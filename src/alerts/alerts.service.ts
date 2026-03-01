@@ -2,7 +2,11 @@ import { Injectable, Inject, Logger } from '@nestjs/common';
 import { eq, desc, and, sql } from 'drizzle-orm';
 import * as schema from '../database/schema';
 
-export type AlertType = 'mispricing' | 'live_event' | 'price_movement' | 'lineup_change';
+export type AlertType =
+  | 'mispricing'
+  | 'live_event'
+  | 'price_movement'
+  | 'lineup_change';
 export type AlertSeverity = 'low' | 'medium' | 'high' | 'critical';
 
 interface CreateAlertDto {
@@ -35,7 +39,9 @@ export class AlertsService {
         })
         .returning();
 
-      this.logger.log(`Alert created: [${dto.severity.toUpperCase()}] ${dto.title}`);
+      this.logger.log(
+        `Alert created: [${dto.severity.toUpperCase()}] ${dto.title}`,
+      );
       return alert;
     } catch (error) {
       this.logger.error(`Failed to create alert: ${error.message}`);
@@ -70,7 +76,8 @@ export class AlertsService {
     return this.createAlert({
       predictionId,
       type: 'live_event',
-      severity: eventType === 'goal' || eventType === 'red_card' ? 'high' : 'medium',
+      severity:
+        eventType === 'goal' || eventType === 'red_card' ? 'high' : 'medium',
       title: `Live: ${eventType.toUpperCase()} in ${matchTitle}`,
       message: `${eventType} detected. Checking for Polymarket price lag.`,
       data: { eventType, ...details },
@@ -147,7 +154,7 @@ export class AlertsService {
 
   private getMispricingSeverity(absGap: number): AlertSeverity {
     if (absGap >= 0.15) return 'critical';
-    if (absGap >= 0.10) return 'high';
+    if (absGap >= 0.1) return 'high';
     if (absGap >= 0.07) return 'medium';
     return 'low';
   }

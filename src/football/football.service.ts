@@ -48,7 +48,9 @@ export class FootballService {
    * Fetch upcoming fixtures for the given leagues and upsert into the
    * fixtures table. Defaults to TRACKED_LEAGUES.
    */
-  async syncFixtures(leagueIds: number[] = [...TRACKED_LEAGUES]): Promise<number> {
+  async syncFixtures(
+    leagueIds: number[] = [...TRACKED_LEAGUES],
+  ): Promise<number> {
     this.logger.log(`Syncing fixtures for ${leagueIds.length} leagues`);
     let totalUpserted = 0;
 
@@ -80,7 +82,9 @@ export class FootballService {
       }
     }
 
-    this.logger.log(`Fixture sync complete — ${totalUpserted} fixtures upserted`);
+    this.logger.log(
+      `Fixture sync complete — ${totalUpserted} fixtures upserted`,
+    );
     return totalUpserted;
   }
 
@@ -143,7 +147,9 @@ export class FootballService {
    * Fetch injuries for a league/season and upsert into the injuries table.
    */
   async syncInjuries(leagueId: number, season: number): Promise<number> {
-    this.logger.log(`Syncing injuries for league ${leagueId}, season ${season}`);
+    this.logger.log(
+      `Syncing injuries for league ${leagueId}, season ${season}`,
+    );
 
     const data = await this.apiRequest<any>('/injuries', {
       league: String(leagueId),
@@ -182,7 +188,9 @@ export class FootballService {
    * Fetch standings for a league/season and update the team_form table.
    */
   async syncStandings(leagueId: number, season: number): Promise<number> {
-    this.logger.log(`Syncing standings for league ${leagueId}, season ${season}`);
+    this.logger.log(
+      `Syncing standings for league ${leagueId}, season ${season}`,
+    );
 
     const data = await this.apiRequest<any>('/standings', {
       league: String(leagueId),
@@ -262,7 +270,9 @@ export class FootballService {
                   : null,
               goalsAgainstAvg:
                 allStats.played > 0
-                  ? String((allStats.goals.against / allStats.played).toFixed(2))
+                  ? String(
+                      (allStats.goals.against / allStats.played).toFixed(2),
+                    )
                   : null,
               updatedAt: new Date(),
             },
@@ -559,7 +569,9 @@ export class FootballService {
   /**
    * Get team info from the database, including form data.
    */
-  async getTeamById(teamId: number): Promise<{ team: any; form: any[] } | null> {
+  async getTeamById(
+    teamId: number,
+  ): Promise<{ team: any; form: any[] } | null> {
     const teamRows = await this.db
       .select()
       .from(schema.teams)
@@ -606,9 +618,12 @@ export class FootballService {
   ): Promise<ApiFootballResponse<T>> {
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        const response = await this.client.get<ApiFootballResponse<T>>(endpoint, {
-          params,
-        });
+        const response = await this.client.get<ApiFootballResponse<T>>(
+          endpoint,
+          {
+            params,
+          },
+        );
 
         const body = response.data;
 

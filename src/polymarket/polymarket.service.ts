@@ -291,8 +291,7 @@ export class PolymarketService {
       conditions.push(eq(polymarketMarkets.active, filters.active));
     }
 
-    const whereClause =
-      conditions.length > 0 ? and(...conditions) : undefined;
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 
     const [markets, totalResult] = await Promise.all([
       this.db
@@ -606,9 +605,7 @@ export class PolymarketService {
       }
     }
 
-    this.logger.debug(
-      `Fetched ${allEvents.length} events for tag "${tag}"`,
-    );
+    this.logger.debug(`Fetched ${allEvents.length} events for tag "${tag}"`);
 
     return allEvents;
   }

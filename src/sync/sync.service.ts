@@ -29,15 +29,28 @@ export class SyncService {
       const eventsResult: any = await this.polymarketService.syncSoccerEvents();
       await this.polymarketService.syncPrices();
 
-      await this.logSync('polymarket', 'sync_events_and_prices', 'completed', startedAt, {
-        recordsProcessed: eventsResult?.eventsCount || eventsResult?.events || 0,
-      });
+      await this.logSync(
+        'polymarket',
+        'sync_events_and_prices',
+        'completed',
+        startedAt,
+        {
+          recordsProcessed:
+            eventsResult?.eventsCount || eventsResult?.events || 0,
+        },
+      );
       this.logger.log('Polymarket sync completed');
     } catch (error) {
       this.logger.error(`Polymarket sync failed: ${error.message}`);
-      await this.logSync('polymarket', 'sync_events_and_prices', 'failed', startedAt, {
-        errorMessage: error.message,
-      });
+      await this.logSync(
+        'polymarket',
+        'sync_events_and_prices',
+        'failed',
+        startedAt,
+        {
+          errorMessage: error.message,
+        },
+      );
     }
   }
 
@@ -50,17 +63,29 @@ export class SyncService {
 
       for (const leagueId of TRACKED_LEAGUES) {
         try {
-          const result: any = await this.footballService.syncFixtures([leagueId]);
+          const result: any = await this.footballService.syncFixtures([
+            leagueId,
+          ]);
           totalProcessed += result?.count || result?.length || 0;
         } catch (error) {
-          this.logger.warn(`Failed to sync fixtures for league ${leagueId}: ${error.message}`);
+          this.logger.warn(
+            `Failed to sync fixtures for league ${leagueId}: ${error.message}`,
+          );
         }
       }
 
-      await this.logSync('api_football', 'sync_fixtures', 'completed', startedAt, {
-        recordsProcessed: totalProcessed,
-      });
-      this.logger.log(`Fixtures sync completed. ${totalProcessed} fixtures processed.`);
+      await this.logSync(
+        'api_football',
+        'sync_fixtures',
+        'completed',
+        startedAt,
+        {
+          recordsProcessed: totalProcessed,
+        },
+      );
+      this.logger.log(
+        `Fixtures sync completed. ${totalProcessed} fixtures processed.`,
+      );
     } catch (error) {
       this.logger.error(`Fixtures sync failed: ${error.message}`);
       await this.logSync('api_football', 'sync_fixtures', 'failed', startedAt, {
@@ -78,17 +103,30 @@ export class SyncService {
 
       for (const leagueId of TRACKED_LEAGUES) {
         try {
-          const result: any = await this.footballService.syncInjuries(leagueId, currentSeason);
+          const result: any = await this.footballService.syncInjuries(
+            leagueId,
+            currentSeason,
+          );
           totalProcessed += result?.count || result?.length || 0;
         } catch (error) {
-          this.logger.warn(`Failed to sync injuries for league ${leagueId}: ${error.message}`);
+          this.logger.warn(
+            `Failed to sync injuries for league ${leagueId}: ${error.message}`,
+          );
         }
       }
 
-      await this.logSync('api_football', 'sync_injuries', 'completed', startedAt, {
-        recordsProcessed: totalProcessed,
-      });
-      this.logger.log(`Injuries sync completed. ${totalProcessed} records processed.`);
+      await this.logSync(
+        'api_football',
+        'sync_injuries',
+        'completed',
+        startedAt,
+        {
+          recordsProcessed: totalProcessed,
+        },
+      );
+      this.logger.log(
+        `Injuries sync completed. ${totalProcessed} records processed.`,
+      );
     } catch (error) {
       this.logger.error(`Injuries sync failed: ${error.message}`);
       await this.logSync('api_football', 'sync_injuries', 'failed', startedAt, {
@@ -107,17 +145,30 @@ export class SyncService {
         try {
           await this.footballService.syncStandings(leagueId, currentSeason);
         } catch (error) {
-          this.logger.warn(`Failed to sync standings for league ${leagueId}: ${error.message}`);
+          this.logger.warn(
+            `Failed to sync standings for league ${leagueId}: ${error.message}`,
+          );
         }
       }
 
-      await this.logSync('api_football', 'sync_standings', 'completed', startedAt);
+      await this.logSync(
+        'api_football',
+        'sync_standings',
+        'completed',
+        startedAt,
+      );
       this.logger.log('Standings sync completed.');
     } catch (error) {
       this.logger.error(`Standings sync failed: ${error.message}`);
-      await this.logSync('api_football', 'sync_standings', 'failed', startedAt, {
-        errorMessage: error.message,
-      });
+      await this.logSync(
+        'api_football',
+        'sync_standings',
+        'failed',
+        startedAt,
+        {
+          errorMessage: error.message,
+        },
+      );
     }
   }
 
@@ -146,7 +197,9 @@ export class SyncService {
       await this.logSync('system', 'match_markets', 'completed', startedAt, {
         recordsProcessed: result?.matched || 0,
       });
-      this.logger.log(`Market matching completed. ${result?.matched || 0} markets matched.`);
+      this.logger.log(
+        `Market matching completed. ${result?.matched || 0} markets matched.`,
+      );
     } catch (error) {
       this.logger.error(`Market matching failed: ${error.message}`);
       await this.logSync('system', 'match_markets', 'failed', startedAt, {
@@ -161,15 +214,29 @@ export class SyncService {
       this.logger.log('Starting prediction generation...');
       const result = await this.predictionService.generatePredictions();
 
-      await this.logSync('system', 'generate_predictions', 'completed', startedAt, {
-        recordsProcessed: result?.predictionsGenerated || 0,
-      });
-      this.logger.log(`Prediction generation completed. ${result?.predictionsGenerated || 0} predictions.`);
+      await this.logSync(
+        'system',
+        'generate_predictions',
+        'completed',
+        startedAt,
+        {
+          recordsProcessed: result?.predictionsGenerated || 0,
+        },
+      );
+      this.logger.log(
+        `Prediction generation completed. ${result?.predictionsGenerated || 0} predictions.`,
+      );
     } catch (error) {
       this.logger.error(`Prediction generation failed: ${error.message}`);
-      await this.logSync('system', 'generate_predictions', 'failed', startedAt, {
-        errorMessage: error.message,
-      });
+      await this.logSync(
+        'system',
+        'generate_predictions',
+        'failed',
+        startedAt,
+        {
+          errorMessage: error.message,
+        },
+      );
     }
   }
 
@@ -219,7 +286,9 @@ export class SyncService {
   ): Promise<void> {
     try {
       const completedAt = status !== 'started' ? new Date() : null;
-      const durationMs = completedAt ? completedAt.getTime() - startedAt.getTime() : null;
+      const durationMs = completedAt
+        ? completedAt.getTime() - startedAt.getTime()
+        : null;
 
       await this.db.insert(schema.syncLog).values({
         source,

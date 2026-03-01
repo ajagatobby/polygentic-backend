@@ -411,9 +411,7 @@ export class LiveScoreService implements OnModuleDestroy {
    * Emit a detected event to all registered listeners.
    */
   private emitEvent(event: DetectedEvent): void {
-    this.logger.log(
-      `[LIVE EVENT] ${event.type}: ${event.detail}`,
-    );
+    this.logger.log(`[LIVE EVENT] ${event.type}: ${event.detail}`);
 
     for (const listener of this.listeners) {
       try {

@@ -13,7 +13,8 @@ import { Type } from 'class-transformer';
 
 export class OddsSyncDto {
   @ApiPropertyOptional({
-    description: 'Sport keys to sync odds for. Defaults to all tracked soccer leagues.',
+    description:
+      'Sport keys to sync odds for. Defaults to all tracked soccer leagues.',
     type: [String],
     example: ['soccer_epl', 'soccer_spain_la_liga'],
   })
@@ -148,7 +149,10 @@ export class OddsSyncResultDto {
 }
 
 export class EventOddsQueryDto {
-  @ApiPropertyOptional({ description: 'Filter by market type (h2h, totals, spreads)', example: 'h2h' })
+  @ApiPropertyOptional({
+    description: 'Filter by market type (h2h, totals, spreads)',
+    example: 'h2h',
+  })
   @IsOptional()
   @IsString()
   marketKey?: string;

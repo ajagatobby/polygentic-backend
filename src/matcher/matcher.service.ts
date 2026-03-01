@@ -50,9 +50,7 @@ export class MatcherService {
       existingLinks.map((l: any) => l.polymarketMarketId),
     );
 
-    const unmatched = allMarkets.filter(
-      (m: any) => !linkedIds.has(m.id),
-    );
+    const unmatched = allMarkets.filter((m: any) => !linkedIds.has(m.id));
 
     this.logger.log(
       `Found ${unmatched.length} unmatched markets out of ${allMarkets.length} active markets`,
@@ -112,15 +110,12 @@ export class MatcherService {
     const teamNames = FuzzyMatchUtil.extractTeamNames(title);
 
     if (teamNames.length === 0) {
-      this.logger.debug(
-        `Could not extract team names from: "${title}"`,
-      );
+      this.logger.debug(`Could not extract team names from: "${title}"`);
       return null;
     }
 
     // Load teams if not provided
-    const teamList =
-      allTeams ?? (await this.db.select().from(teams));
+    const teamList = allTeams ?? (await this.db.select().from(teams));
 
     // Fuzzy match each extracted team name
     const matchedTeams = teamNames
@@ -165,8 +160,7 @@ export class MatcherService {
 
     // Calculate overall match confidence
     const avgScore =
-      matchedTeams.reduce((sum, t) => sum + t.score, 0) /
-      matchedTeams.length;
+      matchedTeams.reduce((sum, t) => sum + t.score, 0) / matchedTeams.length;
     const matchConfidence = Math.min(
       100,
       Math.round(avgScore * 100 * (matchedFixture ? 1.2 : 0.8)),
@@ -292,8 +286,7 @@ export class MatcherService {
 
     if (teamNames.length === 0) return null;
 
-    const teamList =
-      allTeams ?? (await this.db.select().from(teams));
+    const teamList = allTeams ?? (await this.db.select().from(teams));
 
     const matchedTeam = FuzzyMatchUtil.fuzzyMatchTeam(teamNames[0], teamList);
 

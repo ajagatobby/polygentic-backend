@@ -94,9 +94,7 @@ export class OddsService {
    * For each event returned, store individual bookmaker odds and
    * then compute the weighted consensus.
    */
-  async syncOdds(
-    sportKeys: string[],
-  ): Promise<{
+  async syncOdds(sportKeys: string[]): Promise<{
     eventsProcessed: number;
     oddsRecordsInserted: number;
     consensusCalculated: number;
@@ -172,9 +170,7 @@ export class OddsService {
       .orderBy(desc(bookmakerOdds.recordedAt));
 
     if (storedOdds.length === 0) {
-      this.logger.debug(
-        `No bookmaker odds found for event ${oddsApiEventId}`,
-      );
+      this.logger.debug(`No bookmaker odds found for event ${oddsApiEventId}`);
       return;
     }
 
@@ -308,9 +304,13 @@ export class OddsService {
     const lastCost = response.headers['x-requests-last'];
 
     this.creditUsage = {
-      remaining: remaining != null ? parseInt(remaining, 10) : this.creditUsage.remaining,
+      remaining:
+        remaining != null
+          ? parseInt(remaining, 10)
+          : this.creditUsage.remaining,
       used: used != null ? parseInt(used, 10) : this.creditUsage.used,
-      lastCost: lastCost != null ? parseInt(lastCost, 10) : this.creditUsage.lastCost,
+      lastCost:
+        lastCost != null ? parseInt(lastCost, 10) : this.creditUsage.lastCost,
     };
 
     this.logger.debug(
@@ -333,9 +333,7 @@ export class OddsService {
       },
     );
 
-    this.logger.debug(
-      `Fetched ${response.data.length} events for ${sportKey}`,
-    );
+    this.logger.debug(`Fetched ${response.data.length} events for ${sportKey}`);
 
     return response.data;
   }
@@ -383,9 +381,7 @@ export class OddsService {
           impliedProbabilities,
           trueProbabilities,
           overround: overround.toFixed(4),
-          lastUpdate: market.last_update
-            ? new Date(market.last_update)
-            : null,
+          lastUpdate: market.last_update ? new Date(market.last_update) : null,
           recordedAt: new Date(),
         });
 
@@ -420,15 +416,9 @@ export class OddsService {
       }>;
       if (!Array.isArray(trueProbsArr)) continue;
 
-      const homeEntry = trueProbsArr.find(
-        (p) => p.name === meta.homeTeam,
-      );
-      const drawEntry = trueProbsArr.find(
-        (p) => p.name === 'Draw',
-      );
-      const awayEntry = trueProbsArr.find(
-        (p) => p.name === meta.awayTeam,
-      );
+      const homeEntry = trueProbsArr.find((p) => p.name === meta.homeTeam);
+      const drawEntry = trueProbsArr.find((p) => p.name === 'Draw');
+      const awayEntry = trueProbsArr.find((p) => p.name === meta.awayTeam);
 
       if (homeEntry) {
         homeProbs.push({
@@ -457,12 +447,9 @@ export class OddsService {
       }
     }
 
-    const consensusHome =
-      ProbabilityUtil.calculateWeightedConsensus(homeProbs);
-    const consensusDraw =
-      ProbabilityUtil.calculateWeightedConsensus(drawProbs);
-    const consensusAway =
-      ProbabilityUtil.calculateWeightedConsensus(awayProbs);
+    const consensusHome = ProbabilityUtil.calculateWeightedConsensus(homeProbs);
+    const consensusDraw = ProbabilityUtil.calculateWeightedConsensus(drawProbs);
+    const consensusAway = ProbabilityUtil.calculateWeightedConsensus(awayProbs);
 
     await this.db.insert(consensusOdds).values({
       oddsApiEventId,
@@ -532,8 +519,7 @@ export class OddsService {
       }
     }
 
-    const consensusOver =
-      ProbabilityUtil.calculateWeightedConsensus(overProbs);
+    const consensusOver = ProbabilityUtil.calculateWeightedConsensus(overProbs);
     const consensusUnder =
       ProbabilityUtil.calculateWeightedConsensus(underProbs);
 

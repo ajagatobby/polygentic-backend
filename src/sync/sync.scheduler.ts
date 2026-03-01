@@ -14,7 +14,9 @@ export class SyncScheduler implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    this.logger.log('Sync scheduler initialized. Cron jobs will run on schedule.');
+    this.logger.log(
+      'Sync scheduler initialized. Cron jobs will run on schedule.',
+    );
     this.logger.log('Running initial Polymarket sync on startup...');
 
     // Run initial sync after a short delay to let the app finish bootstrapping

@@ -96,18 +96,18 @@ export class MispricingService {
 
     const absGap = Math.abs(gap);
 
-    if (gap > 0.10) {
+    if (gap > 0.1) {
       // Strong BUY_YES: Polymarket significantly underpriced
       direction = 'BUY_YES';
-      signalStrength = Math.min(1.0, 0.7 + (absGap - 0.10) * 3);
+      signalStrength = Math.min(1.0, 0.7 + (absGap - 0.1) * 3);
     } else if (gap > 0.05) {
       // Moderate BUY_YES
       direction = 'BUY_YES';
       signalStrength = 0.3 + ((absGap - 0.05) / 0.05) * 0.4;
-    } else if (gap < -0.10) {
+    } else if (gap < -0.1) {
       // Strong BUY_NO: Polymarket significantly overpriced
       direction = 'BUY_NO';
-      signalStrength = Math.min(1.0, 0.7 + (absGap - 0.10) * 3);
+      signalStrength = Math.min(1.0, 0.7 + (absGap - 0.1) * 3);
     } else if (gap < -0.05) {
       // Moderate BUY_NO
       direction = 'BUY_NO';
@@ -115,7 +115,7 @@ export class MispricingService {
     } else {
       // Within noise range (-0.05 to +0.05)
       direction = 'NEUTRAL';
-      signalStrength = absGap / 0.05 * 0.3;
+      signalStrength = (absGap / 0.05) * 0.3;
     }
 
     return {
@@ -181,9 +181,7 @@ export class MispricingService {
       .limit(1);
 
     if (!consensus) {
-      this.logger.debug(
-        `No consensus odds found for event ${oddsApiEventId}`,
-      );
+      this.logger.debug(`No consensus odds found for event ${oddsApiEventId}`);
       return null;
     }
 

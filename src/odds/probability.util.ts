@@ -71,7 +71,11 @@ export class ProbabilityUtil {
     if (bookmakerProbabilities.length === 0) return 0;
 
     // Separate named and "other" bookmakers
-    const named: Array<{ bookmaker: string; probability: number; weight: number }> = [];
+    const named: Array<{
+      bookmaker: string;
+      probability: number;
+      weight: number;
+    }> = [];
     const others: Array<{ bookmaker: string; probability: number }> = [];
 
     for (const bp of bookmakerProbabilities) {

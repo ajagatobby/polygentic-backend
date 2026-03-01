@@ -79,11 +79,7 @@ export class StatisticalModelService {
       ]);
 
     // Calculate goal model (expected goals approximation)
-    const goalModel = await this.getGoalModel(
-      homeTeamId,
-      awayTeamId,
-      leagueId,
-    );
+    const goalModel = await this.getGoalModel(homeTeamId, awayTeamId, leagueId);
 
     // Combine into raw home advantage score (0-1 range, 0.5 = even)
     const rawHomeAdvantage =
@@ -137,10 +133,7 @@ export class StatisticalModelService {
       .select()
       .from(teamForm)
       .where(
-        and(
-          eq(teamForm.teamId, homeTeamId),
-          eq(teamForm.leagueId, leagueId),
-        ),
+        and(eq(teamForm.teamId, homeTeamId), eq(teamForm.leagueId, leagueId)),
       )
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
@@ -149,10 +142,7 @@ export class StatisticalModelService {
       .select()
       .from(teamForm)
       .where(
-        and(
-          eq(teamForm.teamId, awayTeamId),
-          eq(teamForm.leagueId, leagueId),
-        ),
+        and(eq(teamForm.teamId, awayTeamId), eq(teamForm.leagueId, leagueId)),
       )
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
@@ -181,10 +171,7 @@ export class StatisticalModelService {
       .select()
       .from(teamForm)
       .where(
-        and(
-          eq(teamForm.teamId, homeTeamId),
-          eq(teamForm.leagueId, leagueId),
-        ),
+        and(eq(teamForm.teamId, homeTeamId), eq(teamForm.leagueId, leagueId)),
       )
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
@@ -193,10 +180,7 @@ export class StatisticalModelService {
       .select()
       .from(teamForm)
       .where(
-        and(
-          eq(teamForm.teamId, awayTeamId),
-          eq(teamForm.leagueId, leagueId),
-        ),
+        and(eq(teamForm.teamId, awayTeamId), eq(teamForm.leagueId, leagueId)),
       )
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
@@ -229,10 +213,7 @@ export class StatisticalModelService {
    * h2h_score = (h2h_wins * 3 + h2h_draws) / (h2h_total * 3)
    * Returns 0-1 from the home team's perspective.
    */
-  async getH2HScore(
-    team1Id: number,
-    team2Id: number,
-  ): Promise<number> {
+  async getH2HScore(team1Id: number, team2Id: number): Promise<number> {
     // Find past fixtures between these two teams (last 10)
     const h2hFixtures = await this.db
       .select()
@@ -295,14 +276,8 @@ export class StatisticalModelService {
   ): Promise<number> {
     // Get injuries for both teams
     const [homeInjuries, awayInjuries] = await Promise.all([
-      this.db
-        .select()
-        .from(injuries)
-        .where(eq(injuries.teamId, homeTeamId)),
-      this.db
-        .select()
-        .from(injuries)
-        .where(eq(injuries.teamId, awayTeamId)),
+      this.db.select().from(injuries).where(eq(injuries.teamId, homeTeamId)),
+      this.db.select().from(injuries).where(eq(injuries.teamId, awayTeamId)),
     ]);
 
     const homeImpact = this.sumInjuryImpact(homeInjuries);
@@ -327,24 +302,14 @@ export class StatisticalModelService {
     const [team1Form] = await this.db
       .select()
       .from(teamForm)
-      .where(
-        and(
-          eq(teamForm.teamId, team1Id),
-          eq(teamForm.leagueId, leagueId),
-        ),
-      )
+      .where(and(eq(teamForm.teamId, team1Id), eq(teamForm.leagueId, leagueId)))
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
 
     const [team2Form] = await this.db
       .select()
       .from(teamForm)
-      .where(
-        and(
-          eq(teamForm.teamId, team2Id),
-          eq(teamForm.leagueId, leagueId),
-        ),
-      )
+      .where(and(eq(teamForm.teamId, team2Id), eq(teamForm.leagueId, leagueId)))
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
 
@@ -404,10 +369,7 @@ export class StatisticalModelService {
       .select()
       .from(teamForm)
       .where(
-        and(
-          eq(teamForm.teamId, homeTeamId),
-          eq(teamForm.leagueId, leagueId),
-        ),
+        and(eq(teamForm.teamId, homeTeamId), eq(teamForm.leagueId, leagueId)),
       )
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);
@@ -416,10 +378,7 @@ export class StatisticalModelService {
       .select()
       .from(teamForm)
       .where(
-        and(
-          eq(teamForm.teamId, awayTeamId),
-          eq(teamForm.leagueId, leagueId),
-        ),
+        and(eq(teamForm.teamId, awayTeamId), eq(teamForm.leagueId, leagueId)),
       )
       .orderBy(desc(teamForm.updatedAt))
       .limit(1);

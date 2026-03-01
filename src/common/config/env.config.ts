@@ -75,7 +75,11 @@ export class EnvConfig {
   DATABASE_PASSWORD: string;
 
   @ValidateIf(
-    (o) => !o.DATABASE_HOST || !o.DATABASE_NAME || !o.DATABASE_USER || !o.DATABASE_PASSWORD,
+    (o) =>
+      !o.DATABASE_HOST ||
+      !o.DATABASE_NAME ||
+      !o.DATABASE_USER ||
+      !o.DATABASE_PASSWORD,
   )
   @IsString()
   @IsNotEmpty()
@@ -162,7 +166,8 @@ export class EnvConfig {
 
   @IsString()
   @IsOptional()
-  POLYMARKET_WS_URL: string = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
+  POLYMARKET_WS_URL: string =
+    'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
   @IsString()
   @IsOptional()

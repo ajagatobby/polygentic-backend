@@ -35,7 +35,9 @@ export class FootballController {
   // ─── FIXTURES ────────────────────────────────────────────────────────
 
   @Get('fixtures')
-  @ApiOperation({ summary: 'List fixtures with optional filters and pagination' })
+  @ApiOperation({
+    summary: 'List fixtures with optional filters and pagination',
+  })
   @ApiResponse({ status: 200, description: 'Paginated list of fixtures' })
   async getFixtures(@Query() query: FixtureQueryDto) {
     try {
@@ -75,15 +77,22 @@ export class FootballController {
       };
     } catch (error) {
       this.logger.error(`Failed to get live fixtures: ${error.message}`);
-      throw new InternalServerErrorException('Failed to retrieve live fixtures');
+      throw new InternalServerErrorException(
+        'Failed to retrieve live fixtures',
+      );
     }
   }
 
   @Get('fixtures/:id')
   @ApiOperation({
-    summary: 'Get fixture details with statistics, events, injuries, and predictions',
+    summary:
+      'Get fixture details with statistics, events, injuries, and predictions',
   })
-  @ApiParam({ name: 'id', description: 'API-Football fixture ID', type: Number })
+  @ApiParam({
+    name: 'id',
+    description: 'API-Football fixture ID',
+    type: Number,
+  })
   @ApiResponse({ status: 200, description: 'Full fixture detail' })
   @ApiResponse({ status: 404, description: 'Fixture not found' })
   async getFixtureById(@Param('id', ParseIntPipe) id: number) {

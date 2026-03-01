@@ -51,12 +51,21 @@ export class HealthController {
 
     let counts: Record<string, number> = {};
     try {
-      const [marketsCount, fixturesCount, predictionsCount, alertsCount] = await Promise.all([
-        this.db.select({ count: sql<number>`count(*)::int` }).from(schema.polymarketMarkets),
-        this.db.select({ count: sql<number>`count(*)::int` }).from(schema.fixtures),
-        this.db.select({ count: sql<number>`count(*)::int` }).from(schema.predictions),
-        this.db.select({ count: sql<number>`count(*)::int` }).from(schema.alerts),
-      ]);
+      const [marketsCount, fixturesCount, predictionsCount, alertsCount] =
+        await Promise.all([
+          this.db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(schema.polymarketMarkets),
+          this.db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(schema.fixtures),
+          this.db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(schema.predictions),
+          this.db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(schema.alerts),
+        ]);
       counts = {
         polymarket_markets: marketsCount[0]?.count || 0,
         fixtures: fixturesCount[0]?.count || 0,

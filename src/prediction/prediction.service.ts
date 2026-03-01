@@ -130,12 +130,11 @@ export class PredictionService {
     let numBookmakers: number | null = null;
 
     if (oddsEventId) {
-      mispricingResult =
-        await this.mispricingService.calculateMispricingSignal(
-          marketId,
-          oddsEventId,
-          mappedOutcome,
-        );
+      mispricingResult = await this.mispricingService.calculateMispricingSignal(
+        marketId,
+        oddsEventId,
+        mappedOutcome,
+      );
 
       if (mispricingResult) {
         consensusProb = mispricingResult.consensusProbability;
@@ -177,10 +176,7 @@ export class PredictionService {
     let statisticalProb: number | null = null;
     let statResult: StatisticalProbability | null = null;
 
-    if (
-      fixtureId &&
-      ['match_outcome', 'over_under'].includes(matchType)
-    ) {
+    if (fixtureId && ['match_outcome', 'over_under'].includes(matchType)) {
       statResult =
         await this.statisticalModelService.calculateProbability(fixtureId);
 
@@ -220,7 +216,8 @@ export class PredictionService {
     let daysToEvent: number | null = null;
     let hasInjuryData = false;
     let hasFormData = false;
-    let hasH2HData = statResult?.h2hScore !== undefined && statResult?.h2hScore !== 0.5;
+    let hasH2HData =
+      statResult?.h2hScore !== undefined && statResult?.h2hScore !== 0.5;
 
     if (fixtureId) {
       const [fixture] = await this.db
@@ -239,9 +236,7 @@ export class PredictionService {
       const injuryCount = await this.db
         .select({ count: sql`count(*)` })
         .from(injuries)
-        .where(
-          eq(injuries.teamId, fixture?.homeTeamId ?? 0),
-        );
+        .where(eq(injuries.teamId, fixture?.homeTeamId ?? 0));
       hasInjuryData = (injuryCount[0]?.count ?? 0) > 0;
 
       // Check for form data
@@ -360,17 +355,14 @@ export class PredictionService {
     }
 
     if (filters?.minConfidence != null) {
-      conditions.push(
-        gte(predictions.confidenceScore, filters.minConfidence),
-      );
+      conditions.push(gte(predictions.confidenceScore, filters.minConfidence));
     }
 
     if (filters?.status) {
       conditions.push(eq(predictions.status, filters.status));
     }
 
-    const whereClause =
-      conditions.length > 0 ? and(...conditions) : undefined;
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 
     const results = await this.db
       .select()
@@ -396,9 +388,7 @@ export class PredictionService {
           sql`ABS(CAST(${predictions.mispricingGap} AS NUMERIC)) >= ${minGap}`,
         ),
       )
-      .orderBy(
-        sql`ABS(CAST(${predictions.mispricingGap} AS NUMERIC)) DESC`,
-      );
+      .orderBy(sql`ABS(CAST(${predictions.mispricingGap} AS NUMERIC)) DESC`);
 
     return results;
   }
@@ -447,9 +437,7 @@ export class PredictionService {
             const rows = await this.db
               .select()
               .from(consensusOdds)
-              .where(
-                eq(consensusOdds.oddsApiEventId, links[0].oddsApiEventId),
-              )
+              .where(eq(consensusOdds.oddsApiEventId, links[0].oddsApiEventId))
               .orderBy(desc(consensusOdds.calculatedAt))
               .limit(1);
             return rows[0] ?? null;
@@ -489,7 +477,11 @@ export class PredictionService {
     const hasStat = statisticalProb != null && statisticalProb > 0;
     const hasApiFootball = apiFootballProb != null && apiFootballProb > 0;
 
-    if (['league_winner', 'top_finish', 'relegation', 'tournament'].includes(matchType)) {
+    if (
+      ['league_winner', 'top_finish', 'relegation', 'tournament'].includes(
+        matchType,
+      )
+    ) {
       // No API-Football prediction for season markets
       if (hasConsensus && hasStat) {
         return consensusProb * 0.55 + statisticalProb * 0.45;
@@ -551,8 +543,7 @@ export class PredictionService {
     parts.push(`Outcome: ${mappedOutcome.replace('_', ' ')}.`);
 
     if (mispricing) {
-      const direction =
-        mispricing.gap > 0 ? 'underpriced' : 'overpriced';
+      const direction = mispricing.gap > 0 ? 'underpriced' : 'overpriced';
       parts.push(
         `Mispricing: Polymarket is ${direction} by ${(Math.abs(mispricing.gap) * 100).toFixed(1)}% ` +
           `(consensus: ${(mispricing.consensusProbability * 100).toFixed(1)}%, ` +
@@ -574,9 +565,7 @@ export class PredictionService {
       );
     }
 
-    parts.push(
-      `Confidence: ${confidence.score}/100 (${confidence.label}).`,
-    );
+    parts.push(`Confidence: ${confidence.score}/100 (${confidence.label}).`);
     parts.push(`Recommendation: ${recommendation}.`);
 
     return parts.join(' ');

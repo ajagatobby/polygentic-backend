@@ -17,8 +17,16 @@ export class AlertsController {
 
   @Get()
   @ApiOperation({ summary: 'Get alerts with optional filters' })
-  @ApiQuery({ name: 'type', required: false, enum: ['mispricing', 'live_event', 'price_movement', 'lineup_change'] })
-  @ApiQuery({ name: 'severity', required: false, enum: ['low', 'medium', 'high', 'critical'] })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['mispricing', 'live_event', 'price_movement', 'lineup_change'],
+  })
+  @ApiQuery({
+    name: 'severity',
+    required: false,
+    enum: ['low', 'medium', 'high', 'critical'],
+  })
   @ApiQuery({ name: 'acknowledged', required: false, type: Boolean })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
@@ -35,7 +43,8 @@ export class AlertsController {
     return this.alertsService.getAlerts({
       type: type as any,
       severity: severity as any,
-      acknowledged: acknowledged !== undefined ? acknowledged === 'true' : undefined,
+      acknowledged:
+        acknowledged !== undefined ? acknowledged === 'true' : undefined,
       limit: limitNum,
       offset: (pageNum - 1) * limitNum,
     });

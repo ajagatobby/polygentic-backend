@@ -46,7 +46,9 @@ export class OddsController {
       };
     } catch (err) {
       if (err instanceof HttpException) throw err;
-      this.logger.error(`Failed to get odds for event ${eventId}: ${err.message}`);
+      this.logger.error(
+        `Failed to get odds for event ${eventId}: ${err.message}`,
+      );
       throw new HttpException(
         'Failed to retrieve odds',
         HttpStatus.INTERNAL_SERVER_ERROR,

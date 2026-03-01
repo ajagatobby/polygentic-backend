@@ -30,9 +30,7 @@ export const teams = pgTable(
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),
   },
-  (table) => [
-    index('idx_teams_name').on(table.name),
-  ],
+  (table) => [index('idx_teams_name').on(table.name)],
 );
 
 // ─── fixtures ──────────────────────────────────────────────────────────
@@ -116,7 +114,10 @@ export const fixtureStatistics = pgTable(
   (table) => [
     index('idx_fixture_stats_fixture').on(table.fixtureId),
     index('idx_fixture_stats_team').on(table.teamId),
-    uniqueIndex('uq_fixture_stats_fixture_team').on(table.fixtureId, table.teamId),
+    uniqueIndex('uq_fixture_stats_fixture_team').on(
+      table.fixtureId,
+      table.teamId,
+    ),
   ],
 );
 
@@ -207,8 +208,16 @@ export const teamForm = pgTable(
     updatedAt: timestamp('updated_at').defaultNow(),
   },
   (table) => [
-    index('idx_team_form_team_league').on(table.teamId, table.leagueId, table.season),
-    uniqueIndex('uq_team_form_team_league_season').on(table.teamId, table.leagueId, table.season),
+    index('idx_team_form_team_league').on(
+      table.teamId,
+      table.leagueId,
+      table.season,
+    ),
+    uniqueIndex('uq_team_form_team_league_season').on(
+      table.teamId,
+      table.leagueId,
+      table.season,
+    ),
   ],
 );
 
@@ -239,16 +248,19 @@ export const fixturesRelations = relations(fixtures, ({ one, many }) => ({
   injuries: many(injuries),
 }));
 
-export const fixtureStatisticsRelations = relations(fixtureStatistics, ({ one }) => ({
-  fixture: one(fixtures, {
-    fields: [fixtureStatistics.fixtureId],
-    references: [fixtures.id],
+export const fixtureStatisticsRelations = relations(
+  fixtureStatistics,
+  ({ one }) => ({
+    fixture: one(fixtures, {
+      fields: [fixtureStatistics.fixtureId],
+      references: [fixtures.id],
+    }),
+    team: one(teams, {
+      fields: [fixtureStatistics.teamId],
+      references: [teams.id],
+    }),
   }),
-  team: one(teams, {
-    fields: [fixtureStatistics.teamId],
-    references: [teams.id],
-  }),
-}));
+);
 
 export const fixtureEventsRelations = relations(fixtureEvents, ({ one }) => ({
   fixture: one(fixtures, {

@@ -151,9 +151,7 @@ export class PolymarketWebSocketService implements OnModuleDestroy {
       this.stopHeartbeat();
 
       const reasonStr = reason?.toString() || 'unknown';
-      this.logger.warn(
-        `WebSocket closed: code=${code}, reason=${reasonStr}`,
-      );
+      this.logger.warn(`WebSocket closed: code=${code}, reason=${reasonStr}`);
 
       if (!this.isIntentionallyClosed && this.subscribedTokenIds.size > 0) {
         this.scheduleReconnect();
@@ -185,9 +183,7 @@ export class PolymarketWebSocketService implements OnModuleDestroy {
 
   private sendSubscription(tokenIds: string[]): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.logger.warn(
-        'Cannot send subscription: WebSocket is not open',
-      );
+      this.logger.warn('Cannot send subscription: WebSocket is not open');
       return;
     }
 
@@ -200,9 +196,7 @@ export class PolymarketWebSocketService implements OnModuleDestroy {
       if (err) {
         this.logger.error(`Failed to send subscription: ${err.message}`);
       } else {
-        this.logger.debug(
-          `Sent subscription for ${tokenIds.length} token(s)`,
-        );
+        this.logger.debug(`Sent subscription for ${tokenIds.length} token(s)`);
       }
     });
   }
@@ -238,9 +232,7 @@ export class PolymarketWebSocketService implements OnModuleDestroy {
           try {
             callback(update);
           } catch (err) {
-            this.logger.error(
-              `Price update callback error: ${err.message}`,
-            );
+            this.logger.error(`Price update callback error: ${err.message}`);
           }
         }
       }
@@ -272,9 +264,7 @@ export class PolymarketWebSocketService implements OnModuleDestroy {
   private scheduleReconnect(): void {
     this.clearReconnectTimer();
 
-    this.logger.log(
-      `Scheduling reconnect in ${this.reconnectDelay}ms`,
-    );
+    this.logger.log(`Scheduling reconnect in ${this.reconnectDelay}ms`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

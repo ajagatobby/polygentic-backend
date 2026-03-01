@@ -25,12 +25,30 @@ export const predictions = pgTable(
       .notNull()
       .references(() => polymarketMarkets.id),
     fixtureId: integer('fixture_id').references(() => fixtures.id),
-    polymarketPrice: numeric('polymarket_price', { precision: 8, scale: 4 }).notNull(),
-    bookmakerConsensus: numeric('bookmaker_consensus', { precision: 8, scale: 4 }),
-    pinnacleProbability: numeric('pinnacle_probability', { precision: 8, scale: 4 }),
-    statisticalModelProb: numeric('statistical_model_prob', { precision: 8, scale: 4 }),
-    apiFootballPrediction: numeric('api_football_prediction', { precision: 8, scale: 4 }),
-    predictedProbability: numeric('predicted_probability', { precision: 8, scale: 4 }).notNull(),
+    polymarketPrice: numeric('polymarket_price', {
+      precision: 8,
+      scale: 4,
+    }).notNull(),
+    bookmakerConsensus: numeric('bookmaker_consensus', {
+      precision: 8,
+      scale: 4,
+    }),
+    pinnacleProbability: numeric('pinnacle_probability', {
+      precision: 8,
+      scale: 4,
+    }),
+    statisticalModelProb: numeric('statistical_model_prob', {
+      precision: 8,
+      scale: 4,
+    }),
+    apiFootballPrediction: numeric('api_football_prediction', {
+      precision: 8,
+      scale: 4,
+    }),
+    predictedProbability: numeric('predicted_probability', {
+      precision: 8,
+      scale: 4,
+    }).notNull(),
     mispricingGap: numeric('mispricing_gap', { precision: 8, scale: 4 }),
     mispricingPct: numeric('mispricing_pct', { precision: 8, scale: 4 }),
     confidenceScore: integer('confidence_score'),
@@ -104,7 +122,10 @@ export const marketFixtureLinks = pgTable(
     index('idx_links_polymarket').on(table.polymarketMarketId),
     index('idx_links_fixture').on(table.fixtureId),
     index('idx_links_type').on(table.matchType),
-    uniqueIndex('uq_links_market_fixture').on(table.polymarketMarketId, table.fixtureId),
+    uniqueIndex('uq_links_market_fixture').on(
+      table.polymarketMarketId,
+      table.fixtureId,
+    ),
   ],
 );
 
@@ -129,17 +150,20 @@ export const alertsRelations = relations(alerts, ({ one }) => ({
   }),
 }));
 
-export const marketFixtureLinksRelations = relations(marketFixtureLinks, ({ one }) => ({
-  polymarketMarket: one(polymarketMarkets, {
-    fields: [marketFixtureLinks.polymarketMarketId],
-    references: [polymarketMarkets.id],
+export const marketFixtureLinksRelations = relations(
+  marketFixtureLinks,
+  ({ one }) => ({
+    polymarketMarket: one(polymarketMarkets, {
+      fields: [marketFixtureLinks.polymarketMarketId],
+      references: [polymarketMarkets.id],
+    }),
+    fixture: one(fixtures, {
+      fields: [marketFixtureLinks.fixtureId],
+      references: [fixtures.id],
+    }),
+    team: one(teams, {
+      fields: [marketFixtureLinks.teamId],
+      references: [teams.id],
+    }),
   }),
-  fixture: one(fixtures, {
-    fields: [marketFixtureLinks.fixtureId],
-    references: [fixtures.id],
-  }),
-  team: one(teams, {
-    fields: [marketFixtureLinks.teamId],
-    references: [teams.id],
-  }),
-}));
+);

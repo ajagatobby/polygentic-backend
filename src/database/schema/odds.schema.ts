@@ -63,7 +63,10 @@ export const consensusOdds = pgTable(
     calculatedAt: timestamp('calculated_at').defaultNow().notNull(),
   },
   (table) => [
-    index('idx_consensus_event_market').on(table.oddsApiEventId, table.marketKey),
+    index('idx_consensus_event_market').on(
+      table.oddsApiEventId,
+      table.marketKey,
+    ),
     index('idx_consensus_time').on(table.calculatedAt),
   ],
 );

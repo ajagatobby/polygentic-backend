@@ -99,21 +99,30 @@ export const polymarketPriceHistory = pgTable(
 
 // ─── RELATIONS ─────────────────────────────────────────────────────────
 
-export const polymarketEventsRelations = relations(polymarketEvents, ({ many }) => ({
-  markets: many(polymarketMarkets),
-}));
-
-export const polymarketMarketsRelations = relations(polymarketMarkets, ({ one, many }) => ({
-  event: one(polymarketEvents, {
-    fields: [polymarketMarkets.eventId],
-    references: [polymarketEvents.id],
+export const polymarketEventsRelations = relations(
+  polymarketEvents,
+  ({ many }) => ({
+    markets: many(polymarketMarkets),
   }),
-  priceHistory: many(polymarketPriceHistory),
-}));
+);
 
-export const polymarketPriceHistoryRelations = relations(polymarketPriceHistory, ({ one }) => ({
-  market: one(polymarketMarkets, {
-    fields: [polymarketPriceHistory.marketId],
-    references: [polymarketMarkets.id],
+export const polymarketMarketsRelations = relations(
+  polymarketMarkets,
+  ({ one, many }) => ({
+    event: one(polymarketEvents, {
+      fields: [polymarketMarkets.eventId],
+      references: [polymarketEvents.id],
+    }),
+    priceHistory: many(polymarketPriceHistory),
   }),
-}));
+);
+
+export const polymarketPriceHistoryRelations = relations(
+  polymarketPriceHistory,
+  ({ one }) => ({
+    market: one(polymarketMarkets, {
+      fields: [polymarketPriceHistory.marketId],
+      references: [polymarketMarkets.id],
+    }),
+  }),
+);
