@@ -29,6 +29,7 @@
     "@nestjs/config": "^4.0.3",
     "@nestjs/core": "^11.1.14",
     "@nestjs/platform-express": "^11.1.14",
+    "@nestjs/platform-socket.io": "^11.1.14",
     "@nestjs/platform-ws": "^11.1.14",
     "@nestjs/schedule": "^6.1.1",
     "@nestjs/swagger": "^11.2.6",
@@ -42,6 +43,7 @@
     "postgres": "^3.4.8",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.1",
+    "socket.io": "^4.8.3",
     "swagger-ui-express": "^5.0.1",
     "ws": "^8.19.0"
   },

@@ -1,8 +1,14 @@
 import { Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
+import * as postgresModule from 'postgres';
 import * as schema from './schema';
+
+// Handle both ESM default export and CJS module.exports
+const postgres =
+  typeof (postgresModule as any).default === 'function'
+    ? (postgresModule as any).default
+    : postgresModule;
 
 export const DRIZZLE = 'DRIZZLE';
 
