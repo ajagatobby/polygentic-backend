@@ -48,13 +48,13 @@ mispricing_pct = mispricing_gap / bookmaker_consensus * 100
 
 ### Interpretation
 
-| Gap | Interpretation | Action |
-|---|---|---|
-| > +0.10 (10%+) | Polymarket significantly underpriced | Strong BUY_YES signal |
-| +0.05 to +0.10 | Moderate underpricing | Moderate BUY_YES signal |
-| -0.05 to +0.05 | Within noise range | No signal |
-| -0.10 to -0.05 | Moderate overpricing | Moderate BUY_NO signal |
-| < -0.10 (10%+) | Polymarket significantly overpriced | Strong BUY_NO signal |
+| Gap            | Interpretation                       | Action                  |
+| -------------- | ------------------------------------ | ----------------------- |
+| > +0.10 (10%+) | Polymarket significantly underpriced | Strong BUY_YES signal   |
+| +0.05 to +0.10 | Moderate underpricing                | Moderate BUY_YES signal |
+| -0.05 to +0.05 | Within noise range                   | No signal               |
+| -0.10 to -0.05 | Moderate overpricing                 | Moderate BUY_NO signal  |
+| < -0.10 (10%+) | Polymarket significantly overpriced  | Strong BUY_NO signal    |
 
 ### Edge Cases
 
@@ -79,11 +79,11 @@ Where:
   Win   = 3 points
   Draw  = 1 point
   Loss  = 0 points
-  
+
   Weights (most recent first): [0.30, 0.25, 0.20, 0.15, 0.10]
-  
+
   Max score = 3 * (0.30 + 0.25 + 0.20 + 0.15 + 0.10) = 3.0
-  
+
   form_pct = form_score / 3.0
 ```
 
@@ -115,7 +115,7 @@ For match outcome:
 
 For over/under markets:
   expected_total = expected_goals_home + expected_goals_away
-  
+
   Use Poisson distribution to calculate P(over X.5) and P(under X.5)
 ```
 
@@ -236,24 +236,24 @@ final_probability = bookmaker_consensus  (if available)
 
 Each prediction gets a confidence score from 0-100 based on:
 
-| Factor | Max Points | Criteria |
-|---|---|---|
-| **Signal agreement** | 30 | All 3 signals within 5% of each other = 30 pts. Wider disagreement = fewer points. |
-| **Mispricing gap size** | 25 | Larger gap = higher confidence. >15% gap = 25 pts. |
-| **Data completeness** | 15 | All data sources available = 15 pts. Missing injury data = -3, missing odds = -5, etc. |
-| **Market liquidity** | 15 | Higher Polymarket liquidity = more reliable price. >$50K volume = 15 pts. |
-| **Time to event** | 10 | 1-7 days before event = 10 pts (optimal). Too far = less data, too close = less time to act. |
-| **Historical accuracy** | 5 | If we've made similar predictions before, how accurate were they? |
+| Factor                  | Max Points | Criteria                                                                                     |
+| ----------------------- | ---------- | -------------------------------------------------------------------------------------------- |
+| **Signal agreement**    | 30         | All 3 signals within 5% of each other = 30 pts. Wider disagreement = fewer points.           |
+| **Mispricing gap size** | 25         | Larger gap = higher confidence. >15% gap = 25 pts.                                           |
+| **Data completeness**   | 15         | All data sources available = 15 pts. Missing injury data = -3, missing odds = -5, etc.       |
+| **Market liquidity**    | 15         | Higher Polymarket liquidity = more reliable price. >$50K volume = 15 pts.                    |
+| **Time to event**       | 10         | 1-7 days before event = 10 pts (optimal). Too far = less data, too close = less time to act. |
+| **Historical accuracy** | 5          | If we've made similar predictions before, how accurate were they?                            |
 
 ### Confidence Thresholds
 
-| Score | Label | Action |
-|---|---|---|
+| Score  | Label     | Action                                |
+| ------ | --------- | ------------------------------------- |
 | 80-100 | Very High | Strong recommendation, generate alert |
-| 60-79 | High | Recommendation with caveat |
-| 40-59 | Medium | Informational only |
-| 20-39 | Low | Weak signal, likely noise |
-| 0-19 | Very Low | Insufficient data, no recommendation |
+| 60-79  | High      | Recommendation with caveat            |
+| 40-59  | Medium    | Informational only                    |
+| 20-39  | Low       | Weak signal, likely noise             |
+| 0-19   | Very Low  | Insufficient data, no recommendation  |
 
 ---
 
@@ -264,13 +264,13 @@ Based on final probability, mispricing gap, and confidence:
 ```
 IF confidence >= 60 AND mispricing_gap > 0.05:
   recommendation = "BUY_YES"
-  
+
 ELIF confidence >= 60 AND mispricing_gap < -0.05:
   recommendation = "BUY_NO"
-  
+
 ELIF confidence >= 40 AND |mispricing_gap| > 0.03:
   recommendation = "HOLD" (monitor for further movement)
-  
+
 ELSE:
   recommendation = "NO_SIGNAL"
 ```
@@ -283,15 +283,15 @@ During live matches, predictions are recalculated in near real-time:
 
 ### Trigger Events
 
-| Event | Source | Action |
-|---|---|---|
-| Goal scored | API-Football live | Recalculate all signals, check for delayed Polymarket reaction |
-| Red card | API-Football live | Significant probability shift expected |
-| Penalty awarded | API-Football live | Major event — watch for Polymarket lag |
-| Half-time | API-Football live | Update with half-time stats |
-| Injury / Substitution | API-Football live | Minor adjustment if key player |
-| Polymarket price movement | WebSocket | Check if movement aligns with our prediction |
-| Bookmaker odds movement | The Odds API | Update consensus, check for new mispricing |
+| Event                     | Source            | Action                                                         |
+| ------------------------- | ----------------- | -------------------------------------------------------------- |
+| Goal scored               | API-Football live | Recalculate all signals, check for delayed Polymarket reaction |
+| Red card                  | API-Football live | Significant probability shift expected                         |
+| Penalty awarded           | API-Football live | Major event — watch for Polymarket lag                         |
+| Half-time                 | API-Football live | Update with half-time stats                                    |
+| Injury / Substitution     | API-Football live | Minor adjustment if key player                                 |
+| Polymarket price movement | WebSocket         | Check if movement aligns with our prediction                   |
+| Bookmaker odds movement   | The Odds API      | Update consensus, check for new mispricing                     |
 
 ### Live Mispricing Detection Flow
 
@@ -328,9 +328,9 @@ After markets resolve, we compare:
 
 ```
 For each resolved prediction:
-  was_correct = (recommendation == "BUY_YES" AND outcome == "yes") 
+  was_correct = (recommendation == "BUY_YES" AND outcome == "yes")
              OR (recommendation == "BUY_NO" AND outcome == "no")
-  
+
   brier_score = (predicted_probability - actual_outcome)^2
   // Lower Brier score = better calibration
 ```
@@ -349,23 +349,23 @@ Use this analysis to adjust model weights over time.
 
 ### Tracking Metrics
 
-| Metric | Description | Target |
-|---|---|---|
-| **Overall accuracy** | % of recommendations that were correct | > 55% |
-| **Brier score** | Mean squared prediction error | < 0.20 |
-| **ROI** | If you followed all recommendations | > 5% |
-| **Mispricing detection rate** | % of detected mispricings that were real | > 60% |
-| **Average reaction time** | How fast we detect mispricings vs Polymarket correction | < 5 min for live |
+| Metric                        | Description                                             | Target           |
+| ----------------------------- | ------------------------------------------------------- | ---------------- |
+| **Overall accuracy**          | % of recommendations that were correct                  | > 55%            |
+| **Brier score**               | Mean squared prediction error                           | < 0.20           |
+| **ROI**                       | If you followed all recommendations                     | > 5%             |
+| **Mispricing detection rate** | % of detected mispricings that were real                | > 60%            |
+| **Average reaction time**     | How fast we detect mispricings vs Polymarket correction | < 5 min for live |
 
 ---
 
 ## Future Improvements
 
-| Improvement | Impact | Complexity |
-|---|---|---|
-| **Machine Learning model** | Replace heuristic statistical model with trained model | High |
-| **xG integration** | Add expected goals data from SportMonks/FBref | Medium |
-| **News sentiment analysis** | Parse Twitter/news for injury rumors, manager changes | High |
-| **Polymarket reaction speed model** | Learn how fast Polymarket typically adjusts to events | Medium |
-| **Kelly criterion sizing** | Optimal position sizing based on edge and confidence | Low |
-| **Multi-market correlation** | Detect correlated mispricings across related markets | Medium |
+| Improvement                         | Impact                                                 | Complexity |
+| ----------------------------------- | ------------------------------------------------------ | ---------- |
+| **Machine Learning model**          | Replace heuristic statistical model with trained model | High       |
+| **xG integration**                  | Add expected goals data from SportMonks/FBref          | Medium     |
+| **News sentiment analysis**         | Parse Twitter/news for injury rumors, manager changes  | High       |
+| **Polymarket reaction speed model** | Learn how fast Polymarket typically adjusts to events  | Medium     |
+| **Kelly criterion sizing**          | Optimal position sizing based on edge and confidence   | Low        |
+| **Multi-market correlation**        | Detect correlated mispricings across related markets   | Medium     |

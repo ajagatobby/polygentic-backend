@@ -151,9 +151,9 @@ export class ConfidenceService {
     const spread = maxVal - minVal;
 
     if (spread <= 0.05) return 30;
-    if (spread <= 0.10) return 22;
+    if (spread <= 0.1) return 22;
     if (spread <= 0.15) return 15;
-    if (spread <= 0.20) return 10;
+    if (spread <= 0.2) return 10;
     return 5;
   }
 
@@ -166,7 +166,7 @@ export class ConfidenceService {
     const absGap = Math.abs(gap);
 
     if (absGap >= 0.15) return 25;
-    if (absGap >= 0.10) return 20;
+    if (absGap >= 0.1) return 20;
     if (absGap >= 0.07) return 15;
     if (absGap >= 0.05) return 10;
     if (absGap >= 0.03) return 5;

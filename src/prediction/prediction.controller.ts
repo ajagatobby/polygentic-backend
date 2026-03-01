@@ -9,13 +9,7 @@ import {
   Logger,
   ParseIntPipe,
 } from '@nestjs/common';
-import {
-  ApiTags,
-  ApiOperation,
-  ApiParam,
-  ApiResponse,
-  ApiQuery,
-} from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { PredictionService } from './prediction.service';
 import {
   PredictionQueryDto,
@@ -95,9 +89,7 @@ export class PredictionController {
       return prediction;
     } catch (err) {
       if (err instanceof HttpException) throw err;
-      this.logger.error(
-        `Failed to get prediction ${id}: ${err.message}`,
-      );
+      this.logger.error(`Failed to get prediction ${id}: ${err.message}`);
       throw new HttpException(
         'Failed to retrieve prediction',
         HttpStatus.INTERNAL_SERVER_ERROR,
