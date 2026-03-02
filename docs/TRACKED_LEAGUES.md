@@ -13,7 +13,7 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | 78     | Bundesliga                   | Germany     | 18    | 34 matchdays, Aug–May |
 | 61     | Ligue 1                      | France      | 18    | 34 matchdays, Aug–May |
 | 88     | Eredivisie                   | Netherlands | 18    | 34 matchdays, Aug–May |
-| 94     | Liga Portugal                | Portugal    | 18    | 34 matchdays, Aug–May |
+| 94     | Primeira Liga                | Portugal    | 18    | 34 matchdays, Aug–May |
 
 ## International Club Competitions
 
