@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { FootballService, TRACKED_LEAGUES } from '../football.service';
 
@@ -42,7 +47,7 @@ export interface DetectedEvent {
 export type LiveEventListener = (event: DetectedEvent) => void;
 
 @Injectable()
-export class LiveScoreService implements OnModuleDestroy {
+export class LiveScoreService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(LiveScoreService.name);
 
   /** Currently tracked live fixture states, keyed by fixture ID. */
@@ -78,6 +83,11 @@ export class LiveScoreService implements OnModuleDestroy {
       'LIVE_PENALTY_POLLING_MS',
       15_000,
     );
+  }
+
+  onModuleInit(): void {
+    this.logger.log('LiveScoreService initialized — starting live monitoring');
+    this.startMonitoring();
   }
 
   onModuleDestroy(): void {

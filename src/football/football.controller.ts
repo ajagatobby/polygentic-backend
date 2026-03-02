@@ -18,7 +18,6 @@ import { LiveScoreService } from './live/live-score.service';
 import {
   FixtureQueryDto,
   SyncFixturesDto,
-  TeamQueryDto,
   LeagueQueryDto,
 } from './dto/fixture-query.dto';
 
@@ -46,6 +45,31 @@ export class FootballController {
       this.logger.error(`Failed to get fixtures: ${error.message}`);
       throw new InternalServerErrorException('Failed to retrieve fixtures');
     }
+  }
+
+  @Post('fixtures/live/start')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Start live match monitoring' })
+  @ApiResponse({ status: 200, description: 'Monitoring started' })
+  startLiveMonitoring() {
+    this.liveScoreService.startMonitoring();
+    return {
+      success: true,
+      message: 'Live monitoring started',
+      activeMatches: this.liveScoreService.getActiveMatches().length,
+    };
+  }
+
+  @Post('fixtures/live/stop')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Stop live match monitoring' })
+  @ApiResponse({ status: 200, description: 'Monitoring stopped' })
+  stopLiveMonitoring() {
+    this.liveScoreService.stopMonitoring();
+    return {
+      success: true,
+      message: 'Live monitoring stopped',
+    };
   }
 
   @Get('fixtures/live')

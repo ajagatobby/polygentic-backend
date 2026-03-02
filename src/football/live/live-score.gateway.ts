@@ -5,7 +5,7 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleDestroy } from '@nestjs/common';
 import { Server, WebSocket } from 'ws';
 import { LiveScoreService, DetectedEvent } from './live-score.service';
 
@@ -22,7 +22,11 @@ import { LiveScoreService, DetectedEvent } from './live-score.service';
  */
 @WebSocketGateway({ namespace: 'live', cors: true })
 export class LiveScoreGateway
-  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+  implements
+    OnGatewayInit,
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnModuleDestroy
 {
   private readonly logger = new Logger(LiveScoreGateway.name);
 
@@ -150,5 +154,13 @@ export class LiveScoreGateway
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ event, data }));
     }
+  }
+
+  onModuleDestroy(): void {
+    if (this.broadcastTimer) {
+      clearInterval(this.broadcastTimer);
+      this.broadcastTimer = null;
+    }
+    this.logger.log('Live score WebSocket gateway destroyed');
   }
 }
