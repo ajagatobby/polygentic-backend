@@ -817,6 +817,135 @@ export class FootballService {
   }
 
   /**
+   * Get a fixture by ID with all its predictions and team details.
+   */
+  async getFixtureWithPredictions(fixtureId: number): Promise<any | null> {
+    const fixtureRows = await this.db
+      .select()
+      .from(schema.fixtures)
+      .where(eq(schema.fixtures.id, fixtureId))
+      .limit(1);
+
+    const fixture = fixtureRows?.[0];
+    if (!fixture) return null;
+
+    // Fetch predictions and team names in parallel
+    const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(Boolean);
+
+    const [predictions, teamRows] = await Promise.all([
+      this.db
+        .select()
+        .from(schema.predictions)
+        .where(eq(schema.predictions.fixtureId, fixtureId))
+        .orderBy(desc(schema.predictions.createdAt)),
+      teamIds.length > 0
+        ? this.db
+            .select({
+              id: schema.teams.id,
+              name: schema.teams.name,
+              logo: schema.teams.logo,
+            })
+            .from(schema.teams)
+            .where(
+              sql`${schema.teams.id} IN (${sql.join(
+                teamIds.map((id: number) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+        : [],
+    ]);
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, { name: t.name, logo: t.logo });
+    }
+
+    const homeTeam = teamMap.get(fixture.homeTeamId);
+    const awayTeam = teamMap.get(fixture.awayTeamId);
+
+    // Best prediction: pre_match > daily > on_demand
+    const bestPrediction =
+      predictions.find((p: any) => p.predictionType === 'pre_match') ??
+      predictions.find((p: any) => p.predictionType === 'daily') ??
+      predictions.find((p: any) => p.predictionType === 'on_demand') ??
+      null;
+
+    return {
+      fixture: {
+        id: fixture.id,
+        date: fixture.date,
+        status: fixture.status,
+        statusLong: fixture.statusLong,
+        elapsed: fixture.elapsed,
+        round: fixture.round,
+        referee: fixture.referee,
+        venueName: fixture.venueName,
+        venueCity: fixture.venueCity,
+        leagueId: fixture.leagueId,
+        leagueName: fixture.leagueName,
+        leagueCountry: fixture.leagueCountry,
+        season: fixture.season,
+        goalsHome: fixture.goalsHome,
+        goalsAway: fixture.goalsAway,
+        scoreHalftimeHome: fixture.scoreHalftimeHome,
+        scoreHalftimeAway: fixture.scoreHalftimeAway,
+        scoreFulltimeHome: fixture.scoreFulltimeHome,
+        scoreFulltimeAway: fixture.scoreFulltimeAway,
+      },
+      homeTeam: {
+        id: fixture.homeTeamId,
+        name: homeTeam?.name ?? null,
+        logo: homeTeam?.logo ?? null,
+      },
+      awayTeam: {
+        id: fixture.awayTeamId,
+        name: awayTeam?.name ?? null,
+        logo: awayTeam?.logo ?? null,
+      },
+      prediction: bestPrediction
+        ? {
+            id: bestPrediction.id,
+            predictionType: bestPrediction.predictionType,
+            homeWinProb: bestPrediction.homeWinProb,
+            drawProb: bestPrediction.drawProb,
+            awayWinProb: bestPrediction.awayWinProb,
+            predictedHomeGoals: bestPrediction.predictedHomeGoals,
+            predictedAwayGoals: bestPrediction.predictedAwayGoals,
+            confidence: bestPrediction.confidence,
+            keyFactors: bestPrediction.keyFactors,
+            riskFactors: bestPrediction.riskFactors,
+            valueBets: bestPrediction.valueBets,
+            detailedAnalysis: bestPrediction.detailedAnalysis,
+            matchContext: bestPrediction.matchContext,
+            researchContext: bestPrediction.researchContext,
+            modelVersion: bestPrediction.modelVersion,
+            actualResult: bestPrediction.actualResult,
+            wasCorrect: bestPrediction.wasCorrect,
+            probabilityAccuracy: bestPrediction.probabilityAccuracy,
+            resolvedAt: bestPrediction.resolvedAt,
+            createdAt: bestPrediction.createdAt,
+            updatedAt: bestPrediction.updatedAt,
+          }
+        : null,
+      allPredictions: predictions.map((p: any) => ({
+        id: p.id,
+        predictionType: p.predictionType,
+        homeWinProb: p.homeWinProb,
+        drawProb: p.drawProb,
+        awayWinProb: p.awayWinProb,
+        predictedHomeGoals: p.predictedHomeGoals,
+        predictedAwayGoals: p.predictedAwayGoals,
+        confidence: p.confidence,
+        keyFactors: p.keyFactors,
+        actualResult: p.actualResult,
+        wasCorrect: p.wasCorrect,
+        resolvedAt: p.resolvedAt,
+        createdAt: p.createdAt,
+      })),
+    };
+  }
+
+  /**
    * Fetch all currently live fixtures from the API.
    */
   async fetchLiveFixtures(leagueId?: number): Promise<any[]> {

@@ -143,6 +143,37 @@ export class FootballController {
     }
   }
 
+  @Get('fixtures/:id/prediction')
+  @ApiOperation({
+    summary: 'Get a fixture with its AI predictions and team details',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'API-Football fixture ID',
+    type: Number,
+  })
+  @ApiResponse({ status: 200, description: 'Fixture with predictions' })
+  @ApiResponse({ status: 404, description: 'Fixture not found' })
+  async getFixturePrediction(@Param('id', ParseIntPipe) id: number) {
+    try {
+      const result = await this.footballService.getFixtureWithPredictions(id);
+
+      if (!result) {
+        throw new NotFoundException(`Fixture ${id} not found`);
+      }
+
+      return result;
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(
+        `Failed to get fixture prediction for ${id}: ${error.message}`,
+      );
+      throw new InternalServerErrorException(
+        'Failed to retrieve fixture prediction',
+      );
+    }
+  }
+
   @Get('fixtures/:id')
   @ApiOperation({
     summary:
