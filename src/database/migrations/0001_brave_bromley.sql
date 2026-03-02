@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX "uq_fixture_events_natural_key" ON "fixture_events" USING btree ("fixture_id","team_id","elapsed","type","player_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "uq_injuries_player_team_fixture_type" ON "injuries" USING btree ("player_id","team_id","fixture_id","type");

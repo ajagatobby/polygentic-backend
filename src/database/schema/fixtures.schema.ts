@@ -147,6 +147,13 @@ export const fixtureEvents = pgTable(
   (table) => [
     index('idx_fixture_events_fixture').on(table.fixtureId),
     index('idx_fixture_events_type').on(table.type),
+    uniqueIndex('uq_fixture_events_natural_key').on(
+      table.fixtureId,
+      table.teamId,
+      table.elapsed,
+      table.type,
+      table.playerId,
+    ),
   ],
 );
 
@@ -171,6 +178,12 @@ export const injuries = pgTable(
   (table) => [
     index('idx_injuries_team').on(table.teamId),
     index('idx_injuries_fixture').on(table.fixtureId),
+    uniqueIndex('uq_injuries_player_team_fixture_type').on(
+      table.playerId,
+      table.teamId,
+      table.fixtureId,
+      table.type,
+    ),
   ],
 );
 

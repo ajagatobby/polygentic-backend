@@ -21,7 +21,9 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "sync:fixtures": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts",
+    "sync:fixtures:all": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts --all"
   },
   "dependencies": {
     "@nestjs/bull": "^11.0.4",

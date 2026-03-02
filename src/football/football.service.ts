@@ -175,7 +175,19 @@ export class FootballService {
           leagueId: item.league.id,
           updatedAt: new Date(),
         })
-        .onConflictDoNothing();
+        .onConflictDoUpdate({
+          target: [
+            schema.injuries.playerId,
+            schema.injuries.teamId,
+            schema.injuries.fixtureId,
+            schema.injuries.type,
+          ],
+          set: {
+            playerName: item.player.name,
+            reason: item.player.reason,
+            updatedAt: new Date(),
+          },
+        });
 
       count++;
     }
@@ -440,7 +452,23 @@ export class FootballService {
           detail: event.detail,
           comments: event.comments ?? null,
         })
-        .onConflictDoNothing();
+        .onConflictDoUpdate({
+          target: [
+            schema.fixtureEvents.fixtureId,
+            schema.fixtureEvents.teamId,
+            schema.fixtureEvents.elapsed,
+            schema.fixtureEvents.type,
+            schema.fixtureEvents.playerId,
+          ],
+          set: {
+            detail: event.detail,
+            extraTime: event.time.extra ?? null,
+            playerName: event.player?.name ?? null,
+            assistId: event.assist?.id ?? null,
+            assistName: event.assist?.name ?? null,
+            comments: event.comments ?? null,
+          },
+        });
     }
 
     return data.response;
