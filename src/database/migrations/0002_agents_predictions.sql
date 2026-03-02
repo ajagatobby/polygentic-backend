@@ -1,25 +1,15 @@
 -- Migration: Replace old Polymarket-based predictions + alerts with new agentic predictions system
 -- Drop old tables that are no longer in the schema
 
--- Drop old foreign key constraints first
-ALTER TABLE "alerts" DROP CONSTRAINT IF EXISTS "alerts_prediction_id_predictions_id_fk";--> statement-breakpoint
-ALTER TABLE "predictions" DROP CONSTRAINT IF EXISTS "predictions_polymarket_market_id_polymarket_markets_id_fk";--> statement-breakpoint
-ALTER TABLE "predictions" DROP CONSTRAINT IF EXISTS "predictions_fixture_id_fixtures_id_fk";--> statement-breakpoint
-ALTER TABLE "market_fixture_links" DROP CONSTRAINT IF EXISTS "market_fixture_links_polymarket_market_id_polymarket_markets_id_fk";--> statement-breakpoint
-ALTER TABLE "market_fixture_links" DROP CONSTRAINT IF EXISTS "market_fixture_links_fixture_id_fixtures_id_fk";--> statement-breakpoint
-ALTER TABLE "market_fixture_links" DROP CONSTRAINT IF EXISTS "market_fixture_links_team_id_teams_id_fk";--> statement-breakpoint
-ALTER TABLE "polymarket_markets" DROP CONSTRAINT IF EXISTS "polymarket_markets_event_id_polymarket_events_id_fk";--> statement-breakpoint
-ALTER TABLE "polymarket_price_history" DROP CONSTRAINT IF EXISTS "polymarket_price_history_market_id_polymarket_markets_id_fk";--> statement-breakpoint
-
--- Drop old tables
-DROP TABLE IF EXISTS "market_fixture_links";--> statement-breakpoint
-DROP TABLE IF EXISTS "polymarket_price_history";--> statement-breakpoint
-DROP TABLE IF EXISTS "polymarket_markets";--> statement-breakpoint
-DROP TABLE IF EXISTS "polymarket_events";--> statement-breakpoint
+-- Drop old tables (CASCADE handles FK deps automatically)
+DROP TABLE IF EXISTS "market_fixture_links" CASCADE;--> statement-breakpoint
+DROP TABLE IF EXISTS "polymarket_price_history" CASCADE;--> statement-breakpoint
+DROP TABLE IF EXISTS "polymarket_markets" CASCADE;--> statement-breakpoint
+DROP TABLE IF EXISTS "polymarket_events" CASCADE;--> statement-breakpoint
 
 -- Drop old predictions and alerts tables (will be recreated)
-DROP TABLE IF EXISTS "alerts";--> statement-breakpoint
-DROP TABLE IF EXISTS "predictions";--> statement-breakpoint
+DROP TABLE IF EXISTS "alerts" CASCADE;--> statement-breakpoint
+DROP TABLE IF EXISTS "predictions" CASCADE;--> statement-breakpoint
 
 -- Create new predictions table
 CREATE TABLE "predictions" (
