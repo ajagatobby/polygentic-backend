@@ -31,6 +31,28 @@ export enum FixtureStatus {
   BREAK_TIME = 'BT',
 }
 
+/**
+ * User-friendly match state groups that map to one or more FixtureStatus values.
+ */
+export enum MatchState {
+  /** Matches not yet started (NS, TBD) */
+  UPCOMING = 'upcoming',
+  /** Matches currently in play (1H, HT, 2H, ET, BT, P, SUSP, INT) */
+  LIVE = 'live',
+  /** Matches that have finished (FT, AET, PEN) */
+  FINISHED = 'finished',
+  /** Postponed, cancelled, abandoned, walkover, technical loss */
+  CANCELLED = 'cancelled',
+}
+
+/** Maps each MatchState to the raw API-Football status codes it includes. */
+export const MATCH_STATE_STATUSES: Record<MatchState, string[]> = {
+  [MatchState.UPCOMING]: ['NS', 'TBD'],
+  [MatchState.LIVE]: ['1H', 'HT', '2H', 'ET', 'BT', 'P', 'SUSP', 'INT'],
+  [MatchState.FINISHED]: ['FT', 'AET', 'PEN'],
+  [MatchState.CANCELLED]: ['PST', 'CANC', 'ABD', 'WO', 'AWD'],
+};
+
 export class FixtureQueryDto {
   @ApiPropertyOptional({ description: 'Filter by league ID' })
   @IsOptional()
@@ -47,12 +69,21 @@ export class FixtureQueryDto {
   date?: string;
 
   @ApiPropertyOptional({
-    description: 'Filter by fixture status',
+    description: 'Filter by exact fixture status code (e.g. NS, FT, 1H)',
     enum: FixtureStatus,
   })
   @IsOptional()
   @IsEnum(FixtureStatus)
   status?: FixtureStatus;
+
+  @ApiPropertyOptional({
+    description:
+      'Filter by match state group: upcoming (not started), live (in play), finished (completed), cancelled',
+    enum: MatchState,
+  })
+  @IsOptional()
+  @IsEnum(MatchState)
+  state?: MatchState;
 
   @ApiPropertyOptional({ description: 'Filter by team ID' })
   @IsOptional()

@@ -3,7 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { eq, and, gte, lte, sql, desc, asc } from 'drizzle-orm';
 import * as schema from '../database/schema';
-import { FixtureQueryDto } from './dto/fixture-query.dto';
+import { FixtureQueryDto, MATCH_STATE_STATUSES } from './dto/fixture-query.dto';
+import { inArray } from 'drizzle-orm';
 
 /** League IDs we actively track across all sync operations. */
 export const TRACKED_LEAGUES = [
@@ -564,8 +565,18 @@ export class FootballService {
       conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
     }
 
+    // Exact status filter (e.g. status=NS)
     if (filters?.status) {
       conditions.push(eq(schema.fixtures.status, filters.status));
+    }
+
+    // Friendly state group filter (e.g. state=live)
+    // state is ignored if an exact status is already provided
+    if (filters?.state && !filters?.status) {
+      const statuses = MATCH_STATE_STATUSES[filters.state];
+      if (statuses?.length) {
+        conditions.push(inArray(schema.fixtures.status, statuses));
+      }
     }
 
     if (filters?.teamId) {
@@ -611,11 +622,12 @@ export class FootballService {
 
   /**
    * Get today's fixtures with their predictions and team names.
-   * Optionally filter by leagueId or status.
+   * Optionally filter by leagueId, status, or state group.
    */
   async getTodayFixturesWithPredictions(filters?: {
     leagueId?: number;
     status?: string;
+    state?: string;
   }): Promise<any[]> {
     const now = new Date();
     const startOfDay = new Date(`${now.toISOString().split('T')[0]}T00:00:00Z`);
@@ -631,6 +643,15 @@ export class FootballService {
     }
     if (filters?.status) {
       conditions.push(eq(schema.fixtures.status, filters.status));
+    }
+    if (filters?.state && !filters?.status) {
+      const statuses =
+        MATCH_STATE_STATUSES[
+          filters.state as keyof typeof MATCH_STATE_STATUSES
+        ];
+      if (statuses?.length) {
+        conditions.push(inArray(schema.fixtures.status, statuses));
+      }
     }
 
     // Get today's fixtures

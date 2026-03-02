@@ -75,6 +75,9 @@ export class FootballController {
   @Get('fixtures/today')
   @ApiOperation({
     summary: "Get today's fixtures with their AI predictions and team details",
+    description:
+      'Filter by state: upcoming (not started), live (in play), finished (completed), cancelled. ' +
+      'Or use exact status codes: NS, 1H, HT, 2H, FT, etc.',
   })
   @ApiResponse({
     status: 200,
@@ -84,11 +87,13 @@ export class FootballController {
   async getTodayFixtures(
     @Query('leagueId') leagueId?: string,
     @Query('status') status?: string,
+    @Query('state') state?: string,
   ) {
     try {
       const data = await this.footballService.getTodayFixturesWithPredictions({
         leagueId: leagueId ? Number(leagueId) : undefined,
         status,
+        state,
       });
 
       return {
