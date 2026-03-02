@@ -57,8 +57,24 @@ export class FootballService {
   // ─── SYNC METHODS ────────────────────────────────────────────────────
 
   /**
+   * Leagues that follow a calendar-year season (Jan–Dec) rather than the
+   * European Aug–May cycle. For these, we need to try both the "European"
+   * season (getCurrentSeason()) and the current calendar year.
+   */
+  private static readonly CALENDAR_YEAR_LEAGUES = new Set([
+    253, // MLS
+    262, // Liga MX
+    71, // Brasileirao
+    128, // Argentina Liga
+  ]);
+
+  /**
    * Fetch upcoming fixtures for the given leagues and upsert into the
    * fixtures table. Defaults to TRACKED_LEAGUES.
+   *
+   * For calendar-year leagues (MLS, Brasileirao, etc.), also tries
+   * the current calendar year as the season to avoid missing fixtures
+   * when getCurrentSeason() returns the previous year.
    */
   async syncFixtures(
     leagueIds: number[] = [...TRACKED_LEAGUES],
@@ -66,27 +82,46 @@ export class FootballService {
     this.logger.log(`Syncing fixtures for ${leagueIds.length} leagues`);
     let totalUpserted = 0;
 
+    const europeanSeason = this.getCurrentSeason();
+    const calendarYear = new Date().getFullYear();
+
     for (const leagueId of leagueIds) {
       try {
-        const data = await this.apiRequest<any>('/fixtures', {
-          league: String(leagueId),
-          season: String(this.getCurrentSeason()),
-          next: '50',
-        });
+        // Determine which seasons to try for this league
+        const seasonsToTry = [europeanSeason];
+        if (
+          FootballService.CALENDAR_YEAR_LEAGUES.has(leagueId) &&
+          calendarYear !== europeanSeason
+        ) {
+          seasonsToTry.push(calendarYear);
+        }
 
-        if (!data.response?.length) {
+        let leagueUpserted = 0;
+
+        for (const season of seasonsToTry) {
+          const data = await this.apiRequest<any>('/fixtures', {
+            league: String(leagueId),
+            season: String(season),
+            next: '50',
+          });
+
+          if (!data.response?.length) continue;
+
+          for (const item of data.response) {
+            await this.upsertFixture(item);
+            leagueUpserted++;
+          }
+        }
+
+        if (leagueUpserted === 0) {
           this.logger.debug(`No upcoming fixtures for league ${leagueId}`);
-          continue;
+        } else {
+          this.logger.debug(
+            `Synced ${leagueUpserted} fixtures for league ${leagueId}`,
+          );
         }
 
-        for (const item of data.response) {
-          await this.upsertFixture(item);
-          totalUpserted++;
-        }
-
-        this.logger.debug(
-          `Synced ${data.response.length} fixtures for league ${leagueId}`,
-        );
+        totalUpserted += leagueUpserted;
       } catch (error) {
         this.logger.error(
           `Failed to sync fixtures for league ${leagueId}: ${error.message}`,
@@ -338,30 +373,38 @@ export class FootballService {
     const fromDate = twoDaysAgo.toISOString().split('T')[0];
     const toDate = now.toISOString().split('T')[0];
 
+    const europeanSeason = this.getCurrentSeason();
+    const calendarYear = new Date().getFullYear();
+
     for (const leagueId of leagueIds) {
       try {
-        const data = await this.apiRequest<any>('/fixtures', {
-          league: String(leagueId),
-          season: String(this.getCurrentSeason()),
-          from: fromDate,
-          to: toDate,
-        });
+        const seasonsToTry = [europeanSeason];
+        if (
+          FootballService.CALENDAR_YEAR_LEAGUES.has(leagueId) &&
+          calendarYear !== europeanSeason
+        ) {
+          seasonsToTry.push(calendarYear);
+        }
 
-        if (!data.response?.length) {
+        for (const season of seasonsToTry) {
+          const data = await this.apiRequest<any>('/fixtures', {
+            league: String(leagueId),
+            season: String(season),
+            from: fromDate,
+            to: toDate,
+          });
+
+          if (!data.response?.length) continue;
+
+          for (const item of data.response) {
+            await this.upsertFixture(item);
+            totalUpserted++;
+          }
+
           this.logger.debug(
-            `No recent fixtures for league ${leagueId} (${fromDate} to ${toDate})`,
+            `Synced ${data.response.length} recent fixtures for league ${leagueId} (season ${season})`,
           );
-          continue;
         }
-
-        for (const item of data.response) {
-          await this.upsertFixture(item);
-          totalUpserted++;
-        }
-
-        this.logger.debug(
-          `Synced ${data.response.length} recent fixtures for league ${leagueId}`,
-        );
       } catch (error) {
         this.logger.error(
           `Failed to sync completed fixtures for league ${leagueId}: ${error.message}`,
