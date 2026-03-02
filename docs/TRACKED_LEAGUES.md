@@ -28,6 +28,7 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | API ID | League              | Country    | Teams | Format                             |
 | ------ | ------------------- | ---------- | ----- | ---------------------------------- |
 | 253    | MLS                 | USA/Canada | 29    | Regular season + playoffs, Feb–Dec |
+| 262    | Liga MX             | Mexico     | 18    | Apertura + Clausura, Jul–May       |
 | 71     | Brasileirao Serie A | Brazil     | 20    | 38 matchdays, Apr–Dec              |
 | 128    | Liga Profesional    | Argentina  | 28    | 27 matchdays, Jan–Dec              |
 
