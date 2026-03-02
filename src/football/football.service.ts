@@ -213,6 +213,13 @@ export class FootballService {
         const homeStats = standing.home;
         const awayStats = standing.away;
 
+        // Ensure team exists before inserting team_form (FK constraint)
+        await this.ensureTeam({
+          id: standing.team.id,
+          name: standing.team.name,
+          logo: standing.team.logo,
+        });
+
         await this.db
           .insert(schema.teamForm)
           .values({
@@ -696,6 +703,33 @@ export class FootballService {
   }
 
   /**
+   * Ensure a team row exists in the teams table (upsert from API response data).
+   * This prevents FK violations when inserting fixtures or team_form rows.
+   */
+  private async ensureTeam(team: {
+    id: number;
+    name: string;
+    logo?: string;
+  }): Promise<void> {
+    await this.db
+      .insert(schema.teams)
+      .values({
+        id: team.id,
+        name: team.name,
+        logo: team.logo ?? null,
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: schema.teams.id,
+        set: {
+          name: team.name,
+          logo: team.logo ?? null,
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  /**
    * Upsert a single fixture from the API response into the database.
    */
   private async upsertFixture(item: any): Promise<void> {
@@ -704,6 +738,12 @@ export class FootballService {
     const teams = item.teams;
     const goals = item.goals;
     const score = item.score;
+
+    // Ensure both teams exist before inserting the fixture (FK constraint)
+    await Promise.all([
+      this.ensureTeam(teams.home),
+      this.ensureTeam(teams.away),
+    ]);
 
     await this.db
       .insert(schema.fixtures)
