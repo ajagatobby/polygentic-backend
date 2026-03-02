@@ -7,8 +7,18 @@ import { FixtureQueryDto } from './dto/fixture-query.dto';
 
 /** League IDs we actively track across all sync operations. */
 export const TRACKED_LEAGUES = [
-  39, 140, 141, 135, 78, 61, 2, 3, 848, 253, 262, 88, 94, 71, 128, 307, 45, 143,
-  81,
+  // Domestic leagues
+  39, 140, 141, 135, 78, 61, 88, 94, 307,
+  // European club competitions
+  2, 3, 848,
+  // Americas
+  253, 262, 71, 128,
+  // Domestic cups
+  45, 143, 81,
+  // International tournaments
+  1, 15, 4, 6, 9, 29, 5, 13,
+  // World Cup qualifiers
+  32, 34, 36,
 ] as const;
 
 interface ApiFootballResponse<T = any> {

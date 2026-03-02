@@ -46,6 +46,29 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | 143    | Copa del Rey | Spain   | Knockout, rounds vary |
 | 81     | DFB Pokal    | Germany | Knockout, rounds vary |
 
+## International Tournaments
+
+These are periodic tournaments -- they produce zero fixtures during off-periods so there is no API cost when inactive.
+
+| API ID | Tournament            | Region        | Format                 |
+| ------ | --------------------- | ------------- | ---------------------- |
+| 1      | FIFA World Cup        | Global        | Every 4 years, Jun–Jul |
+| 15     | FIFA Club World Cup   | Global        | Annual, Jun–Jul        |
+| 4      | Euro Championship     | Europe        | Every 4 years, Jun–Jul |
+| 6      | Africa Cup of Nations | Africa        | Every 2 years, Jan–Feb |
+| 9      | Copa America          | South America | Every 4 years, Jun–Jul |
+| 29     | AFC Asian Cup         | Asia          | Every 4 years          |
+| 5      | UEFA Nations League   | Europe        | Biennial, Sep–Jun      |
+| 13     | CONCACAF Gold Cup     | North America | Every 2 years, Jun–Jul |
+
+## World Cup Qualifiers
+
+| API ID | Tournament                                | Region        | Format                     |
+| ------ | ----------------------------------------- | ------------- | -------------------------- |
+| 32     | FIFA World Cup Qualifiers - Europe        | Europe        | Group stage + playoffs     |
+| 34     | FIFA World Cup Qualifiers - South America | South America | Round-robin (18 matchdays) |
+| 36     | FIFA World Cup Qualifiers - Africa        | Africa        | Group stage + playoffs     |
+
 ## How Tracking Works
 
 Adding a league ID to the `TRACKED_LEAGUES` array automatically includes it in:
