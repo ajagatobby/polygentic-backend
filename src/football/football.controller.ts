@@ -72,6 +72,42 @@ export class FootballController {
     };
   }
 
+  @Get('fixtures/today')
+  @ApiOperation({
+    summary: "Get today's fixtures with their AI predictions and team details",
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      "Today's fixtures with best prediction (pre_match > daily > on_demand) and all available predictions",
+  })
+  async getTodayFixtures(
+    @Query('leagueId') leagueId?: string,
+    @Query('status') status?: string,
+  ) {
+    try {
+      const data = await this.footballService.getTodayFixturesWithPredictions({
+        leagueId: leagueId ? Number(leagueId) : undefined,
+        status,
+      });
+
+      return {
+        data,
+        count: data.length,
+        date: new Date().toISOString().split('T')[0],
+        filters: {
+          leagueId: leagueId ? Number(leagueId) : null,
+          status: status ?? null,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get today's fixtures: ${error.message}`);
+      throw new InternalServerErrorException(
+        "Failed to retrieve today's fixtures",
+      );
+    }
+  }
+
   @Get('fixtures/live')
   @ApiOperation({ summary: 'Get currently live matches' })
   @ApiResponse({ status: 200, description: 'List of live matches' })

@@ -610,6 +610,165 @@ export class FootballService {
   }
 
   /**
+   * Get today's fixtures with their predictions and team names.
+   * Optionally filter by leagueId or status.
+   */
+  async getTodayFixturesWithPredictions(filters?: {
+    leagueId?: number;
+    status?: string;
+  }): Promise<any[]> {
+    const now = new Date();
+    const startOfDay = new Date(`${now.toISOString().split('T')[0]}T00:00:00Z`);
+    const endOfDay = new Date(`${now.toISOString().split('T')[0]}T23:59:59Z`);
+
+    const conditions: any[] = [
+      gte(schema.fixtures.date, startOfDay),
+      lte(schema.fixtures.date, endOfDay),
+    ];
+
+    if (filters?.leagueId) {
+      conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+    if (filters?.status) {
+      conditions.push(eq(schema.fixtures.status, filters.status));
+    }
+
+    // Get today's fixtures
+    const fixtures = await this.db
+      .select()
+      .from(schema.fixtures)
+      .where(and(...conditions))
+      .orderBy(asc(schema.fixtures.date));
+
+    if (fixtures.length === 0) return [];
+
+    // Collect fixture IDs and team IDs
+    const fixtureIds = fixtures.map((f: any) => f.id);
+    const teamIds = new Set<number>();
+    for (const f of fixtures) {
+      if (f.homeTeamId) teamIds.add(f.homeTeamId);
+      if (f.awayTeamId) teamIds.add(f.awayTeamId);
+    }
+
+    // Batch fetch predictions for all fixtures
+    const predictions = await this.db
+      .select()
+      .from(schema.predictions)
+      .where(
+        sql`${schema.predictions.fixtureId} IN (${sql.join(
+          fixtureIds.map((id: number) => sql`${id}`),
+          sql`, `,
+        )})`,
+      )
+      .orderBy(desc(schema.predictions.createdAt));
+
+    // Batch fetch team names
+    const teamRows =
+      teamIds.size > 0
+        ? await this.db
+            .select({
+              id: schema.teams.id,
+              name: schema.teams.name,
+              logo: schema.teams.logo,
+            })
+            .from(schema.teams)
+            .where(
+              sql`${schema.teams.id} IN (${sql.join(
+                [...teamIds].map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+        : [];
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, { name: t.name, logo: t.logo });
+    }
+
+    // Group predictions by fixture ID
+    const predictionsByFixture = new Map<number, any[]>();
+    for (const p of predictions) {
+      const existing = predictionsByFixture.get(p.fixtureId) ?? [];
+      existing.push(p);
+      predictionsByFixture.set(p.fixtureId, existing);
+    }
+
+    // Assemble response
+    return fixtures.map((fixture: any) => {
+      const homeTeam = teamMap.get(fixture.homeTeamId);
+      const awayTeam = teamMap.get(fixture.awayTeamId);
+      const fixturePredictions = predictionsByFixture.get(fixture.id) ?? [];
+
+      // Pick the best prediction: prefer pre_match, then daily, then on_demand
+      const bestPrediction =
+        fixturePredictions.find((p: any) => p.predictionType === 'pre_match') ??
+        fixturePredictions.find((p: any) => p.predictionType === 'daily') ??
+        fixturePredictions.find((p: any) => p.predictionType === 'on_demand') ??
+        null;
+
+      return {
+        fixture: {
+          id: fixture.id,
+          date: fixture.date,
+          status: fixture.status,
+          statusLong: fixture.statusLong,
+          elapsed: fixture.elapsed,
+          round: fixture.round,
+          referee: fixture.referee,
+          venueName: fixture.venueName,
+          venueCity: fixture.venueCity,
+          leagueId: fixture.leagueId,
+          leagueName: fixture.leagueName,
+          leagueCountry: fixture.leagueCountry,
+          season: fixture.season,
+          goalsHome: fixture.goalsHome,
+          goalsAway: fixture.goalsAway,
+        },
+        homeTeam: {
+          id: fixture.homeTeamId,
+          name: homeTeam?.name ?? null,
+          logo: homeTeam?.logo ?? null,
+        },
+        awayTeam: {
+          id: fixture.awayTeamId,
+          name: awayTeam?.name ?? null,
+          logo: awayTeam?.logo ?? null,
+        },
+        prediction: bestPrediction
+          ? {
+              id: bestPrediction.id,
+              predictionType: bestPrediction.predictionType,
+              homeWinProb: bestPrediction.homeWinProb,
+              drawProb: bestPrediction.drawProb,
+              awayWinProb: bestPrediction.awayWinProb,
+              predictedHomeGoals: bestPrediction.predictedHomeGoals,
+              predictedAwayGoals: bestPrediction.predictedAwayGoals,
+              confidence: bestPrediction.confidence,
+              keyFactors: bestPrediction.keyFactors,
+              riskFactors: bestPrediction.riskFactors,
+              valueBets: bestPrediction.valueBets,
+              detailedAnalysis: bestPrediction.detailedAnalysis,
+              actualResult: bestPrediction.actualResult,
+              wasCorrect: bestPrediction.wasCorrect,
+              probabilityAccuracy: bestPrediction.probabilityAccuracy,
+              resolvedAt: bestPrediction.resolvedAt,
+              createdAt: bestPrediction.createdAt,
+            }
+          : null,
+        allPredictions: fixturePredictions.map((p: any) => ({
+          id: p.id,
+          predictionType: p.predictionType,
+          homeWinProb: p.homeWinProb,
+          drawProb: p.drawProb,
+          awayWinProb: p.awayWinProb,
+          confidence: p.confidence,
+          createdAt: p.createdAt,
+        })),
+      };
+    });
+  }
+
+  /**
    * Get a single fixture by its API-Football ID with all related data.
    */
   async getFixtureById(id: number): Promise<{
