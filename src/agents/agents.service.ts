@@ -122,7 +122,11 @@ export class AgentsService {
       }
     }
 
-    return stored;
+    return {
+      ...stored,
+      homeTeamName: matchData.homeTeam?.team?.name ?? null,
+      awayTeamName: matchData.awayTeam?.team?.name ?? null,
+    };
   }
 
   // ─── Batch generation ───────────────────────────────────────────────
@@ -407,18 +411,23 @@ export class AgentsService {
 
     const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-    // If filtering by leagueId, join with fixtures
+    // If filtering by leagueId, join with fixtures + teams
     if (filters.leagueId) {
       const [data, countResult] = await Promise.all([
         this.db
           .select({
             prediction: schema.predictions,
             fixture: schema.fixtures,
+            homeTeam: schema.teams,
           })
           .from(schema.predictions)
           .innerJoin(
             schema.fixtures,
             eq(schema.predictions.fixtureId, schema.fixtures.id),
+          )
+          .leftJoin(
+            schema.teams,
+            eq(schema.predictions.homeTeamId, schema.teams.id),
           )
           .where(and(where, eq(schema.fixtures.leagueId, filters.leagueId)))
           .orderBy(desc(schema.predictions.createdAt))
@@ -435,7 +444,9 @@ export class AgentsService {
       ]);
 
       return {
-        data: data.map((r: any) => ({ ...r.prediction, fixture: r.fixture })),
+        data: await this.enrichPredictionsWithTeamNames(
+          data.map((r: any) => ({ ...r.prediction, fixture: r.fixture })),
+        ),
         total: Number(countResult[0]?.count ?? 0),
         page,
         limit,
@@ -457,7 +468,7 @@ export class AgentsService {
     ]);
 
     return {
-      data,
+      data: await this.enrichPredictionsWithTeamNames(data),
       total: Number(countResult[0]?.count ?? 0),
       page,
       limit,
@@ -465,11 +476,13 @@ export class AgentsService {
   }
 
   async getPredictionByFixtureId(fixtureId: number): Promise<any[]> {
-    return this.db
+    const rows = await this.db
       .select()
       .from(schema.predictions)
       .where(eq(schema.predictions.fixtureId, fixtureId))
       .orderBy(desc(schema.predictions.createdAt));
+
+    return this.enrichPredictionsWithTeamNames(rows);
   }
 
   /**
@@ -526,6 +539,47 @@ export class AgentsService {
   }
 
   // ─── Private helpers ────────────────────────────────────────────────
+
+  /**
+   * Enrich prediction rows with homeTeamName / awayTeamName by looking up the teams table.
+   * Batches team ID lookups to avoid N+1 queries.
+   */
+  private async enrichPredictionsWithTeamNames(
+    predictions: any[],
+  ): Promise<any[]> {
+    if (predictions.length === 0) return predictions;
+
+    // Collect unique team IDs
+    const teamIds = new Set<number>();
+    for (const p of predictions) {
+      if (p.homeTeamId) teamIds.add(p.homeTeamId);
+      if (p.awayTeamId) teamIds.add(p.awayTeamId);
+    }
+
+    if (teamIds.size === 0) return predictions;
+
+    // Batch lookup
+    const teamRows = await this.db
+      .select({ id: schema.teams.id, name: schema.teams.name })
+      .from(schema.teams)
+      .where(
+        sql`${schema.teams.id} IN (${sql.join(
+          [...teamIds].map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+
+    const teamMap = new Map<number, string>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, t.name);
+    }
+
+    return predictions.map((p: any) => ({
+      ...p,
+      homeTeamName: teamMap.get(p.homeTeamId) ?? null,
+      awayTeamName: teamMap.get(p.awayTeamId) ?? null,
+    }));
+  }
 
   private async storePrediction(
     fixtureId: number,
