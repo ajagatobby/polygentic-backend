@@ -3,14 +3,15 @@ import { eq, desc, and, sql } from 'drizzle-orm';
 import * as schema from '../database/schema';
 
 export type AlertType =
-  | 'mispricing'
+  | 'high_confidence'
+  | 'value_bet'
   | 'live_event'
-  | 'price_movement'
   | 'lineup_change';
 export type AlertSeverity = 'low' | 'medium' | 'high' | 'critical';
 
 interface CreateAlertDto {
-  predictionId: number;
+  predictionId?: number;
+  fixtureId?: number;
   type: AlertType;
   severity: AlertSeverity;
   title: string;
@@ -29,7 +30,8 @@ export class AlertsService {
       const [alert] = await this.db
         .insert(schema.alerts)
         .values({
-          predictionId: dto.predictionId,
+          predictionId: dto.predictionId || null,
+          fixtureId: dto.fixtureId || null,
           type: dto.type,
           severity: dto.severity,
           title: dto.title,
@@ -49,37 +51,39 @@ export class AlertsService {
     }
   }
 
-  async createMispricingAlert(
+  async createHighConfidenceAlert(
     predictionId: number,
-    marketTitle: string,
-    polymarketPrice: number,
-    consensusPrice: number,
-    gap: number,
+    fixtureId: number,
+    matchTitle: string,
+    confidence: number,
+    predictedResult: string,
   ): Promise<any> {
-    const severity = this.getMispricingSeverity(Math.abs(gap));
+    const severity: AlertSeverity =
+      confidence >= 9 ? 'critical' : confidence >= 7 ? 'high' : 'medium';
     return this.createAlert({
       predictionId,
-      type: 'mispricing',
+      fixtureId,
+      type: 'high_confidence',
       severity,
-      title: `Mispricing detected: ${marketTitle}`,
-      message: `Polymarket price ${(polymarketPrice * 100).toFixed(1)}% vs consensus ${(consensusPrice * 100).toFixed(1)}%. Gap: ${(gap * 100).toFixed(1)}%`,
-      data: { polymarketPrice, consensusPrice, gap },
+      title: `High confidence prediction: ${matchTitle}`,
+      message: `Predicted ${predictedResult} with confidence ${confidence}/10.`,
+      data: { confidence, predictedResult },
     });
   }
 
   async createLiveEventAlert(
-    predictionId: number,
+    fixtureId: number,
     eventType: string,
     matchTitle: string,
     details: Record<string, any>,
   ): Promise<any> {
     return this.createAlert({
-      predictionId,
+      fixtureId,
       type: 'live_event',
       severity:
         eventType === 'goal' || eventType === 'red_card' ? 'high' : 'medium',
       title: `Live: ${eventType.toUpperCase()} in ${matchTitle}`,
-      message: `${eventType} detected. Checking for Polymarket price lag.`,
+      message: `${eventType} detected in ${matchTitle}.`,
       data: { eventType, ...details },
     });
   }
@@ -150,12 +154,5 @@ export class AlertsService {
       .where(eq(schema.alerts.acknowledged, false));
 
     return result.rowCount || 0;
-  }
-
-  private getMispricingSeverity(absGap: number): AlertSeverity {
-    if (absGap >= 0.15) return 'critical';
-    if (absGap >= 0.1) return 'high';
-    if (absGap >= 0.07) return 'medium';
-    return 'low';
   }
 }

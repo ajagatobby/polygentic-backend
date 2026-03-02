@@ -34,14 +34,13 @@ async function bootstrap() {
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Polygentic API')
     .setDescription(
-      'Soccer prediction backend that combines Polymarket, API-Football, and The Odds API data to detect mispriced prediction markets.',
+      'AI-powered soccer prediction backend using multi-agent analysis. Combines API-Football data, bookmaker odds, and real-time research to produce match predictions.',
     )
-    .setVersion('1.0')
+    .setVersion('2.0')
     .addTag('Health', 'System health and status')
-    .addTag('Markets', 'Polymarket soccer markets')
     .addTag('Football', 'Fixtures, teams, and match data')
     .addTag('Odds', 'Bookmaker odds and consensus probabilities')
-    .addTag('Predictions', 'Prediction engine and mispricing detection')
+    .addTag('Predictions', 'AI-powered match predictions')
     .addTag('Alerts', 'Alert management')
     .build();
 

@@ -20,7 +20,7 @@ export class AlertsController {
   @ApiQuery({
     name: 'type',
     required: false,
-    enum: ['mispricing', 'live_event', 'price_movement', 'lineup_change'],
+    enum: ['high_confidence', 'value_bet', 'live_event', 'lineup_change'],
   })
   @ApiQuery({
     name: 'severity',

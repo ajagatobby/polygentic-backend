@@ -154,30 +154,21 @@ export class EnvConfig {
   @IsOptional()
   ODDS_API_CREDIT_PAUSE_THRESHOLD: number = 0.1;
 
-  // ─── POLYMARKET ──────────────────────────────────────────────────────
+  // ─── AI / PREDICTION ──────────────────────────────────────────────────
+
+  @IsString()
+  @IsNotEmpty()
+  ANTHROPIC_API_KEY: string;
+
+  @IsString()
+  @IsNotEmpty()
+  PERPLEXITY_API_KEY: string;
 
   @IsString()
   @IsOptional()
-  POLYMARKET_GAMMA_URL: string = 'https://gamma-api.polymarket.com';
-
-  @IsString()
-  @IsOptional()
-  POLYMARKET_CLOB_URL: string = 'https://clob.polymarket.com';
-
-  @IsString()
-  @IsOptional()
-  POLYMARKET_WS_URL: string =
-    'wss://ws-subscriptions-clob.polymarket.com/ws/market';
-
-  @IsString()
-  @IsOptional()
-  POLYMARKET_DATA_URL: string = 'https://data-api.polymarket.com';
+  PREDICTION_MODEL: string = 'claude-sonnet-4-20250514';
 
   // ─── SYNC INTERVALS ─────────────────────────────────────────────────
-
-  @IsString()
-  @IsOptional()
-  SYNC_POLYMARKET_INTERVAL: string = '*/15 * * * *';
 
   @IsString()
   @IsOptional()
@@ -205,7 +196,11 @@ export class EnvConfig {
 
   @IsString()
   @IsOptional()
-  SYNC_PREDICTIONS_INTERVAL: string = '*/20 * * * *';
+  SYNC_DAILY_PREDICTIONS_CRON: string = '0 6 * * *'; // 6 AM UTC
+
+  @IsString()
+  @IsOptional()
+  SYNC_PRE_MATCH_PREDICTIONS_CRON: string = '*/15 * * * *'; // Check every 15 min for fixtures starting within 1hr
 
   // ─── LIVE MATCH CONFIG ───────────────────────────────────────────────
 
@@ -237,29 +232,14 @@ export class EnvConfig {
   // ─── PREDICTION CONFIG ───────────────────────────────────────────────
 
   @Type(() => Number)
-  @IsNumber()
+  @IsInt()
   @IsOptional()
-  PREDICTION_MISPRICING_THRESHOLD: number = 0.05;
+  PREDICTION_HIGH_CONFIDENCE_THRESHOLD: number = 7; // 1-10 scale, alerts above this
 
   @Type(() => Number)
   @IsInt()
   @IsOptional()
-  PREDICTION_HIGH_CONFIDENCE_THRESHOLD: number = 60;
-
-  @Type(() => Number)
-  @IsNumber()
-  @IsOptional()
-  PREDICTION_SIGNAL_WEIGHT_MISPRICING: number = 0.4;
-
-  @Type(() => Number)
-  @IsNumber()
-  @IsOptional()
-  PREDICTION_SIGNAL_WEIGHT_STATISTICAL: number = 0.35;
-
-  @Type(() => Number)
-  @IsNumber()
-  @IsOptional()
-  PREDICTION_SIGNAL_WEIGHT_API_FOOTBALL: number = 0.25;
+  PREDICTION_MAX_CONCURRENT: number = 5; // Max concurrent prediction pipelines
 
   get databaseUrl(): string {
     if (this.DATABASE_URL) {

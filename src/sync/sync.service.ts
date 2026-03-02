@@ -1,11 +1,8 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as schema from '../database/schema';
-import { PolymarketService } from '../polymarket/polymarket.service';
 import { FootballService, TRACKED_LEAGUES } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
-import { MatcherService } from '../matcher/matcher.service';
-import { PredictionService } from '../prediction/prediction.service';
 import { desc, sql } from 'drizzle-orm';
 
 @Injectable()
@@ -15,50 +12,14 @@ export class SyncService {
   constructor(
     @Inject('DRIZZLE') private db: any,
     private readonly configService: ConfigService,
-    private readonly polymarketService: PolymarketService,
     private readonly footballService: FootballService,
     private readonly oddsService: OddsService,
-    private readonly matcherService: MatcherService,
-    private readonly predictionService: PredictionService,
   ) {}
-
-  async syncPolymarket(): Promise<void> {
-    const startedAt = new Date();
-    try {
-      this.logger.log('Starting Polymarket sync...');
-      const eventsResult: any = await this.polymarketService.syncSoccerEvents();
-      await this.polymarketService.syncPrices();
-
-      await this.logSync(
-        'polymarket',
-        'sync_events_and_prices',
-        'completed',
-        startedAt,
-        {
-          recordsProcessed:
-            eventsResult?.eventsCount || eventsResult?.events || 0,
-        },
-      );
-      this.logger.log('Polymarket sync completed');
-    } catch (error) {
-      this.logger.error(`Polymarket sync failed: ${error.message}`);
-      await this.logSync(
-        'polymarket',
-        'sync_events_and_prices',
-        'failed',
-        startedAt,
-        {
-          errorMessage: error.message,
-        },
-      );
-    }
-  }
 
   async syncFixtures(): Promise<void> {
     const startedAt = new Date();
     try {
       this.logger.log('Starting fixtures sync...');
-      const currentSeason = new Date().getFullYear();
       let totalProcessed = 0;
 
       for (const leagueId of TRACKED_LEAGUES) {
@@ -66,7 +27,7 @@ export class SyncService {
           const result: any = await this.footballService.syncFixtures([
             leagueId,
           ]);
-          totalProcessed += result?.count || result?.length || 0;
+          totalProcessed += result || 0;
         } catch (error) {
           this.logger.warn(
             `Failed to sync fixtures for league ${leagueId}: ${error.message}`,
@@ -79,9 +40,7 @@ export class SyncService {
         'sync_fixtures',
         'completed',
         startedAt,
-        {
-          recordsProcessed: totalProcessed,
-        },
+        { recordsProcessed: totalProcessed },
       );
       this.logger.log(
         `Fixtures sync completed. ${totalProcessed} fixtures processed.`,
@@ -98,7 +57,7 @@ export class SyncService {
     const startedAt = new Date();
     try {
       this.logger.log('Starting injuries sync...');
-      const currentSeason = new Date().getFullYear();
+      const currentSeason = this.getCurrentSeason();
       let totalProcessed = 0;
 
       for (const leagueId of TRACKED_LEAGUES) {
@@ -107,7 +66,7 @@ export class SyncService {
             leagueId,
             currentSeason,
           );
-          totalProcessed += result?.count || result?.length || 0;
+          totalProcessed += result || 0;
         } catch (error) {
           this.logger.warn(
             `Failed to sync injuries for league ${leagueId}: ${error.message}`,
@@ -120,9 +79,7 @@ export class SyncService {
         'sync_injuries',
         'completed',
         startedAt,
-        {
-          recordsProcessed: totalProcessed,
-        },
+        { recordsProcessed: totalProcessed },
       );
       this.logger.log(
         `Injuries sync completed. ${totalProcessed} records processed.`,
@@ -139,7 +96,7 @@ export class SyncService {
     const startedAt = new Date();
     try {
       this.logger.log('Starting standings sync...');
-      const currentSeason = new Date().getFullYear();
+      const currentSeason = this.getCurrentSeason();
 
       for (const leagueId of TRACKED_LEAGUES) {
         try {
@@ -165,9 +122,7 @@ export class SyncService {
         'sync_standings',
         'failed',
         startedAt,
-        {
-          errorMessage: error.message,
-        },
+        { errorMessage: error.message },
       );
     }
   }
@@ -188,68 +143,15 @@ export class SyncService {
     }
   }
 
-  async matchMarkets(): Promise<void> {
-    const startedAt = new Date();
-    try {
-      this.logger.log('Starting market matching...');
-      const result = await this.matcherService.matchAllMarkets();
-
-      await this.logSync('system', 'match_markets', 'completed', startedAt, {
-        recordsProcessed: result?.matched || 0,
-      });
-      this.logger.log(
-        `Market matching completed. ${result?.matched || 0} markets matched.`,
-      );
-    } catch (error) {
-      this.logger.error(`Market matching failed: ${error.message}`);
-      await this.logSync('system', 'match_markets', 'failed', startedAt, {
-        errorMessage: error.message,
-      });
-    }
-  }
-
-  async generatePredictions(): Promise<void> {
-    const startedAt = new Date();
-    try {
-      this.logger.log('Starting prediction generation...');
-      const result = await this.predictionService.generatePredictions();
-
-      await this.logSync(
-        'system',
-        'generate_predictions',
-        'completed',
-        startedAt,
-        {
-          recordsProcessed: result?.predictionsGenerated || 0,
-        },
-      );
-      this.logger.log(
-        `Prediction generation completed. ${result?.predictionsGenerated || 0} predictions.`,
-      );
-    } catch (error) {
-      this.logger.error(`Prediction generation failed: ${error.message}`);
-      await this.logSync(
-        'system',
-        'generate_predictions',
-        'failed',
-        startedAt,
-        {
-          errorMessage: error.message,
-        },
-      );
-    }
-  }
-
   async runFullSync(): Promise<{ results: Record<string, string> }> {
     this.logger.log('=== Starting full sync cycle ===');
     const results: Record<string, string> = {};
 
     const steps = [
-      { name: 'polymarket', fn: () => this.syncPolymarket() },
       { name: 'fixtures', fn: () => this.syncFixtures() },
+      { name: 'standings', fn: () => this.syncStandings() },
+      { name: 'injuries', fn: () => this.syncInjuries() },
       { name: 'odds', fn: () => this.syncOdds() },
-      { name: 'match_markets', fn: () => this.matchMarkets() },
-      { name: 'predictions', fn: () => this.generatePredictions() },
     ];
 
     for (const step of steps) {
@@ -271,6 +173,11 @@ export class SyncService {
       .from(schema.syncLog)
       .orderBy(desc(schema.syncLog.startedAt))
       .limit(limit);
+  }
+
+  private getCurrentSeason(): number {
+    const now = new Date();
+    return now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1;
   }
 
   private async logSync(
