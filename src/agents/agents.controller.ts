@@ -11,6 +11,12 @@ import {
 import { ApiTags, ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 import { AgentsService, PredictionType } from './agents.service';
 import { PredictionQueryDto } from './dto/prediction-query.dto';
+import { generatePredictionTask } from '../trigger/generate-prediction';
+import { generateDailyPredictionsTask } from '../trigger/generate-daily-predictions';
+import {
+  resolvePredictionsTask,
+  syncCompletedFixturesAndResolveTask,
+} from '../trigger/sync-and-resolve';
 
 @ApiTags('Predictions')
 @Controller('api/predictions')
@@ -59,7 +65,8 @@ export class AgentsController {
 
   @Post('generate/:fixtureId')
   @ApiOperation({
-    summary: 'Generate an on-demand prediction for a specific fixture',
+    summary:
+      'Trigger an on-demand prediction for a specific fixture (runs as background task)',
   })
   @ApiParam({ name: 'fixtureId', type: Number })
   @ApiQuery({
@@ -74,27 +81,71 @@ export class AgentsController {
   ) {
     const predictionType = (type as PredictionType) || 'on_demand';
     this.logger.log(
-      `On-demand prediction requested for fixture ${fixtureId} (type: ${predictionType})`,
+      `Triggering prediction task for fixture ${fixtureId} (type: ${predictionType})`,
     );
 
-    return this.agentsService.generatePrediction(fixtureId, predictionType);
+    const handle = await generatePredictionTask.trigger({
+      fixtureId,
+      predictionType,
+    });
+
+    return {
+      message: `Prediction task triggered for fixture ${fixtureId}`,
+      taskRunId: handle.id,
+      fixtureId,
+      predictionType,
+    };
   }
 
   @Post('generate-daily')
   @ApiOperation({
     summary:
-      'Generate daily predictions for all upcoming fixtures (next 48 hours)',
+      'Trigger daily predictions for all upcoming fixtures (runs as background task)',
   })
   async generateDailyPredictions() {
-    this.logger.log('Daily prediction generation triggered via API');
-    return this.agentsService.generateDailyPredictions();
+    this.logger.log('Triggering daily prediction generation via API');
+
+    const handle = await generateDailyPredictionsTask.trigger(
+      undefined as void,
+    );
+
+    return {
+      message: 'Daily prediction generation task triggered',
+      taskRunId: handle.id,
+    };
   }
 
   @Post('resolve')
   @ApiOperation({
-    summary: 'Resolve predictions for finished matches (compute accuracy)',
+    summary:
+      'Trigger prediction resolution for finished matches (runs as background task)',
   })
   async resolvePredictions() {
-    return this.agentsService.resolvePredictions();
+    this.logger.log('Triggering prediction resolution via API');
+
+    const handle = await resolvePredictionsTask.trigger(undefined as void);
+
+    return {
+      message: 'Prediction resolution task triggered',
+      taskRunId: handle.id,
+    };
+  }
+
+  @Post('sync-and-resolve')
+  @ApiOperation({
+    summary:
+      'Trigger completed fixture sync + prediction resolution (runs as background task)',
+  })
+  async syncAndResolve() {
+    this.logger.log('Triggering completed fixtures sync + resolve via API');
+
+    const handle = await syncCompletedFixturesAndResolveTask.trigger(
+      undefined as void,
+    );
+
+    return {
+      message: 'Sync and resolve task triggered',
+      taskRunId: handle.id,
+    };
   }
 }

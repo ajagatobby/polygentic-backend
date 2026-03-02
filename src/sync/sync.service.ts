@@ -127,6 +127,47 @@ export class SyncService {
     }
   }
 
+  async syncCompletedFixtures(): Promise<void> {
+    const startedAt = new Date();
+    try {
+      this.logger.log('Starting completed fixtures sync...');
+      let totalProcessed = 0;
+
+      for (const leagueId of TRACKED_LEAGUES) {
+        try {
+          const result: any = await this.footballService.syncCompletedFixtures([
+            leagueId,
+          ]);
+          totalProcessed += result || 0;
+        } catch (error) {
+          this.logger.warn(
+            `Failed to sync completed fixtures for league ${leagueId}: ${error.message}`,
+          );
+        }
+      }
+
+      await this.logSync(
+        'api_football',
+        'sync_completed_fixtures',
+        'completed',
+        startedAt,
+        { recordsProcessed: totalProcessed },
+      );
+      this.logger.log(
+        `Completed fixtures sync finished. ${totalProcessed} fixtures processed.`,
+      );
+    } catch (error) {
+      this.logger.error(`Completed fixtures sync failed: ${error.message}`);
+      await this.logSync(
+        'api_football',
+        'sync_completed_fixtures',
+        'failed',
+        startedAt,
+        { errorMessage: error.message },
+      );
+    }
+  }
+
   async syncOdds(): Promise<void> {
     const startedAt = new Date();
     try {
@@ -149,6 +190,7 @@ export class SyncService {
 
     const steps = [
       { name: 'fixtures', fn: () => this.syncFixtures() },
+      { name: 'completed_fixtures', fn: () => this.syncCompletedFixtures() },
       { name: 'standings', fn: () => this.syncStandings() },
       { name: 'injuries', fn: () => this.syncInjuries() },
       { name: 'odds', fn: () => this.syncOdds() },

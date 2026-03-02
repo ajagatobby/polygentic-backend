@@ -305,6 +305,64 @@ export class FootballService {
     return count;
   }
 
+  /**
+   * Fetch recently completed fixtures (last 2 days) for tracked leagues
+   * and upsert into the fixtures table. This ensures fixtures that were
+   * previously synced as upcoming (NS) get their final status (FT),
+   * goals, and scores updated — which is required for prediction resolution.
+   */
+  async syncCompletedFixtures(
+    leagueIds: number[] = [...TRACKED_LEAGUES],
+  ): Promise<number> {
+    this.logger.log(
+      `Syncing completed fixtures for ${leagueIds.length} leagues`,
+    );
+    let totalUpserted = 0;
+
+    const now = new Date();
+    const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
+
+    // Format dates as YYYY-MM-DD for the API
+    const fromDate = twoDaysAgo.toISOString().split('T')[0];
+    const toDate = now.toISOString().split('T')[0];
+
+    for (const leagueId of leagueIds) {
+      try {
+        const data = await this.apiRequest<any>('/fixtures', {
+          league: String(leagueId),
+          season: String(this.getCurrentSeason()),
+          from: fromDate,
+          to: toDate,
+        });
+
+        if (!data.response?.length) {
+          this.logger.debug(
+            `No recent fixtures for league ${leagueId} (${fromDate} to ${toDate})`,
+          );
+          continue;
+        }
+
+        for (const item of data.response) {
+          await this.upsertFixture(item);
+          totalUpserted++;
+        }
+
+        this.logger.debug(
+          `Synced ${data.response.length} recent fixtures for league ${leagueId}`,
+        );
+      } catch (error) {
+        this.logger.error(
+          `Failed to sync completed fixtures for league ${leagueId}: ${error.message}`,
+        );
+      }
+    }
+
+    this.logger.log(
+      `Completed fixtures sync done — ${totalUpserted} fixtures upserted`,
+    );
+    return totalUpserted;
+  }
+
   // ─── FETCH METHODS (Read-only from API, optionally persist) ──────────
 
   /**
