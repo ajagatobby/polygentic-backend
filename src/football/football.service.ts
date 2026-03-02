@@ -561,8 +561,69 @@ export class FootballService {
 
     const conditions: any[] = [];
 
+    // ── Search (league name OR team name) ──
+    // If 'club' is provided, we need to resolve team IDs first
+    // If 'search' is provided, we search both league name and team name
+    let teamIdsByName: number[] | null = null;
+
+    if (filters?.club || filters?.search) {
+      const searchTerm = filters.club || filters.search;
+      const matchingTeams = await this.db
+        .select({ id: schema.teams.id })
+        .from(schema.teams)
+        .where(
+          sql`LOWER(${schema.teams.name}) LIKE LOWER(${'%' + searchTerm + '%'})`,
+        );
+
+      teamIdsByName = matchingTeams.map((t: any) => t.id);
+    }
+
+    if (filters?.club) {
+      // Filter fixtures where home or away team matches the club name
+      if (teamIdsByName && teamIdsByName.length > 0) {
+        conditions.push(
+          sql`(${schema.fixtures.homeTeamId} IN (${sql.join(
+            teamIdsByName.map((id: number) => sql`${id}`),
+            sql`, `,
+          )}) OR ${schema.fixtures.awayTeamId} IN (${sql.join(
+            teamIdsByName.map((id: number) => sql`${id}`),
+            sql`, `,
+          )}))`,
+        );
+      } else {
+        // No teams match — return empty result
+        return { data: [], total: 0, page, limit };
+      }
+    }
+
+    if (filters?.search) {
+      // Search across league name OR team name
+      const searchPattern = '%' + filters.search + '%';
+      const leagueCondition = sql`LOWER(${schema.fixtures.leagueName}) LIKE LOWER(${searchPattern})`;
+
+      if (teamIdsByName && teamIdsByName.length > 0) {
+        const teamCondition = sql`(${schema.fixtures.homeTeamId} IN (${sql.join(
+          teamIdsByName.map((id: number) => sql`${id}`),
+          sql`, `,
+        )}) OR ${schema.fixtures.awayTeamId} IN (${sql.join(
+          teamIdsByName.map((id: number) => sql`${id}`),
+          sql`, `,
+        )}))`;
+        conditions.push(sql`(${leagueCondition} OR ${teamCondition})`);
+      } else {
+        conditions.push(leagueCondition);
+      }
+    }
+
     if (filters?.leagueId) {
       conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+
+    // Filter by league name (partial, case-insensitive)
+    if (filters?.leagueName) {
+      conditions.push(
+        sql`LOWER(${schema.fixtures.leagueName}) LIKE LOWER(${'%' + filters.leagueName + '%'})`,
+      );
     }
 
     // Exact status filter (e.g. status=NS)

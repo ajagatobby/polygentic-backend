@@ -54,11 +54,39 @@ export const MATCH_STATE_STATUSES: Record<MatchState, string[]> = {
 };
 
 export class FixtureQueryDto {
+  @ApiPropertyOptional({
+    description:
+      'Search across league names and team names (case-insensitive, partial match). ' +
+      'Example: "premier", "madrid", "la liga"',
+    example: 'premier',
+  })
+  @IsOptional()
+  @IsString()
+  search?: string;
+
   @ApiPropertyOptional({ description: 'Filter by league ID' })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   leagueId?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Filter by league name (case-insensitive, partial match). Example: "premier", "la liga"',
+    example: 'Premier League',
+  })
+  @IsOptional()
+  @IsString()
+  leagueName?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Filter by club/team name (case-insensitive, partial match). Returns fixtures where either home or away team matches. Example: "barcelona", "real madrid"',
+    example: 'Barcelona',
+  })
+  @IsOptional()
+  @IsString()
+  club?: string;
 
   @ApiPropertyOptional({
     description: 'Filter by date (YYYY-MM-DD)',
