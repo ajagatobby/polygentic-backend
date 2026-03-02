@@ -22,6 +22,11 @@
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
+    "trigger:deploy": "npx trigger.dev deploy",
+    "trigger:dev": "npx trigger.dev dev",
+    "trigger:logs": "npx trigger.dev logs",
+    "trigger:run": "npx trigger.dev run",
+    "trigger:status": "npx trigger.dev status",
     "sync:fixtures": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts",
     "sync:fixtures:all": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts --all"
   },

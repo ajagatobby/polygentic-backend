@@ -3,6 +3,7 @@ import {
   generateDailyPredictionsTask,
   generatePreMatchPredictionsTask,
 } from './generate-daily-predictions';
+import { lineupPredictionTask } from './lineup-prediction';
 import { syncCompletedFixturesAndResolveTask } from './sync-and-resolve';
 
 /**
@@ -42,6 +43,21 @@ export const preMatchPredictionsSchedule = schedules.task({
       undefined as void,
     );
     logger.info('Triggered pre-match predictions task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 5 minutes: Check for newly available lineups and regenerate predictions.
+ * Lineups appear ~60min before kickoff. This task catches them quickly and
+ * re-runs the prediction pipeline with confirmed XI and formation data.
+ */
+export const lineupPredictionSchedule = schedules.task({
+  id: 'scheduled-lineup-prediction',
+  cron: '*/5 * * * *',
+  run: async () => {
+    logger.info('Scheduled: lineup-aware prediction check');
+    const handle = await lineupPredictionTask.trigger(undefined as void);
+    logger.info('Triggered lineup prediction task', { runId: handle.id });
   },
 });
 
