@@ -169,7 +169,7 @@ export const injuries = pgTable(
       .notNull()
       .references(() => teams.id),
     fixtureId: integer('fixture_id').references(() => fixtures.id),
-    leagueId: integer('league_id'),
+    leagueId: integer('league_id').notNull(),
     type: varchar('type', { length: 100 }),
     reason: varchar('reason', { length: 255 }),
     createdAt: timestamp('created_at').defaultNow(),
@@ -178,10 +178,14 @@ export const injuries = pgTable(
   (table) => [
     index('idx_injuries_team').on(table.teamId),
     index('idx_injuries_fixture').on(table.fixtureId),
-    uniqueIndex('uq_injuries_player_team_fixture_type').on(
+    // Use (playerId, teamId, leagueId, type) instead of fixtureId.
+    // fixtureId is nullable and PostgreSQL treats NULLs as distinct in
+    // unique indexes, which means onConflictDoUpdate never matches rows
+    // with fixtureId = null, causing duplicate rows every sync cycle.
+    uniqueIndex('uq_injuries_player_team_league_type').on(
       table.playerId,
       table.teamId,
-      table.fixtureId,
+      table.leagueId,
       table.type,
     ),
   ],

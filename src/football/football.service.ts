@@ -186,8 +186,15 @@ export class FootballService {
    * leagues (MLS, Brasileirao, etc.) both the current calendar year and the
    * European season are tried, accumulating results from all seasons.
    *
-   * Injuries that reference a fixtureId not yet in our database are inserted
-   * with fixtureId = null to avoid FK constraint violations.
+   * Key behaviours:
+   * - Ensures the referenced team exists (via ensureTeam) before inserting to
+   *   avoid FK constraint violations on teamId.
+   * - Injuries that reference a fixtureId not yet in our database are inserted
+   *   with fixtureId = null to avoid FK constraint violations.
+   * - Supports pagination: fetches all pages from the API if multiple exist.
+   * - Uses (playerId, teamId, leagueId, type) as the conflict target instead
+   *   of fixtureId to avoid duplicate rows caused by NULL != NULL in PG
+   *   unique indexes.
    */
   async syncInjuries(leagueId: number): Promise<number> {
     const seasonsToTry = FootballService.getSeasonsForLeague(leagueId);
@@ -198,21 +205,40 @@ export class FootballService {
         `Syncing injuries for league ${leagueId}, season ${season}`,
       );
 
-      const data = await this.apiRequest<any>('/injuries', {
-        league: String(leagueId),
-        season: String(season),
-      });
+      // ── Fetch all pages from the API ──────────────────────────────
+      const allItems: any[] = [];
+      let currentPage = 1;
+      let totalPages = 1;
 
-      if (!data.response?.length) {
+      do {
+        const data = await this.apiRequest<any>('/injuries', {
+          league: String(leagueId),
+          season: String(season),
+          page: String(currentPage),
+        });
+
+        if (data.response?.length) {
+          allItems.push(...data.response);
+        }
+
+        totalPages = data.paging?.total ?? 1;
+        currentPage++;
+      } while (currentPage <= totalPages);
+
+      if (!allItems.length) {
         this.logger.debug(
           `No injuries for league ${leagueId} season ${season}`,
         );
         continue;
       }
 
-      // Collect all referenced fixture IDs and check which exist in our DB
+      this.logger.log(
+        `Fetched ${allItems.length} injury records for league ${leagueId} (season ${season}, ${totalPages} page(s))`,
+      );
+
+      // ── Check which referenced fixtures exist in our DB ───────────
       const referencedFixtureIds = new Set<number>();
-      for (const item of data.response) {
+      for (const item of allItems) {
         if (item.fixture?.id) referencedFixtureIds.add(item.fixture.id);
       }
 
@@ -232,9 +258,12 @@ export class FootballService {
         }
       }
 
+      // ── Upsert each injury ────────────────────────────────────────
       let count = 0;
       let skippedFixtures = 0;
-      for (const item of data.response) {
+      let errors = 0;
+
+      for (const item of allItems) {
         // Use null for fixtureId if the referenced fixture is not in our DB
         const rawFixtureId = item.fixture?.id ?? null;
         const safeFixtureId =
@@ -247,6 +276,15 @@ export class FootballService {
         }
 
         try {
+          // Ensure the team exists to avoid FK violations on teamId
+          if (item.team?.id && item.team?.name) {
+            await this.ensureTeam({
+              id: item.team.id,
+              name: item.team.name,
+              logo: item.team.logo,
+            });
+          }
+
           await this.db
             .insert(schema.injuries)
             .values({
@@ -263,27 +301,35 @@ export class FootballService {
               target: [
                 schema.injuries.playerId,
                 schema.injuries.teamId,
-                schema.injuries.fixtureId,
+                schema.injuries.leagueId,
                 schema.injuries.type,
               ],
               set: {
                 playerName: item.player.name,
                 reason: item.player.reason,
+                fixtureId: safeFixtureId,
                 updatedAt: new Date(),
               },
             });
 
           count++;
         } catch (error) {
-          this.logger.debug(
-            `Skipped injury for player ${item.player?.id} (${item.player?.name}): ${error.message}`,
+          errors++;
+          this.logger.warn(
+            `Failed to upsert injury for player ${item.player?.id} (${item.player?.name}), team ${item.team?.id}: ${error.message}`,
           );
         }
       }
 
       if (skippedFixtures > 0) {
-        this.logger.debug(
+        this.logger.log(
           `${skippedFixtures} injuries for league ${leagueId} had missing fixture refs (fixtureId set to null)`,
+        );
+      }
+
+      if (errors > 0) {
+        this.logger.warn(
+          `${errors}/${allItems.length} injuries failed to upsert for league ${leagueId} (season ${season})`,
         );
       }
 
