@@ -1,242 +1,164 @@
-# Features & Implementation Phases
+# Features & Implementation Status
 
 ## Overview
 
-The project is broken into 7 phases, each building on the previous. Phases 1-4 deliver core value. Phases 5-7 add advanced capabilities.
+The project has evolved from its original 7-phase plan. The core system is operational with AI predictions, live monitoring, and automatic resolution. This document tracks what's been built and what's remaining.
 
 ---
 
-## Phase 1: Foundation
+## Phase 1: Foundation -- COMPLETE
 
 **Goal:** Set up the project infrastructure and database.
 
-### Features
-
-- [ ] **NestJS project setup** — Configure modules, middleware, exception filters, logging
-- [ ] **PostgreSQL + Drizzle ORM setup** — Connection, schema definitions, migration system
-- [ ] **Database schema creation** — All 15 tables as defined in DATABASE_SCHEMA.md
-- [ ] **Environment configuration** — Validated config module for all API keys and settings
-- [ ] **Health check endpoint** — `GET /api/health` returning system status
-- [ ] **Swagger API documentation** — Auto-generated OpenAPI docs at `/api/docs`
-- [ ] **Redis + Bull queue setup** — For background job processing
-
-### Deliverables
-
-- Working NestJS application with database connection
-- All tables created via migration
-- Health check returning OK
-- Swagger UI accessible
+- [x] **NestJS project setup** — NestJS 11 with modules, middleware, exception filters, logging
+- [x] **PostgreSQL + Drizzle ORM setup** — Supabase-hosted, Drizzle schema definitions, migration system
+- [x] **Database schema creation** — 16 tables across 5 domains (see DATABASE_SCHEMA.md)
+- [x] **Environment configuration** — Validated config module for all API keys and settings
+- [x] **Health check endpoint** — `GET /api/health` returning system status
+- [x] **Swagger API documentation** — Auto-generated OpenAPI docs at `/api/docs`
+- [x] ~~**Redis + Bull queue setup**~~ — Replaced by Trigger.dev for durable execution
 
 ---
 
-## Phase 2: Polymarket Integration
+## Phase 2: Polymarket Integration -- COMPLETE (Data Ingestion)
 
 **Goal:** Fetch and store soccer markets from Polymarket.
 
-### Features
+- [x] **PolymarketService** — HTTP client for Gamma API and CLOB API
+- [x] **Event discovery** — Fetch active soccer events by tags
+- [x] **Market data sync** — Store events and markets in database
+- [x] **Price fetching** — Get current prices, midpoints, spreads from CLOB API
+- [x] **Price history tracking** — Periodic snapshots stored in polymarket_price_history
+- [x] **Market type classification** — Classify markets by type
+- [x] **API endpoints** — `GET /api/markets`, `GET /api/markets/:id`, `GET /api/markets/search`
 
-- [ ] **PolymarketService** — HTTP client for Gamma API and CLOB API
-- [ ] **Event discovery** — Fetch active soccer events by tags (soccer, football, league-specific)
-- [ ] **Market data sync** — Store events and markets in database
-- [ ] **Price fetching** — Get current prices, midpoints, spreads from CLOB API
-- [ ] **Price history tracking** — Periodic snapshots stored in polymarket_price_history
-- [ ] **Market type classification** — Classify markets as match_outcome, league_winner, transfer, etc.
-- [ ] **Cron job: sync markets** — Every 15 minutes, refresh Polymarket data
-- [ ] **API endpoints:**
-  - `GET /api/markets` — List all tracked soccer markets
-  - `GET /api/markets/:id` — Market detail with price history
-  - `GET /api/markets/search?q=arsenal` — Search markets
-
-### Deliverables
-
-- Polymarket soccer markets stored and updating every 15 minutes
-- API endpoints returning market data
-- Price history accumulating over time
+> **Note:** The system has pivoted away from Polymarket-centric mispricing detection toward standalone AI match predictions. Polymarket integration remains functional but the prediction engine now operates independently.
 
 ---
 
-## Phase 3: API-Football Integration
+## Phase 3: API-Football Integration -- COMPLETE
 
 **Goal:** Fetch match data, team stats, injuries, and built-in predictions.
 
-### Features
-
-- [ ] **FootballService** — HTTP client for API-Football v3
-- [ ] **League tracking** — Configure which leagues to monitor (top 20+ leagues)
-- [ ] **Fixture sync** — Fetch upcoming fixtures for tracked leagues
-- [ ] **Team data sync** — Store team profiles and season statistics
-- [ ] **Injury sync** — Fetch current injuries per league
-- [ ] **H2H data** — Fetch head-to-head history for upcoming matches
-- [ ] **Predictions fetch** — Get API-Football's built-in predictions per fixture
-- [ ] **Team form calculation** — Compute rolling form from recent results
-- [ ] **Standings sync** — Current league tables
-- [ ] **Cron jobs:**
-  - Fixture sync: every 30 minutes
-  - Injury sync: every 2 hours
-  - Team stats sync: every 6 hours
-  - Standings sync: every 2 hours
-- [ ] **API endpoints:**
-  - `GET /api/fixtures` — Upcoming fixtures
-  - `GET /api/fixtures/:id` — Fixture detail with stats, injuries, predictions
-  - `GET /api/teams/:id` — Team profile with form and stats
-  - `GET /api/leagues` — Tracked leagues with standings
-
-### Deliverables
-
-- Fixture data for all tracked leagues
-- Injuries, team stats, H2H data populated
-- API-Football predictions stored
-- Cron jobs running on schedule
+- [x] **FootballService** — HTTP client for API-Football v3 with rate limiting
+- [x] **League tracking** — 30 leagues tracked (domestic, international, cups, qualifiers, tournaments)
+- [x] **Fixture sync** — Upcoming fixtures synced every 30 minutes for all tracked leagues
+- [x] **Completed fixture sync** — Recently finished matches synced for prediction resolution
+- [x] **Historical backfill** — Script for 6-month backfill of fixtures + stats + events
+- [x] **Team data sync** — Team profiles stored and updated
+- [x] **Injury sync** — Injuries synced every 2 hours with FK safety (null fixtureId for unknown refs)
+- [x] **Lineup sync** — Confirmed lineups persisted to `fixture_lineups` table with formation, startXI, bench, coach, team colors
+- [x] **H2H data** — Fetched on-demand during prediction pipeline
+- [x] **Predictions fetch** — API-Football's built-in predictions fetched per fixture
+- [x] **Team form calculation** — Rolling form from standings sync
+- [x] **Standings sync** — League tables synced every 2 hours
+- [x] **Calendar-year season handling** — MLS, Liga MX, Brasileirao, Argentina Liga correctly use calendar-year seasons
+- [x] **Season detection** — `getCurrentSeason()` and `getSeasonsForLeague()` as single source of truth
+- [x] **Cron jobs** — Fixtures (30min), Injuries (2h), Standings (2h), Odds (6h)
+- [x] **API endpoints:**
+  - `GET /api/fixtures` — Rich filtering (search, leagueName, club, state, status, date, teamId, season)
+  - `GET /api/fixtures/today` — Today's fixtures with AI predictions
+  - `GET /api/fixtures/:id` — Fixture detail with stats, events, injuries, lineups
+  - `GET /api/fixtures/:id/prediction` — Fixture with AI prediction and team details
+  - `GET /api/fixtures/:id/lineups` — Confirmed lineups (DB first, API fallback)
+  - `GET /api/teams/:id` — Team profile with form
+  - `GET /api/teams/:id/history` — Match history with stats for graphs
+  - `GET /api/leagues` — Tracked leagues
+  - `POST /api/fixtures/sync` — Manual sync trigger
 
 ---
 
-## Phase 4: The Odds API Integration
+## Phase 4: The Odds API Integration -- COMPLETE
 
-**Goal:** Fetch bookmaker odds, calculate consensus probabilities, detect mispricings.
+**Goal:** Fetch bookmaker odds, calculate consensus probabilities.
 
-### Features
-
-- [ ] **OddsService** — HTTP client for The Odds API v4
-- [ ] **Sport key mapping** — Map soccer leagues to Odds API sport keys
-- [ ] **Odds fetching** — Fetch h2h, totals, spreads for tracked leagues
-- [ ] **Probability conversion** — Convert decimal odds to implied probabilities
-- [ ] **Vig removal** — Normalize probabilities by removing overround
-- [ ] **Weighted consensus calculation** — Compute consensus using bookmaker sharpness weights
-- [ ] **Consensus odds storage** — Pre-calculated consensus probabilities in consensus_odds table
-- [ ] **Quota tracking** — Monitor credit usage via response headers, pause if low
-- [ ] **Cron jobs:**
-  - Odds sync for top 5 leagues: every 6 hours
-  - Odds sync for other leagues: every 12 hours
-  - Outright/futures: daily
-- [ ] **API endpoints:**
-  - `GET /api/odds/:eventId` — Odds for a specific event with all bookmakers
-  - `GET /api/odds/consensus/:eventId` — Consensus probability for an event
-
-### Deliverables
-
-- Bookmaker odds for all tracked soccer leagues
-- Consensus probabilities calculated and stored
-- Quota management preventing overspend
+- [x] **OddsService** — HTTP client for The Odds API v4
+- [x] **Sport key mapping** — Soccer leagues mapped to Odds API sport keys
+- [x] **Odds fetching** — h2h, totals, spreads for tracked leagues
+- [x] **Probability conversion** — Decimal odds to implied probabilities
+- [x] **Vig removal** — Normalize probabilities by removing overround
+- [x] **Weighted consensus** — Bookmaker sharpness weights (Pinnacle 35%, Betfair 25%, etc.)
+- [x] **Consensus odds storage** — Pre-calculated in consensus_odds table
+- [x] **Quota tracking** — Credit monitoring via response headers
+- [x] **Cron job** — Odds sync every 6 hours
+- [x] **API endpoints** — `GET /api/odds/:eventId`, `GET /api/odds/consensus/:eventId`
 
 ---
 
-## Phase 5: Market Matching & Prediction Engine
+## Phase 5: AI Prediction Engine -- COMPLETE
 
-**Goal:** Link Polymarket markets to real fixtures and generate predictions.
+**Goal:** Generate AI-powered match predictions.
 
-### Features
-
-- [ ] **MatcherService** — Links Polymarket markets to API-Football fixtures and Odds API events
-- [ ] **Fuzzy text matching** — Extract team names, dates, league names from Polymarket titles
-- [ ] **Match type routing** — Different matching logic per market type
-- [ ] **Manual override support** — Admin can manually link markets to fixtures
-- [ ] **MispricingService** — Compare Polymarket prices against bookmaker consensus
-- [ ] **StatisticalModelService** — Heuristic model combining form, H2H, injuries, goals
-- [ ] **PredictionService** — Combine all signals into final prediction
-- [ ] **ConfidenceService** — Score prediction confidence (0-100)
-- [ ] **RecommendationEngine** — Generate BUY_YES / BUY_NO / HOLD / NO_SIGNAL
-- [ ] **Cron job: generate predictions** — After each data sync cycle
-- [ ] **API endpoints:**
-  - `GET /api/predictions` — All current predictions, sorted by confidence
-  - `GET /api/predictions/mispricings` — Only markets with significant mispricings
-  - `GET /api/predictions/:id` — Prediction detail with all signals
-  - `GET /api/predictions/history` — Past predictions with outcomes
-
-### Deliverables
-
-- Polymarket markets linked to real fixtures
-- Predictions generated with mispricing detection
-- Confidence scores and recommendations
-- API serving prediction data
+- [x] **3-Agent Pipeline** — DataCollector -> Perplexity Research -> Claude Analysis
+- [x] **DataCollectorAgent** — Gathers fixture, form, H2H, injuries, lineups (DB first), odds
+- [x] **ResearchAgent** — Perplexity Sonar web research for real-time context
+- [x] **AnalysisAgent** — Claude structured prediction (probabilities, goals, confidence, factors)
+- [x] **Trigger.dev integration** — Durable execution with retries for all prediction tasks
+- [x] **Daily predictions** — 6 AM UTC for next 48 hours of fixtures
+- [x] **Pre-match predictions** — Every 15 minutes for fixtures within 1 hour
+- [x] **Lineup-aware regeneration** — Every 5 minutes, detects lineups and re-generates predictions
+- [x] **Prediction resolution** — Automatic after match completion (wasCorrect, Brier score)
+- [x] **Accuracy tracking** — `getAccuracyStats()` returns accuracy metrics by type
+- [x] **API endpoints:**
+  - `GET /api/predictions` — All predictions sorted by confidence
+  - `GET /api/predictions/accuracy` — Accuracy statistics
 
 ---
 
-## Phase 6: Live Match Monitoring
+## Phase 6: Live Match Monitoring -- COMPLETE
 
-**Goal:** Real-time monitoring during live matches with live mispricing detection.
+**Goal:** Real-time monitoring during live matches.
 
-### Features
-
-- [ ] **LiveScoreService** — Poll API-Football for live match data every 30 seconds
-- [ ] **Live event detection** — Detect goals, red cards, penalties in real-time
-- [ ] **PolymarketWebSocket** — Persistent WebSocket connection to Polymarket price streams
-- [ ] **Live mispricing detection** — Compare live bookmaker odds shifts vs Polymarket price reactions
-- [ ] **Live prediction updates** — Recalculate predictions on significant events
-- [ ] **Alert generation** — Create alerts for live mispricings
-- [ ] **Match lifecycle management** — Auto-start monitoring when matches begin, stop when they end
-- [ ] **Rate limit management** — Dynamic polling frequency based on match state and API budget
-- [ ] **Lineup sync** — Fetch confirmed lineups ~1 hour before kickoff, adjust predictions
-- [ ] **WebSocket gateway** — Expose live data to clients via WebSocket
-- [ ] **API endpoints:**
-  - `GET /api/live` — All currently live matches with real-time data
-  - `GET /api/live/:fixtureId` — Live match detail with events and price movement
-  - `WS /ws/live` — WebSocket for real-time updates to clients
-
-### Deliverables
-
-- Live match monitoring during active games
-- Real-time Polymarket price tracking via WebSocket
-- Live mispricing alerts when Polymarket lags behind bookmaker adjustments
-- WebSocket gateway for client consumption
+- [x] **LiveScoreService** — Adaptive polling (15s/30s/60s based on match state)
+- [x] **Auto-start** — Monitoring starts on server boot via `OnModuleInit`
+- [x] **Event detection** — Goals, red cards, match start/end, status changes (diff-based)
+- [x] **LiveEventHandler** — Event-driven DB persistence:
+  - Goal: update score in DB + create alert
+  - Red card: create alert
+  - Match start: update status to 1H
+  - Match end: persist final score + trigger immediate prediction resolution via Trigger.dev
+  - Status change: update status (HT, 2H, ET, P, etc.)
+- [x] **WebSocket gateway** — Socket.IO on `/live` namespace, 30s broadcast interval
+- [x] **Memory leak fix** — Broadcast timer properly cleaned up on stop
+- [x] **Manual controls** — `POST /api/fixtures/live/start` and `POST /api/fixtures/live/stop`
+- [x] **API endpoints:**
+  - `GET /api/fixtures/live` — Current live matches (monitor or API fallback)
 
 ---
 
-## Phase 7: Alerts, Backtesting & Optimization
+## Phase 7: Alerts & Accuracy -- COMPLETE
 
-**Goal:** Alert system, historical analysis, and model calibration.
+**Goal:** Alert system and prediction accuracy tracking.
 
-### Features
-
-- [ ] **AlertService** — Generate and manage alerts across all severity levels
-- [ ] **Alert types:**
-  - `mispricing` — Significant gap detected between Polymarket and bookmaker consensus
-  - `live_event` — Goal/red card detected with Polymarket price lag
-  - `price_movement` — Unusual Polymarket price movement (potential informed trading)
-  - `lineup_change` — Key player dropped from lineup before match
-- [ ] **Backtesting framework** — After markets resolve, compare predictions against outcomes
-- [ ] **Accuracy tracking** — Brier scores, calibration curves, ROI calculations
-- [ ] **Model calibration** — Adjust signal weights based on historical accuracy
-- [ ] **Prediction history** — Full audit trail of every prediction with resolution data
-- [ ] **Daily report generation** — Summary of active predictions, hit rate, opportunities
-- [ ] **API endpoints:**
-  - `GET /api/alerts` — Active alerts
+- [x] **AlertService** — Create and manage alerts
+- [x] **Alert types:**
+  - `high_confidence` — Prediction with confidence >= 7
+  - `value_bet` — Value betting opportunity
+  - `live_event` — Goal/red card during live match
+  - `lineup_change` — Confirmed lineups published before match
+- [x] **Prediction resolution** — wasCorrect, Brier score, actualResult
+- [x] **Accuracy statistics** — Overall accuracy, by prediction type
+- [x] **API endpoints:**
+  - `GET /api/alerts` — Filtered alert list
   - `GET /api/alerts/unread` — Unacknowledged alerts
-  - `POST /api/alerts/:id/acknowledge` — Mark alert as read
-  - `GET /api/analytics/accuracy` — Prediction accuracy metrics
-  - `GET /api/analytics/calibration` — Calibration data
-  - `GET /api/analytics/roi` — ROI tracking
-
-### Deliverables
-
-- Full alert system with severity levels
-- Backtesting tracking resolved predictions
-- Accuracy metrics and calibration analysis
-- Analytics dashboard API
+  - `POST /api/alerts/:id/acknowledge` — Acknowledge single alert
+  - `POST /api/alerts/acknowledge-all` — Acknowledge all
 
 ---
 
-## Summary Timeline
+## Operational Tasks
 
-| Phase | Name | Dependencies | Estimated Effort |
-|---|---|---|---|
-| Phase 1 | Foundation | None | 1-2 days |
-| Phase 2 | Polymarket Integration | Phase 1 | 2-3 days |
-| Phase 3 | API-Football Integration | Phase 1 | 2-3 days |
-| Phase 4 | The Odds API Integration | Phase 1 | 1-2 days |
-| Phase 5 | Market Matching & Predictions | Phases 2, 3, 4 | 3-4 days |
-| Phase 6 | Live Match Monitoring | Phases 3, 5 | 3-4 days |
-| Phase 7 | Alerts & Backtesting | Phases 5, 6 | 2-3 days |
+### Done
 
-**Note:** Phases 2, 3, and 4 can be developed in parallel since they're independent data ingestion modules that all depend only on Phase 1.
+- [x] Historical backfill script ready (`scripts/backfill-historical.ts`)
+- [x] CLI sync script (`scripts/sync-fixtures.ts`)
+- [x] Trigger.dev config with build externals for NestJS peer deps
 
----
+### Pending
 
-## MVP (Minimum Viable Product)
-
-Phases 1-5 constitute the MVP:
-- Data from all 3 sources being synced
-- Markets matched to fixtures
-- Predictions generated with mispricing detection
-- API serving predictions
-
-Phases 6-7 are enhancements that add live capabilities and historical analysis.
+- [ ] Run `fixture_lineups` migration SQL against Supabase
+- [ ] Run historical backfill script (`--all`)
+- [ ] Clean up dead code (`syncTeams()` never called by any automated process)
+- [ ] Add authentication to API endpoints
+- [ ] Set up production monitoring and alerting
+- [ ] Implement ML-based model calibration from historical accuracy data

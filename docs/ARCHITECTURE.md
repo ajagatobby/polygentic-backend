@@ -2,30 +2,32 @@
 
 ## Overview
 
-Polygentic is a soccer prediction backend that combines data from three sources to identify mispriced markets on Polymarket:
+Polygentic is a soccer prediction backend that uses a 3-agent AI pipeline to generate match predictions for 30 tracked football competitions worldwide. The system:
 
-1. **Polymarket** — Prediction market prices (the target)
-2. **API-Football** — Match data, stats, injuries, live scores, built-in predictions
-3. **The Odds API** — Aggregated bookmaker odds from 60+ sportsbooks
-
-The core thesis: Polymarket soccer markets are thinner and slower to update than traditional bookmakers. By comparing Polymarket prices against bookmaker consensus and our own statistical model, we can identify mispricings.
+1. **Syncs data** from API-Football (fixtures, stats, injuries, standings, lineups, live scores)
+2. **Collects odds** from The Odds API (60+ bookmakers, consensus probabilities)
+3. **Generates AI predictions** using a pipeline: Data Collection -> Perplexity research -> Claude analysis
+4. **Monitors live matches** via adaptive polling with WebSocket broadcast
+5. **Resolves predictions** automatically after matches complete (accuracy scoring, Brier scores)
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| Framework | **NestJS 10** | Modular backend with DI, cron, WebSockets, queues |
-| Language | **TypeScript 5** | Type safety across the entire codebase |
-| Database | **PostgreSQL** | Time-series price data, market metadata, predictions |
-| ORM | **Drizzle ORM** | Type-safe, SQL-like query builder |
-| Queue | **Bull (Redis)** | Background job processing for data sync and alerts |
-| Scheduler | **@nestjs/schedule** | Cron-based polling for API data |
-| WebSocket | **ws** | Polymarket live price stream listener |
-| HTTP Client | **Axios** | API requests to all three data sources |
-| Validation | **class-validator + class-transformer** | Request/response validation |
-| Documentation | **@nestjs/swagger** | Auto-generated API docs |
+| Layer             | Technology                              | Purpose                                                  |
+| ----------------- | --------------------------------------- | -------------------------------------------------------- |
+| Framework         | **NestJS 11**                           | Modular backend with DI, cron, WebSockets                |
+| Language          | **TypeScript 5**                        | Type safety across the entire codebase                   |
+| Database          | **PostgreSQL** (Supabase)               | Match data, predictions, alerts, lineups                 |
+| ORM               | **Drizzle ORM**                         | Type-safe, SQL-like query builder                        |
+| Durable Execution | **Trigger.dev**                         | Prediction pipeline, sync+resolve workflows with retries |
+| Scheduler         | **@nestjs/schedule**                    | Lightweight cron-based data sync                         |
+| AI - Research     | **Perplexity Sonar**                    | Real-time web research for match context                 |
+| AI - Analysis     | **Anthropic Claude**                    | Structured match prediction generation                   |
+| WebSocket         | **Socket.IO**                           | Live score broadcast to clients                          |
+| HTTP Client       | **Axios**                               | API requests to external data sources                    |
+| Validation        | **class-validator + class-transformer** | Request/response validation                              |
+| Documentation     | **@nestjs/swagger**                     | Auto-generated API docs                                  |
 
 ---
 
@@ -34,28 +36,32 @@ The core thesis: Polymarket soccer markets are thinner and slower to update than
 ```
 +-----------------------------------------------------------+
 |  Layer 5: API Layer (NestJS Controllers)                  |
-|  /api/markets, /api/predictions, /api/fixtures, /api/live |
+|  /api/fixtures, /api/predictions, /api/alerts, /api/live  |
+|  /api/teams, /api/leagues, /api/odds, /api/health         |
 +-----------------------------------------------------------+
-|  Layer 4: Prediction Engine                               |
-|  +-- Mispricing Detector (Polymarket vs Bookmakers)       |
-|  +-- Statistical Model (form, H2H, injuries)              |
-|  +-- Confidence Scorer                                    |
-|  +-- Live Alert System                                    |
+|  Layer 4: AI Prediction Pipeline (3-Agent System)         |
+|  +-- DataCollectorAgent (stats, form, injuries, lineups)  |
+|  +-- ResearchAgent (Perplexity Sonar web research)        |
+|  +-- AnalysisAgent (Claude structured prediction)         |
+|  +-- Prediction Resolver (Brier score, wasCorrect)        |
 +-----------------------------------------------------------+
-|  Layer 3: Data Processing & Matching                      |
-|  +-- Market Matcher (Polymarket <-> real fixtures)        |
-|  +-- Probability Normalizer (odds -> probabilities)       |
-|  +-- Data Aggregator                                      |
+|  Layer 3: Live Monitoring & Event Handling                |
+|  +-- LiveScoreService (adaptive polling)                  |
+|  +-- LiveEventHandler (goal, red card, match end)         |
+|  +-- LiveScoreGateway (WebSocket broadcast)               |
 +-----------------------------------------------------------+
 |  Layer 2: Data Ingestion Services                         |
-|  +-- PolymarketService (Gamma + CLOB + WebSocket)         |
-|  +-- FootballService (API-Football)                       |
-|  +-- OddsService (The Odds API)                           |
+|  +-- FootballService (API-Football: 30 leagues)           |
+|  +-- OddsService (The Odds API: 60+ bookmakers)           |
+|  +-- SyncScheduler (NestJS cron jobs)                     |
+|  +-- Trigger.dev Schedules (prediction pipeline crons)    |
 +-----------------------------------------------------------+
 |  Layer 1: Database (PostgreSQL + Drizzle ORM)             |
-|  +-- Markets, Fixtures, Odds Snapshots                    |
-|  +-- Price History, Predictions                           |
-|  +-- Sync State, Logs, Alerts                             |
+|  +-- Fixtures, Teams, Statistics, Events, Lineups         |
+|  +-- Injuries, Team Form, Standings                       |
+|  +-- Predictions, Alerts                                  |
+|  +-- Bookmaker Odds, Consensus Odds                       |
+|  +-- Sync Logs                                            |
 +-----------------------------------------------------------+
 ```
 
@@ -66,165 +72,218 @@ The core thesis: Polymarket soccer markets are thinner and slower to update than
 ```
 src/
 +-- app.module.ts                    # Root module
-+-- main.ts                          # Bootstrap
++-- main.ts                          # Bootstrap (port 8080)
 |
 +-- common/                          # Shared utilities
 |   +-- config/                      # Environment configuration
 |   +-- decorators/                  # Custom decorators
 |   +-- filters/                     # Exception filters
 |   +-- interceptors/                # Logging, transform interceptors
-|   +-- utils/                       # Helpers (probability math, text matching)
 |
 +-- database/                        # Database module
 |   +-- database.module.ts
-|   +-- schema/                      # Drizzle schema definitions
-|   |   +-- polymarket.schema.ts     # Polymarket events & markets tables
-|   |   +-- fixtures.schema.ts       # Fixtures, statistics, injuries tables
-|   |   +-- odds.schema.ts           # Bookmaker odds tables
-|   |   +-- predictions.schema.ts    # Predictions & alerts tables
-|   |   +-- sync.schema.ts           # Sync log tables
-|   +-- migrations/                  # Drizzle migrations
+|   +-- schema/
+|   |   +-- fixtures.schema.ts       # teams, fixtures, fixture_statistics,
+|   |   |                            # fixture_events, injuries, fixture_lineups, team_form
+|   |   +-- predictions.schema.ts    # predictions, alerts
+|   |   +-- odds.schema.ts           # bookmaker_odds, consensus_odds
+|   |   +-- sync.schema.ts           # sync_log
+|   |   +-- index.ts                 # Barrel export
+|   +-- migrations/
 |   +-- drizzle.provider.ts          # Drizzle connection provider
 |
-+-- polymarket/                      # Polymarket data module
-|   +-- polymarket.module.ts
-|   +-- polymarket.service.ts        # Gamma + CLOB API client
-|   +-- polymarket.websocket.ts      # WebSocket price stream listener
-|   +-- polymarket.controller.ts     # API endpoints for market data
-|   +-- dto/                         # Data transfer objects
-|
-+-- football/                        # API-Football data module
++-- football/                        # Football data module
 |   +-- football.module.ts
-|   +-- football.service.ts          # API-Football client
-|   +-- football.controller.ts       # API endpoints for fixture data
+|   +-- football.service.ts          # API-Football client, data sync, season logic
+|   +-- football.controller.ts       # REST endpoints for fixtures, teams, leagues, lineups
 |   +-- live/
-|   |   +-- live-score.service.ts    # Live match monitoring
-|   |   +-- live-score.gateway.ts    # WebSocket gateway for live updates to clients
+|   |   +-- live-score.service.ts    # Adaptive live match polling
+|   |   +-- live-score.gateway.ts    # WebSocket gateway for live updates
+|   |   +-- live-event-handler.ts    # Event-driven DB persistence + resolution trigger
 |   +-- dto/
+|       +-- fixture-query.dto.ts     # FixtureQueryDto, MatchState enum
 |
 +-- odds/                            # The Odds API module
 |   +-- odds.module.ts
 |   +-- odds.service.ts              # Odds API client
-|   +-- odds.controller.ts           # API endpoints for odds data
-|   +-- probability.util.ts          # Odds-to-probability conversion, vig removal
+|   +-- odds.controller.ts           # Odds endpoints
+|   +-- probability.util.ts          # Odds-to-probability, vig removal
 |   +-- dto/
 |
-+-- matcher/                         # Market matching module
-|   +-- matcher.module.ts
-|   +-- matcher.service.ts           # Links Polymarket markets to fixtures
-|   +-- fuzzy-match.util.ts          # Text similarity / fuzzy matching
-|
-+-- prediction/                      # Prediction engine module
-|   +-- prediction.module.ts
-|   +-- prediction.service.ts        # Main prediction orchestrator
-|   +-- mispricing.service.ts        # Mispricing detection (Polymarket vs bookmakers)
-|   +-- statistical-model.service.ts # Form, H2H, injury-based model
-|   +-- confidence.service.ts        # Confidence scoring
-|   +-- prediction.controller.ts     # API endpoints for predictions
-|   +-- dto/
-|
-+-- sync/                            # Data synchronization module
-|   +-- sync.module.ts
-|   +-- sync.service.ts              # Orchestrates all sync jobs
-|   +-- sync.scheduler.ts            # Cron job definitions
++-- agents/                          # AI Prediction Pipeline
+|   +-- agents.module.ts
+|   +-- agents.service.ts            # Pipeline orchestration, resolvePredictions()
+|   +-- data-collector.agent.ts      # Collects all match data (reads DB lineups first)
+|   +-- research.agent.ts            # Perplexity Sonar web research
+|   +-- analysis.agent.ts            # Claude structured prediction generation
 |
 +-- alerts/                          # Alert system module
 |   +-- alerts.module.ts
-|   +-- alerts.service.ts            # Generate and manage alerts
-|   +-- alerts.controller.ts         # API endpoints for alerts
+|   +-- alerts.service.ts            # Alert CRUD, createLineupAlert(), createLiveEventAlert()
+|   +-- alerts.controller.ts         # Alert endpoints
+|
++-- sync/                            # Data synchronization module
+|   +-- sync.module.ts
+|   +-- sync.service.ts              # Orchestrates sync operations
+|   +-- sync.scheduler.ts            # NestJS @Cron jobs (fixtures, injuries, standings, odds)
+|
++-- health/                          # Health check module
+|   +-- health.module.ts
+|   +-- health.controller.ts         # GET /api/health
+|
++-- trigger/                         # Trigger.dev tasks (runs outside NestJS DI)
+|   +-- init.ts                      # Standalone service bootstrapper
+|   +-- generate-prediction.ts       # Single fixture 3-agent pipeline
+|   +-- generate-daily-predictions.ts # Batch daily + pre-match predictions
+|   +-- lineup-prediction.ts         # Lineup-aware prediction regeneration
+|   +-- sync-and-resolve.ts          # Sync completed fixtures + resolve predictions
+|   +-- schedules.ts                 # Trigger.dev cron schedule definitions
+|
++-- scripts/                         # CLI scripts
+    +-- backfill-historical.ts       # 6-month historical data backfill
+    +-- sync-fixtures.ts             # Manual fixture/standings/injuries sync
 ```
 
 ---
 
 ## Data Flow
 
-### 1. Periodic Sync (every 15-30 minutes)
+### 1. Periodic Data Sync (NestJS Cron)
+
+Lightweight, idempotent data sync that runs in-process.
 
 ```
 Cron Trigger
     |
-    +-> PolymarketService.syncMarkets()
-    |       -> Fetch active soccer events from Gamma API
-    |       -> Fetch current prices from CLOB API
-    |       -> Store in polymarket_events + polymarket_markets + price_history
+    +-> FootballService.syncFixtures()          [every 30 min]
+    |       -> Fetch upcoming fixtures for all 30 tracked leagues
+    |       -> Auto-detect season per league (calendar-year aware)
+    |       -> Upsert into fixtures table
     |
-    +-> FootballService.syncFixtures()
-    |       -> Fetch upcoming fixtures from API-Football
-    |       -> Fetch predictions, injuries, team stats
-    |       -> Store in fixtures + fixture_statistics + injuries + team_form
+    +-> FootballService.syncInjuries()          [every 2 hours]
+    |       -> Fetch injuries for all tracked leagues
+    |       -> Auto-detect season, handle FK constraints
+    |       -> Upsert into injuries table
     |
-    +-> OddsService.syncOdds()
-    |       -> Fetch odds for active soccer leagues
-    |       -> Convert to implied probabilities, remove vig
-    |       -> Store in bookmaker_odds
+    +-> FootballService.syncStandings()         [every 2 hours]
+    |       -> Fetch league tables, team form, records
+    |       -> Auto-detect season (calendar-year leagues try both)
+    |       -> Upsert into team_form table
     |
-    +-> MatcherService.matchMarkets()
-    |       -> Link Polymarket markets to real fixtures
-    |       -> Store in market_fixture_links
-    |
-    +-> PredictionService.generatePredictions()
-            -> Run mispricing detection
-            -> Run statistical model
-            -> Calculate confidence scores
-            -> Store in predictions table
-            -> Generate alerts for significant mispricings
+    +-> OddsService.syncOdds()                  [every 6 hours]
+            -> Fetch bookmaker odds from The Odds API
+            -> Convert to probabilities, remove vig
+            -> Calculate weighted consensus
+            -> Upsert into bookmaker_odds + consensus_odds
 ```
 
-### 2. Live Match Flow (during active matches)
+### 2. AI Prediction Pipeline (Trigger.dev)
+
+Durable, retryable prediction workloads.
 
 ```
-Match Start Detected
+Trigger.dev Schedule
     |
-    +-> LiveScoreService.startMonitoring(fixtureId)
-    |       -> Poll API-Football /fixtures?live=all every 30 seconds
-    |       -> Detect events: goals, red cards, penalties
+    +-> Daily at 6 AM UTC: generate-daily-predictions
+    |       -> Query fixtures in next 48 hours
+    |       -> Fan out: generate-prediction per fixture
+    |           |
+    |           +-> DataCollectorAgent.collect()
+    |           |       -> Fixture data, team form, H2H, injuries
+    |           |       -> DB lineups (or API fallback)
+    |           |       -> Bookmaker odds + consensus
+    |           |
+    |           +-> ResearchAgent.research()
+    |           |       -> Perplexity Sonar web search
+    |           |       -> Recent news, team updates, tactical analysis
+    |           |
+    |           +-> AnalysisAgent.analyze()
+    |           |       -> Claude generates structured prediction
+    |           |       -> Probabilities, confidence, key factors, value bets
+    |           |
+    |           +-> Store prediction + create alert if high confidence
     |
-    +-> PolymarketWebSocket.subscribe(marketTokenIds)
-    |       -> Listen for real-time price changes
+    +-> Every 15 min: generate-pre-match-predictions
+    |       -> Fixtures kicking off within 1 hour
+    |       -> Latest data capture before match starts
     |
-    +-> On Significant Event (goal, red card):
-            -> Fetch updated bookmaker odds (The Odds API)
-            -> Compare with current Polymarket price
-            -> If gap > threshold: generate LIVE alert
-            -> Update prediction with new data
+    +-> Every 5 min: lineup-aware-prediction
+    |       -> Check for newly published lineups (~60min before kickoff)
+    |       -> Persist lineups to fixture_lineups table
+    |       -> Re-run full pipeline with confirmed XI/formation
+    |       -> Create lineup_change alert
+    |
+    +-> Every hour: sync-and-resolve
+            -> Step 1: syncCompletedFixtures() — fetch final scores
+            -> Step 2: resolvePredictions() — compute wasCorrect, Brier score
 ```
 
-### 3. API Request Flow
+### 3. Live Match Flow
+
+```
+Server Boot -> OnModuleInit -> LiveScoreService.startMonitoring()
+    |
+    +-> Adaptive Polling (API-Football /fixtures?live=all)
+    |       -> 15s during penalty shootout
+    |       -> 30s during normal play
+    |       -> 60s during halftime
+    |
+    +-> Event Detection (diff against previous state)
+    |       -> Goals, red cards, match start/end, status changes
+    |
+    +-> LiveEventHandler (event-driven)
+    |       -> goal: update score in DB, create alert
+    |       -> red-card: create alert
+    |       -> match-start: update status to 1H
+    |       -> match-end: persist final score, trigger immediate
+    |       |              Trigger.dev sync+resolve for instant resolution
+    |       -> status-change: update status in DB
+    |
+    +-> LiveScoreGateway (WebSocket broadcast)
+            -> Every 30s: broadcast full match state to /live namespace
+            -> Individual events emitted as they occur
+```
+
+### 4. API Request Flow
 
 ```
 Client Request -> Controller -> Service -> Database
-                                       -> External API (if cache miss)
+                                       -> External API (if no DB data)
 ```
 
 ---
 
 ## Key Design Decisions
 
-| Decision | Choice | Reasoning |
-|---|---|---|
-| **Sync strategy** | Cron-based polling | API rate limits make real-time impractical for most data; 15-30 min intervals sufficient for prediction markets |
-| **Live scores** | API-Football Pro plan polling | 30-second polling during live matches; Pro plan (7,500 req/day) supports ~10 concurrent matches |
-| **Market matching** | Fuzzy text matching + manual overrides | Polymarket titles are human-written with no standard format |
-| **Sharp book weighting** | Pinnacle > Betfair > rest | Pinnacle is the industry standard for true odds |
-| **Queue system** | Bull + Redis | Handles async processing for data sync, prevents API rate limit violations |
-| **Database** | PostgreSQL | Excellent for time-series data, complex joins, and the relational nature of our data model |
+| Decision              | Choice                                         | Reasoning                                                                      |
+| --------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ |
+| **Prediction engine** | 3-agent AI pipeline (Perplexity + Claude)      | Richer analysis than heuristic models; web research captures real-time context |
+| **Durable execution** | Trigger.dev for prediction workloads           | Automatic retries, observability dashboard, handles AI API failures gracefully |
+| **Lightweight sync**  | NestJS @Cron for data sync                     | Simple, idempotent operations that don't need retry infrastructure             |
+| **Live scores**       | Adaptive polling (15-60s)                      | API-Football Pro plan supports ~10 concurrent matches; adaptive saves budget   |
+| **Season detection**  | `getCurrentSeason()` + `CALENDAR_YEAR_LEAGUES` | Single source of truth; handles MLS/Brasileirao/Liga MX/Argentina correctly    |
+| **Lineup strategy**   | Persist to DB, read DB first                   | Avoids redundant API calls; lineups available even after API cache expires     |
+| **Database**          | PostgreSQL (Supabase)                          | Excellent for relational data, JSONB for flexible fields, managed hosting      |
+| **No Redis/Bull**     | Removed in favor of Trigger.dev                | Trigger.dev provides better retry, observability, and doesn't require Redis    |
 
 ---
 
 ## Rate Limit Budget (Pro Plans)
 
-| API | Budget | Allocation |
-|---|---|---|
-| **API-Football** | 7,500 req/day, 300/min | ~5,000 for periodic sync, ~2,500 for live match monitoring |
-| **The Odds API** | Paid plan credits | Batch by sport key to minimize credit usage |
-| **Polymarket** | 500 events/10s | Very generous; no concern |
+| API                  | Budget                 | Allocation                                                             |
+| -------------------- | ---------------------- | ---------------------------------------------------------------------- |
+| **API-Football**     | 7,500 req/day, 300/min | ~4,500 for periodic sync, ~2,500 for live monitoring, ~500 for lineups |
+| **The Odds API**     | 20,000 credits/month   | ~4,600 credits/month across all leagues                                |
+| **Perplexity Sonar** | Per-request (paid)     | ~50-100 predictions/day                                                |
+| **Anthropic Claude** | Per-token (paid)       | ~50-100 predictions/day                                                |
 
 ---
 
 ## Deployment Considerations
 
 - **Runtime:** Node.js with NestJS (long-running process, not serverless)
-- **Database:** PostgreSQL (managed service recommended: Neon, Supabase, or AWS RDS)
-- **Redis:** Required for Bull queue (managed Redis recommended)
+- **Database:** PostgreSQL (Supabase managed instance)
+- **Trigger.dev:** Cloud workers for prediction pipeline (external to main server)
 - **Process manager:** PM2 or Docker for production
-- **Monitoring:** Health check endpoint + sync log table for observability
+- **Monitoring:** Health check endpoint + Trigger.dev dashboard + sync_log table
+- **Port:** 8080 (default)
