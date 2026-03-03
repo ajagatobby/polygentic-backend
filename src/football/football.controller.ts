@@ -15,6 +15,7 @@ import {
 import { ApiTags, ApiOperation, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { FootballService, TRACKED_LEAGUES } from './football.service';
 import { LiveScoreService } from './live/live-score.service';
+import { OddsService } from '../odds/odds.service';
 import {
   FixtureQueryDto,
   SyncFixturesDto,
@@ -29,6 +30,7 @@ export class FootballController {
   constructor(
     private readonly footballService: FootballService,
     private readonly liveScoreService: LiveScoreService,
+    private readonly oddsService: OddsService,
   ) {}
 
   // ─── FIXTURES ────────────────────────────────────────────────────────
@@ -265,6 +267,89 @@ export class FootballController {
       if (error instanceof NotFoundException) throw error;
       this.logger.error(`Failed to get fixture ${id}: ${error.message}`);
       throw new InternalServerErrorException('Failed to retrieve fixture');
+    }
+  }
+
+  // ─── FIXTURE ODDS ──────────────────────────────────────────────────
+
+  @Get('fixtures/:id/odds')
+  @ApiOperation({
+    summary:
+      'Get all bookmaker odds for a fixture (auto-linked via team name + date matching)',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'API-Football fixture ID',
+    type: Number,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'All bookmaker odds linked to this fixture',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Fixture not found or no odds linked',
+  })
+  async getFixtureOdds(@Param('id', ParseIntPipe) id: number) {
+    try {
+      const result = await this.oddsService.getOddsForFixture(id);
+
+      if (!result) {
+        throw new NotFoundException(
+          `No odds found for fixture ${id}. Odds are linked automatically during odds sync.`,
+        );
+      }
+
+      return {
+        ...result,
+        bookmakerCount: new Set(result.odds.map((o: any) => o.bookmakerKey))
+          .size,
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(
+        `Failed to get odds for fixture ${id}: ${error.message}`,
+      );
+      throw new InternalServerErrorException('Failed to retrieve fixture odds');
+    }
+  }
+
+  @Get('fixtures/:id/odds/compare')
+  @ApiOperation({
+    summary:
+      'Compare odds across all bookmakers for a fixture — best price, value bets, full breakdown',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'API-Football fixture ID',
+    type: Number,
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Best odds per outcome, spread, value bets with edge %, per-bookmaker comparison',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Fixture not found or no odds linked',
+  })
+  async compareFixtureOdds(@Param('id', ParseIntPipe) id: number) {
+    try {
+      const comparison = await this.oddsService.getOddsComparisonForFixture(id);
+
+      if (!comparison) {
+        throw new NotFoundException(
+          `No odds comparison available for fixture ${id}. Odds are linked automatically during odds sync.`,
+        );
+      }
+
+      return comparison;
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(
+        `Failed to compare odds for fixture ${id}: ${error.message}`,
+      );
+      throw new InternalServerErrorException('Failed to compare fixture odds');
     }
   }
 

@@ -69,6 +69,8 @@ export const fixtures = pgTable(
     scorePenaltyHome: integer('score_penalty_home'),
     scorePenaltyAway: integer('score_penalty_away'),
     rawData: jsonb('raw_data'),
+    /** The Odds API event ID — linked during odds sync via team name + date matching */
+    oddsApiEventId: varchar('odds_api_event_id', { length: 255 }),
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),
   },
@@ -77,6 +79,7 @@ export const fixtures = pgTable(
     index('idx_fixtures_league').on(table.leagueId, table.season),
     index('idx_fixtures_teams').on(table.homeTeamId, table.awayTeamId),
     index('idx_fixtures_status').on(table.status),
+    index('idx_fixtures_odds_event').on(table.oddsApiEventId),
   ],
 );
 

@@ -1,8 +1,13 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
-import { eq, and, desc } from 'drizzle-orm';
-import { bookmakerOdds, consensusOdds } from '../database/schema';
+import { eq, and, desc, gte, lte, isNull, sql } from 'drizzle-orm';
+import {
+  bookmakerOdds,
+  consensusOdds,
+  fixtures,
+  teams,
+} from '../database/schema';
 import { ProbabilityUtil } from './probability.util';
 
 /**
@@ -144,6 +149,7 @@ export class OddsService {
     eventsProcessed: number;
     oddsRecordsInserted: number;
     consensusCalculated: number;
+    fixturesLinked: number;
     creditsUsed: number | null;
     creditsRemaining: number | null;
     errors: string[];
@@ -155,6 +161,7 @@ export class OddsService {
     let eventsProcessed = 0;
     let oddsRecordsInserted = 0;
     let consensusCalculated = 0;
+    let fixturesLinked = 0;
     const errors: string[] = [];
 
     for (const sportKey of sportKeys) {
@@ -176,6 +183,17 @@ export class OddsService {
               this.logger.warn(msg);
               errors.push(msg);
             }
+
+            // Auto-match event to a fixture in our DB
+            try {
+              const fixtureId = await this.matchEventToFixture(event);
+              if (fixtureId) fixturesLinked++;
+            } catch (err) {
+              // Non-critical — matching failure doesn't block sync
+              this.logger.debug(
+                `Failed to match event ${event.id} to fixture: ${err.message}`,
+              );
+            }
           } catch (err) {
             const msg = `Failed to store odds for event ${event.id}: ${err.message}`;
             this.logger.warn(msg);
@@ -190,13 +208,14 @@ export class OddsService {
     }
 
     this.logger.log(
-      `Odds sync complete: ${eventsProcessed} events, ${oddsRecordsInserted} odds records, ${consensusCalculated} consensus calculated`,
+      `Odds sync complete: ${eventsProcessed} events, ${oddsRecordsInserted} odds records, ${consensusCalculated} consensus, ${fixturesLinked} fixtures linked`,
     );
 
     return {
       eventsProcessed,
       oddsRecordsInserted,
       consensusCalculated,
+      fixturesLinked,
       creditsUsed: this.creditUsage.used,
       creditsRemaining: this.creditUsage.remaining,
       errors: errors.length > 0 ? errors : [],
@@ -378,7 +397,237 @@ export class OddsService {
     };
   }
 
+  // ─── Fixture ↔ Odds API Event Linking ──────────────────────────────
+
+  /**
+   * Match an Odds API event to a fixture in our database by fuzzy-matching
+   * team names and date proximity (±36 hours to handle timezone differences).
+   *
+   * Matching strategy:
+   * 1. Load all fixtures within ±36h of the event's commence_time that don't
+   *    already have an oddsApiEventId.
+   * 2. For each fixture, load team names from the teams table.
+   * 3. Score each fixture by how well the team names match (normalized,
+   *    substring, contains). Pick the best match above a threshold.
+   */
+  async matchEventToFixture(event: {
+    id: string;
+    home_team: string;
+    away_team: string;
+    commence_time: string;
+  }): Promise<number | null> {
+    const eventDate = new Date(event.commence_time);
+    const windowMs = 36 * 60 * 60 * 1000; // ±36 hours
+    const from = new Date(eventDate.getTime() - windowMs);
+    const to = new Date(eventDate.getTime() + windowMs);
+
+    // Find candidate fixtures in the time window
+    const candidates = await this.db
+      .select({
+        id: fixtures.id,
+        date: fixtures.date,
+        homeTeamId: fixtures.homeTeamId,
+        awayTeamId: fixtures.awayTeamId,
+        oddsApiEventId: fixtures.oddsApiEventId,
+      })
+      .from(fixtures)
+      .where(and(gte(fixtures.date, from), lte(fixtures.date, to)));
+
+    if (candidates.length === 0) return null;
+
+    // Gather all team IDs we need to look up
+    const teamIds = new Set<number>();
+    for (const c of candidates) {
+      teamIds.add(c.homeTeamId);
+      teamIds.add(c.awayTeamId);
+    }
+
+    const teamRows = await this.db
+      .select({ id: teams.id, name: teams.name })
+      .from(teams)
+      .where(
+        sql`${teams.id} IN (${sql.join(
+          [...teamIds].map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+
+    const teamNameMap = new Map<number, string>();
+    for (const t of teamRows) {
+      teamNameMap.set(t.id, t.name);
+    }
+
+    // Score each candidate
+    let bestMatch: { fixtureId: number; score: number } | null = null;
+
+    for (const c of candidates) {
+      const homeName = teamNameMap.get(c.homeTeamId) ?? '';
+      const awayName = teamNameMap.get(c.awayTeamId) ?? '';
+
+      const homeScore = this.teamNameSimilarity(event.home_team, homeName);
+      const awayScore = this.teamNameSimilarity(event.away_team, awayName);
+
+      // Both teams must match reasonably well
+      const combinedScore = (homeScore + awayScore) / 2;
+
+      // Bonus for closer date match
+      const timeDiffMs = Math.abs(
+        eventDate.getTime() - new Date(c.date).getTime(),
+      );
+      const timeBonus = 1 - timeDiffMs / windowMs; // 0..1
+      const finalScore = combinedScore * 0.85 + timeBonus * 0.15;
+
+      if (finalScore > 0.5 && (!bestMatch || finalScore > bestMatch.score)) {
+        bestMatch = { fixtureId: c.id, score: finalScore };
+      }
+    }
+
+    if (!bestMatch) return null;
+
+    // Link the fixture to this Odds API event
+    await this.db
+      .update(fixtures)
+      .set({ oddsApiEventId: event.id, updatedAt: new Date() })
+      .where(eq(fixtures.id, bestMatch.fixtureId));
+
+    this.logger.debug(
+      `Linked fixture ${bestMatch.fixtureId} to Odds event ${event.id} (score: ${bestMatch.score.toFixed(2)})`,
+    );
+
+    return bestMatch.fixtureId;
+  }
+
+  /**
+   * Get all bookmaker odds for a fixture (by fixture ID).
+   * Returns null if the fixture has no linked Odds API event.
+   */
+  async getOddsForFixture(fixtureId: number) {
+    const [fixture] = await this.db
+      .select({
+        id: fixtures.id,
+        oddsApiEventId: fixtures.oddsApiEventId,
+      })
+      .from(fixtures)
+      .where(eq(fixtures.id, fixtureId))
+      .limit(1);
+
+    if (!fixture || !fixture.oddsApiEventId) return null;
+
+    return {
+      fixtureId: fixture.id,
+      oddsApiEventId: fixture.oddsApiEventId,
+      odds: await this.getOddsForEvent(fixture.oddsApiEventId),
+    };
+  }
+
+  /**
+   * Get odds comparison for a fixture (by fixture ID).
+   * Returns null if the fixture has no linked Odds API event.
+   */
+  async getOddsComparisonForFixture(fixtureId: number) {
+    const [fixture] = await this.db
+      .select({
+        id: fixtures.id,
+        oddsApiEventId: fixtures.oddsApiEventId,
+      })
+      .from(fixtures)
+      .where(eq(fixtures.id, fixtureId))
+      .limit(1);
+
+    if (!fixture || !fixture.oddsApiEventId) return null;
+
+    const comparison = await this.getOddsComparison(fixture.oddsApiEventId);
+    if (!comparison) return null;
+
+    return {
+      fixtureId: fixture.id,
+      ...comparison,
+    };
+  }
+
   // ─── Private Methods ─────────────────────────────────────────────────
+
+  /**
+   * Calculate similarity between two team names.
+   * Returns 0..1 where 1 = perfect match.
+   *
+   * Handles common differences between API-Football and The Odds API:
+   * - "Manchester United" vs "Man United" vs "Man Utd"
+   * - "FC Barcelona" vs "Barcelona"
+   * - "Borussia Dortmund" vs "Dortmund"
+   * - "Paris Saint Germain" vs "Paris Saint-Germain" vs "PSG"
+   */
+  private teamNameSimilarity(a: string, b: string): number {
+    const normA = this.normalizeTeamName(a);
+    const normB = this.normalizeTeamName(b);
+
+    // Exact match after normalization
+    if (normA === normB) return 1.0;
+
+    // One contains the other
+    if (normA.includes(normB) || normB.includes(normA)) return 0.85;
+
+    // Check if all words of the shorter name appear in the longer name
+    const wordsA = normA.split(' ');
+    const wordsB = normB.split(' ');
+    const shorter = wordsA.length <= wordsB.length ? wordsA : wordsB;
+    const longer = wordsA.length > wordsB.length ? wordsA : wordsB;
+    const longerStr = longer.join(' ');
+
+    const matchingWords = shorter.filter((w) => longerStr.includes(w));
+    const wordOverlap = matchingWords.length / shorter.length;
+
+    if (wordOverlap >= 0.8) return 0.75;
+    if (wordOverlap >= 0.5) return 0.5;
+
+    // Levenshtein-based similarity for close matches
+    const lev = this.levenshteinDistance(normA, normB);
+    const maxLen = Math.max(normA.length, normB.length);
+    const levSimilarity = maxLen > 0 ? 1 - lev / maxLen : 0;
+
+    return levSimilarity;
+  }
+
+  /**
+   * Normalize a team name for comparison:
+   * - lowercase
+   * - remove FC, CF, SC, AFC, etc.
+   * - remove punctuation/hyphens
+   * - collapse whitespace
+   */
+  private normalizeTeamName(name: string): string {
+    return name
+      .toLowerCase()
+      .replace(/\b(fc|cf|sc|afc|ac|as|ss|us|rc|cd|ud|rcd|sd|ca|se)\b/g, '')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /**
+   * Levenshtein edit distance between two strings.
+   */
+  private levenshteinDistance(a: string, b: string): number {
+    const m = a.length;
+    const n = b.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, () =>
+      Array(n + 1).fill(0),
+    );
+
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        dp[i][j] =
+          a[i - 1] === b[j - 1]
+            ? dp[i - 1][j - 1]
+            : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+      }
+    }
+
+    return dp[m][n];
+  }
 
   /**
    * Build a market comparison object with best odds, all bookmaker odds,
