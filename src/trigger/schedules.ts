@@ -5,16 +5,35 @@ import {
 } from './generate-daily-predictions';
 import { lineupPredictionTask } from './lineup-prediction';
 import { syncCompletedFixturesAndResolveTask } from './sync-and-resolve';
+import {
+  syncFixturesTask,
+  syncInjuriesTask,
+  syncStandingsTask,
+  syncOddsTask,
+} from './sync-data';
 
 /**
  * ┌──────────────────────────────────────────────────────────────────┐
  * │  Trigger.dev Scheduled Tasks                                     │
  * │                                                                  │
- * │  These replace the NestJS @Cron jobs for prediction-critical     │
- * │  workloads. Simple data sync crons (fixtures, injuries,          │
- * │  standings, odds) remain in NestJS @nestjs/schedule.             │
+ * │  ALL scheduled work runs through Trigger.dev for durable         │
+ * │  execution, automatic retries, and observability.                │
+ * │                                                                  │
+ * │  Prediction-critical:                                            │
+ * │  - Daily predictions        — daily at 6 AM UTC                  │
+ * │  - Pre-match predictions    — every 15 min                       │
+ * │  - Lineup predictions       — every 5 min                        │
+ * │  - Sync + resolve           — every hour                         │
+ * │                                                                  │
+ * │  Data sync:                                                      │
+ * │  - Fixtures (upcoming)      — every 30 min                       │
+ * │  - Injuries                 — every 2 hours                      │
+ * │  - Standings                — every 2 hours                      │
+ * │  - Odds                     — every 6 hours                      │
  * └──────────────────────────────────────────────────────────────────┘
  */
+
+// ─── Prediction schedules ───────────────────────────────────────────
 
 /**
  * Daily at 6 AM UTC: Generate predictions for upcoming fixtures (next 48h).
@@ -48,8 +67,6 @@ export const preMatchPredictionsSchedule = schedules.task({
 
 /**
  * Every 5 minutes: Check for newly available lineups and regenerate predictions.
- * Lineups appear ~60min before kickoff. This task catches them quickly and
- * re-runs the prediction pipeline with confirmed XI and formation data.
  */
 export const lineupPredictionSchedule = schedules.task({
   id: 'scheduled-lineup-prediction',
@@ -63,7 +80,6 @@ export const lineupPredictionSchedule = schedules.task({
 
 /**
  * Every hour: Sync completed fixtures then resolve predictions.
- * This is the critical path that ensures prediction resolution actually happens.
  */
 export const syncAndResolveSchedule = schedules.task({
   id: 'scheduled-sync-and-resolve',
@@ -74,5 +90,59 @@ export const syncAndResolveSchedule = schedules.task({
       undefined as void,
     );
     logger.info('Triggered sync and resolve task', { runId: handle.id });
+  },
+});
+
+// ─── Data sync schedules ────────────────────────────────────────────
+
+/**
+ * Every 30 minutes: Sync upcoming fixtures for all tracked leagues.
+ */
+export const fixturesSyncSchedule = schedules.task({
+  id: 'scheduled-sync-fixtures',
+  cron: '*/30 * * * *',
+  run: async () => {
+    logger.info('Scheduled: fixtures sync');
+    const handle = await syncFixturesTask.trigger(undefined as void);
+    logger.info('Triggered fixtures sync task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 2 hours: Sync injuries for all tracked leagues.
+ */
+export const injuriesSyncSchedule = schedules.task({
+  id: 'scheduled-sync-injuries',
+  cron: '0 */2 * * *',
+  run: async () => {
+    logger.info('Scheduled: injuries sync');
+    const handle = await syncInjuriesTask.trigger(undefined as void);
+    logger.info('Triggered injuries sync task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 2 hours: Sync standings for all tracked leagues.
+ */
+export const standingsSyncSchedule = schedules.task({
+  id: 'scheduled-sync-standings',
+  cron: '0 */2 * * *',
+  run: async () => {
+    logger.info('Scheduled: standings sync');
+    const handle = await syncStandingsTask.trigger(undefined as void);
+    logger.info('Triggered standings sync task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 6 hours: Sync odds for all tracked leagues.
+ */
+export const oddsSyncSchedule = schedules.task({
+  id: 'scheduled-sync-odds',
+  cron: '0 */6 * * *',
+  run: async () => {
+    logger.info('Scheduled: odds sync');
+    const handle = await syncOddsTask.trigger(undefined as void);
+    logger.info('Triggered odds sync task', { runId: handle.id });
   },
 });

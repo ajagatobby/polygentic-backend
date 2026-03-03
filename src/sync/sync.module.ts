@@ -1,16 +1,14 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { ScheduleModule } from '@nestjs/schedule';
 import { FootballModule } from '../football/football.module';
 import { OddsModule } from '../odds/odds.module';
 import { SyncService } from './sync.service';
-import { SyncScheduler } from './sync.scheduler';
 import { SyncController } from './sync.controller';
 
 @Module({
-  imports: [ConfigModule, ScheduleModule.forRoot(), FootballModule, OddsModule],
+  imports: [ConfigModule, FootballModule, OddsModule],
   controllers: [SyncController],
-  providers: [SyncService, SyncScheduler],
+  providers: [SyncService],
   exports: [SyncService],
 })
 export class SyncModule {}
