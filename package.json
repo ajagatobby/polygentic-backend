@@ -38,7 +38,6 @@
     "@nestjs/platform-express": "^11.1.14",
     "@nestjs/platform-socket.io": "^11.1.14",
     "@nestjs/platform-ws": "^11.1.14",
-    "@nestjs/schedule": "^6.1.1",
     "@nestjs/swagger": "^11.2.6",
     "@nestjs/websockets": "^11.1.14",
     "@trigger.dev/sdk": "4.4.1",
