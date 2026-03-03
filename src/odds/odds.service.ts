@@ -50,10 +50,56 @@ interface OddsApiEvent {
   bookmakers: OddsApiBookmaker[];
 }
 
-interface CreditUsage {
+export interface CreditUsage {
   remaining: number | null;
   used: number | null;
   lastCost: number | null;
+}
+
+// ─── Odds comparison types ──────────────────────────────────────────
+
+export interface BookmakerPrice {
+  bookmakerKey: string;
+  bookmakerName: string;
+  price: number;
+  impliedProbability: number;
+  overround: number | null;
+  lastUpdate: Date | null;
+}
+
+export interface ValueBet {
+  bookmakerKey: string;
+  bookmakerName: string;
+  price: number;
+  edgePercent: number;
+  consensusProbability: number;
+  impliedProbability: number;
+}
+
+export interface OutcomeComparison {
+  outcome: string;
+  bestPrice: {
+    bookmakerKey: string;
+    bookmakerName: string;
+    price: number;
+  } | null;
+  worstPrice: {
+    bookmakerKey: string;
+    bookmakerName: string;
+    price: number;
+  } | null;
+  spread: number;
+  bookmakerCount: number;
+  consensusProbability: number | null;
+  valueBet: ValueBet | null;
+  bookmakers: BookmakerPrice[];
+}
+
+export interface MarketComparison {
+  marketKey: string;
+  bookmakerCount: number;
+  outcomes: OutcomeComparison[];
+  valueBets: ValueBet[];
 }
 
 @Injectable()
@@ -261,7 +307,198 @@ export class OddsService {
     return { ...this.creditUsage };
   }
 
+  /**
+   * Compare odds across all bookmakers for a given event.
+   * Returns the best price for each outcome in each market,
+   * along with a full comparison table and value bet detection.
+   */
+  async getOddsComparison(oddsApiEventId: string): Promise<{
+    eventId: string;
+    homeTeam: string;
+    awayTeam: string;
+    commenceTime: Date;
+    markets: Record<string, MarketComparison>;
+  } | null> {
+    // Get the latest odds per bookmaker per market
+    const allOdds = await this.db
+      .select()
+      .from(bookmakerOdds)
+      .where(eq(bookmakerOdds.oddsApiEventId, oddsApiEventId))
+      .orderBy(desc(bookmakerOdds.recordedAt));
+
+    if (allOdds.length === 0) return null;
+
+    // Get the latest consensus for value bet detection
+    const latestConsensus = await this.db
+      .select()
+      .from(consensusOdds)
+      .where(eq(consensusOdds.oddsApiEventId, oddsApiEventId))
+      .orderBy(desc(consensusOdds.calculatedAt));
+
+    const consensusByMarket = new Map<string, any>();
+    for (const c of latestConsensus) {
+      if (!consensusByMarket.has(c.marketKey)) {
+        consensusByMarket.set(c.marketKey, c);
+      }
+    }
+
+    const meta = allOdds[0];
+
+    // Deduplicate: keep only the latest row per bookmaker per market
+    const byMarket = new Map<string, Map<string, any>>();
+    for (const row of allOdds) {
+      const mk = row.marketKey as string;
+      if (!byMarket.has(mk)) byMarket.set(mk, new Map());
+      const bookmakers = byMarket.get(mk)!;
+      const bk = row.bookmakerKey as string;
+      if (!bookmakers.has(bk)) {
+        bookmakers.set(bk, row);
+      }
+    }
+
+    const markets: Record<string, MarketComparison> = {};
+
+    for (const [marketKey, bookmakerMap] of byMarket) {
+      const consensus = consensusByMarket.get(marketKey);
+      markets[marketKey] = this.buildMarketComparison(
+        marketKey,
+        bookmakerMap,
+        meta.homeTeam,
+        meta.awayTeam,
+        consensus,
+      );
+    }
+
+    return {
+      eventId: oddsApiEventId,
+      homeTeam: meta.homeTeam as string,
+      awayTeam: meta.awayTeam as string,
+      commenceTime: meta.commenceTime,
+      markets,
+    };
+  }
+
   // ─── Private Methods ─────────────────────────────────────────────────
+
+  /**
+   * Build a market comparison object with best odds, all bookmaker odds,
+   * and value bets for a given market.
+   */
+  private buildMarketComparison(
+    marketKey: string,
+    bookmakerMap: Map<string, any>,
+    homeTeam: string,
+    awayTeam: string,
+    consensus: any | undefined,
+  ): MarketComparison {
+    // Determine the outcome names for this market
+    const outcomeNames =
+      marketKey === 'h2h' ? [homeTeam, 'Draw', awayTeam] : ['Over', 'Under'];
+
+    // Build the comparison table: for each outcome, list all bookmaker prices
+    const outcomes: OutcomeComparison[] = outcomeNames.map((outcomeName) => {
+      const bookmakerPrices: BookmakerPrice[] = [];
+
+      for (const [bk, row] of bookmakerMap) {
+        const outcomesArr = row.outcomes as Array<{
+          name: string;
+          price: number;
+          point?: number;
+        }>;
+        if (!Array.isArray(outcomesArr)) continue;
+
+        const outcome = outcomesArr.find((o) => o.name === outcomeName);
+        if (!outcome) continue;
+
+        bookmakerPrices.push({
+          bookmakerKey: bk,
+          bookmakerName: (row.bookmakerName as string) || bk,
+          price: outcome.price,
+          impliedProbability: ProbabilityUtil.decimalToImplied(outcome.price),
+          overround: row.overround ? parseFloat(row.overround) : null,
+          lastUpdate: row.lastUpdate,
+        });
+      }
+
+      // Sort by price descending (best odds first)
+      bookmakerPrices.sort((a, b) => b.price - a.price);
+
+      const bestPrice = bookmakerPrices[0] ?? null;
+      const worstPrice = bookmakerPrices[bookmakerPrices.length - 1] ?? null;
+
+      // Get consensus probability for value bet detection
+      let consensusProbability: number | null = null;
+      if (consensus && marketKey === 'h2h') {
+        if (outcomeName === homeTeam)
+          consensusProbability = parseFloat(consensus.consensusHomeWin) || null;
+        else if (outcomeName === 'Draw')
+          consensusProbability = parseFloat(consensus.consensusDraw) || null;
+        else if (outcomeName === awayTeam)
+          consensusProbability = parseFloat(consensus.consensusAwayWin) || null;
+      } else if (consensus && marketKey === 'totals') {
+        if (outcomeName === 'Over')
+          consensusProbability = parseFloat(consensus.consensusOver) || null;
+        else if (outcomeName === 'Under')
+          consensusProbability = parseFloat(consensus.consensusUnder) || null;
+      }
+
+      // Detect value bets: edge > 3% at best price
+      let valueBet: ValueBet | null = null;
+      if (consensusProbability && bestPrice) {
+        const edge = ProbabilityUtil.calculateEdge(
+          consensusProbability,
+          bestPrice.price,
+        );
+        if (edge > 3) {
+          valueBet = {
+            bookmakerKey: bestPrice.bookmakerKey,
+            bookmakerName: bestPrice.bookmakerName,
+            price: bestPrice.price,
+            edgePercent: parseFloat(edge.toFixed(2)),
+            consensusProbability,
+            impliedProbability: bestPrice.impliedProbability,
+          };
+        }
+      }
+
+      return {
+        outcome: outcomeName,
+        bestPrice: bestPrice
+          ? {
+              bookmakerKey: bestPrice.bookmakerKey,
+              bookmakerName: bestPrice.bookmakerName,
+              price: bestPrice.price,
+            }
+          : null,
+        worstPrice: worstPrice
+          ? {
+              bookmakerKey: worstPrice.bookmakerKey,
+              bookmakerName: worstPrice.bookmakerName,
+              price: worstPrice.price,
+            }
+          : null,
+        spread:
+          bestPrice && worstPrice
+            ? parseFloat((bestPrice.price - worstPrice.price).toFixed(2))
+            : 0,
+        bookmakerCount: bookmakerPrices.length,
+        consensusProbability,
+        valueBet,
+        bookmakers: bookmakerPrices,
+      };
+    });
+
+    const valueBets = outcomes
+      .filter((o) => o.valueBet !== null)
+      .map((o) => o.valueBet!);
+
+    return {
+      marketKey,
+      bookmakerCount: bookmakerMap.size,
+      outcomes,
+      valueBets,
+    };
+  }
 
   /**
    * Make a GET request to The Odds API with the apiKey query parameter.

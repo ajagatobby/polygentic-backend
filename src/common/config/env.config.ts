@@ -142,7 +142,7 @@ export class EnvConfig {
 
   @IsString()
   @IsOptional()
-  ODDS_API_REGIONS: string = 'uk,eu';
+  ODDS_API_REGIONS: string = 'us,uk,eu,au';
 
   @Type(() => Number)
   @IsInt()
