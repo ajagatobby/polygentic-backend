@@ -264,19 +264,14 @@ export class FootballController {
         ? body.leagueIds
         : [...TRACKED_LEAGUES];
 
-      const season = body.season ?? this.getCurrentSeason();
-
       // Run fixture sync
       const fixtureCount = await this.footballService.syncFixtures(leagueIds);
 
-      // Optionally sync standings for the requested leagues
+      // Sync standings for the requested leagues (season auto-detected per league)
       let standingsCount = 0;
       for (const leagueId of leagueIds) {
         try {
-          standingsCount += await this.footballService.syncStandings(
-            leagueId,
-            season,
-          );
+          standingsCount += await this.footballService.syncStandings(leagueId);
         } catch (error) {
           this.logger.error(
             `Failed to sync standings for league ${leagueId}: ${error.message}`,
@@ -289,18 +284,11 @@ export class FootballController {
         fixturesSynced: fixtureCount,
         standingsSynced: standingsCount,
         leaguesProcessed: leagueIds.length,
-        season,
+        season: FootballService.getCurrentSeason(),
       };
     } catch (error) {
       this.logger.error(`Manual sync failed: ${error.message}`);
       throw new InternalServerErrorException('Sync operation failed');
     }
-  }
-
-  // ─── PRIVATE ─────────────────────────────────────────────────────────
-
-  private getCurrentSeason(): number {
-    const now = new Date();
-    return now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1;
   }
 }

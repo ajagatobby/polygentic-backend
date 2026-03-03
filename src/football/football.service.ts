@@ -82,20 +82,9 @@ export class FootballService {
     this.logger.log(`Syncing fixtures for ${leagueIds.length} leagues`);
     let totalUpserted = 0;
 
-    const europeanSeason = this.getCurrentSeason();
-    const calendarYear = new Date().getFullYear();
-
     for (const leagueId of leagueIds) {
       try {
-        // Determine which seasons to try for this league
-        const seasonsToTry = [europeanSeason];
-        if (
-          FootballService.CALENDAR_YEAR_LEAGUES.has(leagueId) &&
-          calendarYear !== europeanSeason
-        ) {
-          seasonsToTry.push(calendarYear);
-        }
-
+        const seasonsToTry = FootballService.getSeasonsForLeague(leagueId);
         let leagueUpserted = 0;
 
         for (const season of seasonsToTry) {
@@ -191,131 +180,174 @@ export class FootballService {
   }
 
   /**
-   * Fetch injuries for a league/season and upsert into the injuries table.
+   * Fetch injuries for a league and upsert into the injuries table.
+   *
+   * Automatically determines the correct season(s) to query. For calendar-year
+   * leagues (MLS, Brasileirao, etc.) both the current calendar year and the
+   * European season are tried, accumulating results from all seasons.
+   *
+   * Injuries that reference a fixtureId not yet in our database are inserted
+   * with fixtureId = null to avoid FK constraint violations.
    */
-  async syncInjuries(leagueId: number, season: number): Promise<number> {
-    this.logger.log(
-      `Syncing injuries for league ${leagueId}, season ${season}`,
-    );
+  async syncInjuries(leagueId: number): Promise<number> {
+    const seasonsToTry = FootballService.getSeasonsForLeague(leagueId);
+    let totalCount = 0;
 
-    const data = await this.apiRequest<any>('/injuries', {
-      league: String(leagueId),
-      season: String(season),
-    });
+    for (const season of seasonsToTry) {
+      this.logger.log(
+        `Syncing injuries for league ${leagueId}, season ${season}`,
+      );
 
-    if (!data.response?.length) {
-      this.logger.debug(`No injuries for league ${leagueId}`);
-      return 0;
+      const data = await this.apiRequest<any>('/injuries', {
+        league: String(leagueId),
+        season: String(season),
+      });
+
+      if (!data.response?.length) {
+        this.logger.debug(
+          `No injuries for league ${leagueId} season ${season}`,
+        );
+        continue;
+      }
+
+      // Collect all referenced fixture IDs and check which exist in our DB
+      const referencedFixtureIds = new Set<number>();
+      for (const item of data.response) {
+        if (item.fixture?.id) referencedFixtureIds.add(item.fixture.id);
+      }
+
+      const existingFixtureIds = new Set<number>();
+      if (referencedFixtureIds.size > 0) {
+        const rows = await this.db
+          .select({ id: schema.fixtures.id })
+          .from(schema.fixtures)
+          .where(
+            sql`${schema.fixtures.id} IN (${sql.join(
+              [...referencedFixtureIds].map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+          );
+        for (const row of rows) {
+          existingFixtureIds.add(row.id);
+        }
+      }
+
+      let count = 0;
+      let skippedFixtures = 0;
+      for (const item of data.response) {
+        // Use null for fixtureId if the referenced fixture is not in our DB
+        const rawFixtureId = item.fixture?.id ?? null;
+        const safeFixtureId =
+          rawFixtureId !== null && existingFixtureIds.has(rawFixtureId)
+            ? rawFixtureId
+            : null;
+
+        if (rawFixtureId !== null && safeFixtureId === null) {
+          skippedFixtures++;
+        }
+
+        try {
+          await this.db
+            .insert(schema.injuries)
+            .values({
+              playerId: item.player.id,
+              playerName: item.player.name,
+              type: item.player.type,
+              reason: item.player.reason,
+              teamId: item.team.id,
+              fixtureId: safeFixtureId,
+              leagueId: item.league.id,
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [
+                schema.injuries.playerId,
+                schema.injuries.teamId,
+                schema.injuries.fixtureId,
+                schema.injuries.type,
+              ],
+              set: {
+                playerName: item.player.name,
+                reason: item.player.reason,
+                updatedAt: new Date(),
+              },
+            });
+
+          count++;
+        } catch (error) {
+          this.logger.debug(
+            `Skipped injury for player ${item.player?.id} (${item.player?.name}): ${error.message}`,
+          );
+        }
+      }
+
+      if (skippedFixtures > 0) {
+        this.logger.debug(
+          `${skippedFixtures} injuries for league ${leagueId} had missing fixture refs (fixtureId set to null)`,
+        );
+      }
+
+      this.logger.log(
+        `Synced ${count} injuries for league ${leagueId} (season ${season})`,
+      );
+      totalCount += count;
     }
 
-    let count = 0;
-    for (const item of data.response) {
-      await this.db
-        .insert(schema.injuries)
-        .values({
-          playerId: item.player.id,
-          playerName: item.player.name,
-          type: item.player.type,
-          reason: item.player.reason,
-          teamId: item.team.id,
-          fixtureId: item.fixture?.id ?? null,
-          leagueId: item.league.id,
-          updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: [
-            schema.injuries.playerId,
-            schema.injuries.teamId,
-            schema.injuries.fixtureId,
-            schema.injuries.type,
-          ],
-          set: {
-            playerName: item.player.name,
-            reason: item.player.reason,
-            updatedAt: new Date(),
-          },
-        });
-
-      count++;
-    }
-
-    this.logger.log(`Synced ${count} injuries for league ${leagueId}`);
-    return count;
+    return totalCount;
   }
 
   /**
-   * Fetch standings for a league/season and update the team_form table.
+   * Fetch standings for a league and update the team_form table.
+   *
+   * Automatically determines the correct season(s) to query. For calendar-year
+   * leagues (MLS, Brasileirao, etc.) the current calendar year is tried first;
+   * the first season that returns data wins (standings are a snapshot, not
+   * something we need to merge across seasons).
    */
-  async syncStandings(leagueId: number, season: number): Promise<number> {
-    this.logger.log(
-      `Syncing standings for league ${leagueId}, season ${season}`,
-    );
+  async syncStandings(leagueId: number): Promise<number> {
+    const seasonsToTry = FootballService.getSeasonsForLeague(leagueId);
 
-    const data = await this.apiRequest<any>('/standings', {
-      league: String(leagueId),
-      season: String(season),
-    });
+    for (const season of seasonsToTry) {
+      this.logger.log(
+        `Syncing standings for league ${leagueId}, season ${season}`,
+      );
 
-    if (!data.response?.length) {
-      this.logger.warn(`No standings for league ${leagueId}`);
-      return 0;
-    }
+      const data = await this.apiRequest<any>('/standings', {
+        league: String(leagueId),
+        season: String(season),
+      });
 
-    let count = 0;
-    // Standings response is nested: response[0].league.standings[0] = array of team rows
-    const leagueData = data.response[0]?.league;
-    if (!leagueData?.standings?.length) return 0;
+      if (!data.response?.length) {
+        this.logger.debug(
+          `No standings for league ${leagueId} season ${season}, trying next...`,
+        );
+        continue;
+      }
 
-    for (const group of leagueData.standings) {
-      for (const standing of group) {
-        const allStats = standing.all;
-        const homeStats = standing.home;
-        const awayStats = standing.away;
+      let count = 0;
+      // Standings response is nested: response[0].league.standings[0] = array of team rows
+      const leagueData = data.response[0]?.league;
+      if (!leagueData?.standings?.length) continue;
 
-        // Ensure team exists before inserting team_form (FK constraint)
-        await this.ensureTeam({
-          id: standing.team.id,
-          name: standing.team.name,
-          logo: standing.team.logo,
-        });
+      for (const group of leagueData.standings) {
+        for (const standing of group) {
+          const allStats = standing.all;
+          const homeStats = standing.home;
+          const awayStats = standing.away;
 
-        await this.db
-          .insert(schema.teamForm)
-          .values({
-            teamId: standing.team.id,
-            leagueId,
-            season,
-            formString: standing.form ?? null,
-            leaguePosition: standing.rank,
-            points: standing.points,
-            last5Wins: allStats.win,
-            last5Draws: allStats.draw,
-            last5Losses: allStats.lose,
-            last5GoalsFor: allStats.goals.for,
-            last5GoalsAgainst: allStats.goals.against,
-            homeWins: homeStats.win,
-            homeDraws: homeStats.draw,
-            homeLosses: homeStats.lose,
-            awayWins: awayStats.win,
-            awayDraws: awayStats.draw,
-            awayLosses: awayStats.lose,
-            goalsForAvg:
-              allStats.played > 0
-                ? String((allStats.goals.for / allStats.played).toFixed(2))
-                : null,
-            goalsAgainstAvg:
-              allStats.played > 0
-                ? String((allStats.goals.against / allStats.played).toFixed(2))
-                : null,
-            updatedAt: new Date(),
-          })
-          .onConflictDoUpdate({
-            target: [
-              schema.teamForm.teamId,
-              schema.teamForm.leagueId,
-              schema.teamForm.season,
-            ],
-            set: {
+          // Ensure team exists before inserting team_form (FK constraint)
+          await this.ensureTeam({
+            id: standing.team.id,
+            name: standing.team.name,
+            logo: standing.team.logo,
+          });
+
+          await this.db
+            .insert(schema.teamForm)
+            .values({
+              teamId: standing.team.id,
+              leagueId,
+              season,
               formString: standing.form ?? null,
               leaguePosition: standing.rank,
               points: standing.points,
@@ -341,15 +373,54 @@ export class FootballService {
                     )
                   : null,
               updatedAt: new Date(),
-            },
-          });
+            })
+            .onConflictDoUpdate({
+              target: [
+                schema.teamForm.teamId,
+                schema.teamForm.leagueId,
+                schema.teamForm.season,
+              ],
+              set: {
+                formString: standing.form ?? null,
+                leaguePosition: standing.rank,
+                points: standing.points,
+                last5Wins: allStats.win,
+                last5Draws: allStats.draw,
+                last5Losses: allStats.lose,
+                last5GoalsFor: allStats.goals.for,
+                last5GoalsAgainst: allStats.goals.against,
+                homeWins: homeStats.win,
+                homeDraws: homeStats.draw,
+                homeLosses: homeStats.lose,
+                awayWins: awayStats.win,
+                awayDraws: awayStats.draw,
+                awayLosses: awayStats.lose,
+                goalsForAvg:
+                  allStats.played > 0
+                    ? String((allStats.goals.for / allStats.played).toFixed(2))
+                    : null,
+                goalsAgainstAvg:
+                  allStats.played > 0
+                    ? String(
+                        (allStats.goals.against / allStats.played).toFixed(2),
+                      )
+                    : null,
+                updatedAt: new Date(),
+              },
+            });
 
-        count++;
+          count++;
+        }
       }
+
+      this.logger.log(
+        `Synced ${count} standings for league ${leagueId} (season ${season})`,
+      );
+      return count;
     }
 
-    this.logger.log(`Synced ${count} standings for league ${leagueId}`);
-    return count;
+    this.logger.warn(`No standings found for league ${leagueId} in any season`);
+    return 0;
   }
 
   /**
@@ -373,18 +444,9 @@ export class FootballService {
     const fromDate = twoDaysAgo.toISOString().split('T')[0];
     const toDate = now.toISOString().split('T')[0];
 
-    const europeanSeason = this.getCurrentSeason();
-    const calendarYear = new Date().getFullYear();
-
     for (const leagueId of leagueIds) {
       try {
-        const seasonsToTry = [europeanSeason];
-        if (
-          FootballService.CALENDAR_YEAR_LEAGUES.has(leagueId) &&
-          calendarYear !== europeanSeason
-        ) {
-          seasonsToTry.push(calendarYear);
-        }
+        const seasonsToTry = FootballService.getSeasonsForLeague(leagueId);
 
         for (const season of seasonsToTry) {
           const data = await this.apiRequest<any>('/fixtures', {
@@ -1318,10 +1380,34 @@ export class FootballService {
   /**
    * Determine the current football season year. Most European leagues run
    * August–May, so if we're past July we use the current calendar year.
+   *
+   * Public + static so that other services (SyncService, controllers, scripts)
+   * can call `FootballService.getCurrentSeason()` without duplicating the logic.
    */
-  private getCurrentSeason(): number {
+  static getCurrentSeason(): number {
     const now = new Date();
     return now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1;
+  }
+
+  /**
+   * Return the season(s) to try when fetching data for a given league.
+   *
+   * - European leagues: `[europeanSeason]`
+   * - Calendar-year leagues (MLS, Liga MX, etc.): `[calendarYear, europeanSeason]`
+   *   (calendar year first — more likely to have current data), de-duplicated.
+   */
+  static getSeasonsForLeague(leagueId: number): number[] {
+    const europeanSeason = FootballService.getCurrentSeason();
+    const calendarYear = new Date().getFullYear();
+
+    if (
+      FootballService.CALENDAR_YEAR_LEAGUES.has(leagueId) &&
+      calendarYear !== europeanSeason
+    ) {
+      return [calendarYear, europeanSeason];
+    }
+
+    return [europeanSeason];
   }
 
   private parseStatInt(value: any): number | null {

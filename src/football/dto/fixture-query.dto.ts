@@ -158,15 +158,6 @@ export class SyncFixturesDto {
   @Type(() => Number)
   @IsInt({ each: true })
   leagueIds?: number[];
-
-  @ApiPropertyOptional({
-    description: 'Season year. Defaults to current season.',
-    example: 2024,
-  })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  season?: number;
 }
 
 export class TeamQueryDto {

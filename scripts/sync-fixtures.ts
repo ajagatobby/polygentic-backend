@@ -97,11 +97,6 @@ async function main() {
   let totalInjuries = 0;
   const errors: string[] = [];
 
-  // Determine the current season
-  const now = new Date();
-  const season =
-    now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1;
-
   // ── Sync fixtures ────────────────────────────────────────────────────
   console.log(
     `\n[1/3] Syncing fixtures for ${options.leagueIds.length} leagues...`,
@@ -119,13 +114,15 @@ async function main() {
     }
   }
 
-  // ── Sync standings ───────────────────────────────────────────────────
+  // ── Sync standings (season auto-detected per league) ─────────────────
   if (options.includeStandings) {
-    console.log(`\n[2/3] Syncing standings (season ${season})...`);
+    console.log(
+      '\n[2/3] Syncing standings (season auto-detected per league)...',
+    );
 
     for (const leagueId of options.leagueIds) {
       try {
-        const count = await footballService.syncStandings(leagueId, season);
+        const count = await footballService.syncStandings(leagueId);
         totalStandings += count;
         console.log(`  League ${leagueId}: ${count} team standings upserted`);
       } catch (error) {
@@ -138,13 +135,15 @@ async function main() {
     console.log('\n[2/3] Standings sync skipped (use --standings to include)');
   }
 
-  // ── Sync injuries ───────────────────────────────────────────────────
+  // ── Sync injuries (season auto-detected per league) ──────────────────
   if (options.includeInjuries) {
-    console.log(`\n[3/3] Syncing injuries (season ${season})...`);
+    console.log(
+      '\n[3/3] Syncing injuries (season auto-detected per league)...',
+    );
 
     for (const leagueId of options.leagueIds) {
       try {
-        const count = await footballService.syncInjuries(leagueId, season);
+        const count = await footballService.syncInjuries(leagueId);
         totalInjuries += count;
         console.log(`  League ${leagueId}: ${count} injuries synced`);
       } catch (error) {

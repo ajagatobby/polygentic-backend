@@ -20,12 +20,12 @@ Lightweight, idempotent data sync operations. Each has a re-entrancy guard to pr
 
 **File:** `src/sync/sync.scheduler.ts`
 
-| Schedule         | Job               | What It Does                                                                                                                                      |
-| ---------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Every 30 minutes | `syncFixtures()`  | Fetches upcoming fixtures from API-Football for all 30 tracked leagues and upserts them into the `fixtures` table. Keeps match schedules current. |
-| Every 2 hours    | `syncInjuries()`  | Fetches player injury and suspension data for all tracked leagues. Used by the prediction pipeline to assess squad availability.                  |
-| Every 2 hours    | `syncStandings()` | Fetches league tables, team form strings, home/away records, and goal averages. Core data for prediction analysis.                                |
-| Every 6 hours    | `syncOdds()`      | Fetches bookmaker odds from The Odds API. Computes consensus odds across bookmakers. Used for value bet detection in predictions.                 |
+| Schedule         | Job               | What It Does                                                                                                                                                                                                         |
+| ---------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Every 30 minutes | `syncFixtures()`  | Fetches upcoming fixtures from API-Football for all 30 tracked leagues and upserts them into the `fixtures` table. Keeps match schedules current.                                                                    |
+| Every 2 hours    | `syncInjuries()`  | Fetches player injury and suspension data for all tracked leagues. Season auto-detected per league (calendar-year leagues try both seasons). Injuries referencing unknown fixtures are inserted with null fixtureId. |
+| Every 2 hours    | `syncStandings()` | Fetches league tables, team form strings, home/away records, and goal averages. Season auto-detected per league (calendar-year leagues try both seasons; first with data wins).                                      |
+| Every 6 hours    | `syncOdds()`      | Fetches bookmaker odds from The Odds API. Computes consensus odds across bookmakers. Used for value bet detection in predictions.                                                                                    |
 
 ### Cron Expressions
 
@@ -165,11 +165,17 @@ T+1h     [hourly cron]         backup resolution for any matches missed by live 
 | Job                         | Calls per Run | Runs per Day       | Daily Total |
 | --------------------------- | ------------- | ------------------ | ----------- |
 | Fixture sync (30 leagues)   | 30            | 48                 | 1,440       |
-| Standings sync (30 leagues) | 30            | 12                 | 360         |
-| Injuries sync (30 leagues)  | 30            | 12                 | 360         |
+| Standings sync (30 leagues) | 30-34\*       | 12                 | ~408        |
+| Injuries sync (30 leagues)  | 30-34\*       | 12                 | ~408        |
 | Live polling                | 1             | ~2,880 (every 30s) | 2,880       |
 | Lineup checks               | 1-10          | ~288 (every 5 min) | ~500        |
 | Completed fixture sync      | 30            | 24                 | 720         |
-| **Total estimate**          |               |                    | **~6,260**  |
+| **Total estimate**          |               |                    | **~6,356**  |
+
+\* Calendar-year leagues (MLS, Liga MX, Brasileirao, Argentina Liga) may make 2 API calls (one per season) instead of 1.
 
 This is within the 7,500/day Pro plan limit but leaves limited headroom. The live polling (2,880 calls/day) is the largest consumer.
+
+### Season Detection
+
+All sync methods auto-detect the correct season per league. Calendar-year leagues (MLS 253, Liga MX 262, Brasileirao 71, Argentina Liga 128) try both the current calendar year and the European season. The single source of truth for season logic is `FootballService.getCurrentSeason()` and `FootballService.getSeasonsForLeague()`.

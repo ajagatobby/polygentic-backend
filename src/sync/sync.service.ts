@@ -57,15 +57,11 @@ export class SyncService {
     const startedAt = new Date();
     try {
       this.logger.log('Starting injuries sync...');
-      const currentSeason = this.getCurrentSeason();
       let totalProcessed = 0;
 
       for (const leagueId of TRACKED_LEAGUES) {
         try {
-          const result: any = await this.footballService.syncInjuries(
-            leagueId,
-            currentSeason,
-          );
+          const result: any = await this.footballService.syncInjuries(leagueId);
           totalProcessed += result || 0;
         } catch (error) {
           this.logger.warn(
@@ -96,11 +92,10 @@ export class SyncService {
     const startedAt = new Date();
     try {
       this.logger.log('Starting standings sync...');
-      const currentSeason = this.getCurrentSeason();
 
       for (const leagueId of TRACKED_LEAGUES) {
         try {
-          await this.footballService.syncStandings(leagueId, currentSeason);
+          await this.footballService.syncStandings(leagueId);
         } catch (error) {
           this.logger.warn(
             `Failed to sync standings for league ${leagueId}: ${error.message}`,
@@ -215,11 +210,6 @@ export class SyncService {
       .from(schema.syncLog)
       .orderBy(desc(schema.syncLog.startedAt))
       .limit(limit);
-  }
-
-  private getCurrentSeason(): number {
-    const now = new Date();
-    return now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1;
   }
 
   private async logSync(
