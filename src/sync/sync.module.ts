@@ -5,9 +5,11 @@ import { FootballModule } from '../football/football.module';
 import { OddsModule } from '../odds/odds.module';
 import { SyncService } from './sync.service';
 import { SyncScheduler } from './sync.scheduler';
+import { SyncController } from './sync.controller';
 
 @Module({
   imports: [ConfigModule, ScheduleModule.forRoot(), FootballModule, OddsModule],
+  controllers: [SyncController],
   providers: [SyncService, SyncScheduler],
   exports: [SyncService],
 })
