@@ -1,4 +1,38 @@
 import { defineConfig } from '@trigger.dev/sdk/v3';
+import { esbuildPlugin } from '@trigger.dev/build';
+
+/**
+ * Custom esbuild plugin that force-marks unresolvable NestJS optional peer
+ * dependencies as external. Trigger.dev's built-in `build.external` only works
+ * when the package can be resolved from node_modules. Subpaths like
+ * `class-transformer/storage` have no top-level entry point and fail resolution
+ * under pnpm's strict hoisting, so the built-in externals plugin silently
+ * ignores them. This plugin intercepts the bare specifiers at the esbuild
+ * resolve phase and marks them external unconditionally.
+ */
+const nestExternalsPlugin = esbuildPlugin({
+  name: 'nest-externals',
+  setup(build) {
+    // Patterns that should be treated as external regardless of whether
+    // they can be resolved from the project root.
+    const externalPatterns = [
+      '@nestjs/microservices',
+      '@nestjs/websockets',
+      '@nestjs/platform-express',
+      'class-transformer/storage',
+    ];
+
+    build.onResolve(
+      {
+        filter:
+          /^(@nestjs\/microservices|@nestjs\/websockets|@nestjs\/platform-express|class-transformer\/storage)/,
+      },
+      (args) => {
+        return { path: args.path, external: true };
+      },
+    );
+  },
+});
 
 export default defineConfig({
   project: 'proj_vxjafqrlliypvyfbcnpl',
@@ -20,15 +54,16 @@ export default defineConfig({
   },
   dirs: ['./src/trigger'],
   build: {
-    // Mark NestJS optional peer dependencies as external so esbuild doesn't
-    // try to resolve them at bundle time. These are dynamically required by
-    // @nestjs/core but never actually used by Trigger.dev tasks (which use
-    // standalone service instantiation via src/trigger/init.ts).
+    // The built-in `external` array handles packages that exist in node_modules
+    // and can be resolved. We keep it for packages that ARE installed.
     external: [
       '@nestjs/microservices',
       '@nestjs/websockets',
+      '@nestjs/websockets/socket-module',
       '@nestjs/platform-express',
-      'class-transformer/storage',
     ],
+    // The custom esbuild plugin handles subpaths and packages that can't be
+    // resolved (e.g. class-transformer/storage has no top-level entry point).
+    extensions: [nestExternalsPlugin],
   },
 });
