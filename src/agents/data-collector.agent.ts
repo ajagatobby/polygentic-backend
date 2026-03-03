@@ -117,6 +117,44 @@ export class DataCollectorAgent {
 
   private async fetchLineupsSafe(fixtureId: number): Promise<any[]> {
     try {
+      // Check DB first (lineups may have been persisted by the lineup task)
+      const persisted =
+        await this.footballService.getLineupsForFixture(fixtureId);
+      if (persisted.length > 0) {
+        this.logger.debug(
+          `Using ${persisted.length} persisted lineup(s) for fixture ${fixtureId}`,
+        );
+        // Re-shape DB rows to match the API response format expected by AnalysisAgent
+        return persisted.map((row: any) => ({
+          team: { id: row.teamId, name: row.teamName, logo: row.teamLogo },
+          coach: {
+            id: row.coachId,
+            name: row.coachName,
+            photo: row.coachPhoto,
+          },
+          formation: row.formation,
+          startXI: (row.startXI ?? []).map((p: any) => ({
+            player: {
+              id: p.id,
+              name: p.name,
+              number: p.number,
+              pos: p.pos,
+              grid: p.grid,
+            },
+          })),
+          substitutes: (row.substitutes ?? []).map((p: any) => ({
+            player: {
+              id: p.id,
+              name: p.name,
+              number: p.number,
+              pos: p.pos,
+              grid: p.grid,
+            },
+          })),
+        }));
+      }
+
+      // Fall back to live API fetch
       return await this.footballService.fetchLineups(fixtureId);
     } catch (error) {
       this.logger.debug(`Lineups not available for fixture ${fixtureId}`);

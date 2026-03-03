@@ -187,6 +187,57 @@ export const injuries = pgTable(
   ],
 );
 
+// ─── fixture_lineups ───────────────────────────────────────────────────
+
+export const fixtureLineups = pgTable(
+  'fixture_lineups',
+  {
+    id: serial('id').primaryKey(),
+    fixtureId: integer('fixture_id')
+      .notNull()
+      .references(() => fixtures.id),
+    teamId: integer('team_id')
+      .notNull()
+      .references(() => teams.id),
+    formation: varchar('formation', { length: 20 }),
+    coachId: integer('coach_id'),
+    coachName: varchar('coach_name', { length: 255 }),
+    coachPhoto: varchar('coach_photo', { length: 500 }),
+    startXI: jsonb('start_xi').$type<
+      Array<{
+        id: number;
+        name: string;
+        number: number;
+        pos: string;
+        grid: string | null;
+      }>
+    >(),
+    substitutes: jsonb('substitutes').$type<
+      Array<{
+        id: number;
+        name: string;
+        number: number;
+        pos: string;
+        grid: string | null;
+      }>
+    >(),
+    teamColors: jsonb('team_colors').$type<{
+      player: { primary: string; number: string; border: string };
+      goalkeeper: { primary: string; number: string; border: string };
+    } | null>(),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    index('idx_fixture_lineups_fixture').on(table.fixtureId),
+    index('idx_fixture_lineups_team').on(table.teamId),
+    uniqueIndex('uq_fixture_lineups_fixture_team').on(
+      table.fixtureId,
+      table.teamId,
+    ),
+  ],
+);
+
 // ─── team_form ─────────────────────────────────────────────────────────
 
 export const teamForm = pgTable(
@@ -243,6 +294,7 @@ export const teamsRelations = relations(teams, ({ many }) => ({
   fixtureEvents: many(fixtureEvents),
   injuries: many(injuries),
   teamForm: many(teamForm),
+  fixtureLineups: many(fixtureLineups),
 }));
 
 export const fixturesRelations = relations(fixtures, ({ one, many }) => ({
@@ -259,6 +311,7 @@ export const fixturesRelations = relations(fixtures, ({ one, many }) => ({
   statistics: many(fixtureStatistics),
   events: many(fixtureEvents),
   injuries: many(injuries),
+  lineups: many(fixtureLineups),
 }));
 
 export const fixtureStatisticsRelations = relations(
@@ -294,6 +347,17 @@ export const injuriesRelations = relations(injuries, ({ one }) => ({
   fixture: one(fixtures, {
     fields: [injuries.fixtureId],
     references: [fixtures.id],
+  }),
+}));
+
+export const fixtureLineupsRelations = relations(fixtureLineups, ({ one }) => ({
+  fixture: one(fixtures, {
+    fields: [fixtureLineups.fixtureId],
+    references: [fixtures.id],
+  }),
+  team: one(teams, {
+    fields: [fixtureLineups.teamId],
+    references: [teams.id],
   }),
 }));
 

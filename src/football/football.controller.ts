@@ -179,10 +179,71 @@ export class FootballController {
     }
   }
 
+  @Get('fixtures/:id/lineups')
+  @ApiOperation({
+    summary:
+      'Get confirmed lineups for a fixture (formation, startXI, bench, coach)',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'API-Football fixture ID',
+    type: Number,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Lineups for both teams (empty array if not yet available)',
+  })
+  @ApiResponse({ status: 404, description: 'Fixture not found' })
+  async getFixtureLineups(@Param('id', ParseIntPipe) id: number) {
+    try {
+      // First check the fixture exists
+      const fixture = await this.footballService.getFixtureById(id);
+      if (!fixture) {
+        throw new NotFoundException(`Fixture ${id} not found`);
+      }
+
+      // Get persisted lineups from DB
+      const lineups = await this.footballService.getLineupsForFixture(id);
+
+      // If no persisted lineups, try fetching from API (might be available now)
+      if (lineups.length === 0) {
+        try {
+          const persisted =
+            await this.footballService.fetchAndPersistLineups(id);
+          if (persisted > 0) {
+            const freshLineups =
+              await this.footballService.getLineupsForFixture(id);
+            return {
+              data: freshLineups,
+              count: freshLineups.length,
+              source: 'api-fresh',
+            };
+          }
+        } catch {
+          // API fetch failed — return empty
+        }
+      }
+
+      return {
+        data: lineups,
+        count: lineups.length,
+        source: lineups.length > 0 ? 'database' : 'unavailable',
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(
+        `Failed to get lineups for fixture ${id}: ${error.message}`,
+      );
+      throw new InternalServerErrorException(
+        'Failed to retrieve fixture lineups',
+      );
+    }
+  }
+
   @Get('fixtures/:id')
   @ApiOperation({
     summary:
-      'Get fixture details with statistics, events, injuries, and predictions',
+      'Get fixture details with statistics, events, injuries, lineups, and predictions',
   })
   @ApiParam({
     name: 'id',

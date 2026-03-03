@@ -88,6 +88,33 @@ export class AlertsService {
     });
   }
 
+  async createLineupAlert(
+    fixtureId: number,
+    matchTitle: string,
+    details: {
+      homeFormation?: string;
+      awayFormation?: string;
+      homeTeam?: string;
+      awayTeam?: string;
+    },
+  ): Promise<any> {
+    return this.createAlert({
+      fixtureId,
+      type: 'lineup_change',
+      severity: 'medium',
+      title: `Lineups confirmed: ${matchTitle}`,
+      message:
+        `Confirmed lineups released for ${matchTitle}. ` +
+        (details.homeFormation
+          ? `${details.homeTeam ?? 'Home'}: ${details.homeFormation}. `
+          : '') +
+        (details.awayFormation
+          ? `${details.awayTeam ?? 'Away'}: ${details.awayFormation}.`
+          : ''),
+      data: details,
+    });
+  }
+
   async getAlerts(filters?: {
     type?: AlertType;
     severity?: AlertSeverity;

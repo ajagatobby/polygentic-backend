@@ -527,6 +527,109 @@ export class FootballService {
   }
 
   /**
+   * Fetch lineups from API-Football and persist them to the fixture_lineups table.
+   * Returns the number of lineup rows upserted (typically 2 per fixture — home + away).
+   *
+   * If lineups are not yet available for the fixture, returns 0.
+   */
+  async fetchAndPersistLineups(fixtureId: number): Promise<number> {
+    const lineups = await this.fetchLineups(fixtureId);
+    if (!lineups.length) return 0;
+
+    let count = 0;
+    for (const lineup of lineups) {
+      const teamId = lineup.team?.id;
+      if (!teamId) continue;
+
+      // Normalize startXI: API returns [{ player: { id, name, number, pos, grid } }]
+      const startXI = (lineup.startXI ?? []).map((p: any) => ({
+        id: p.player?.id,
+        name: p.player?.name,
+        number: p.player?.number,
+        pos: p.player?.pos,
+        grid: p.player?.grid ?? null,
+      }));
+
+      const substitutes = (lineup.substitutes ?? []).map((p: any) => ({
+        id: p.player?.id,
+        name: p.player?.name,
+        number: p.player?.number,
+        pos: p.player?.pos,
+        grid: p.player?.grid ?? null,
+      }));
+
+      const teamColors = lineup.team?.colors ?? null;
+
+      await this.db
+        .insert(schema.fixtureLineups)
+        .values({
+          fixtureId,
+          teamId,
+          formation: lineup.formation ?? null,
+          coachId: lineup.coach?.id ?? null,
+          coachName: lineup.coach?.name ?? null,
+          coachPhoto: lineup.coach?.photo ?? null,
+          startXI,
+          substitutes,
+          teamColors,
+          updatedAt: new Date(),
+        })
+        .onConflictDoUpdate({
+          target: [
+            schema.fixtureLineups.fixtureId,
+            schema.fixtureLineups.teamId,
+          ],
+          set: {
+            formation: lineup.formation ?? null,
+            coachId: lineup.coach?.id ?? null,
+            coachName: lineup.coach?.name ?? null,
+            coachPhoto: lineup.coach?.photo ?? null,
+            startXI,
+            substitutes,
+            teamColors,
+            updatedAt: new Date(),
+          },
+        });
+
+      count++;
+    }
+
+    if (count > 0) {
+      this.logger.log(`Persisted ${count} lineup(s) for fixture ${fixtureId}`);
+    }
+
+    return count;
+  }
+
+  /**
+   * Get persisted lineups for a fixture from the database.
+   * Returns both teams' lineups with team names resolved.
+   */
+  async getLineupsForFixture(fixtureId: number): Promise<any[]> {
+    const lineups = await this.db
+      .select({
+        id: schema.fixtureLineups.id,
+        fixtureId: schema.fixtureLineups.fixtureId,
+        teamId: schema.fixtureLineups.teamId,
+        teamName: schema.teams.name,
+        teamLogo: schema.teams.logo,
+        formation: schema.fixtureLineups.formation,
+        coachId: schema.fixtureLineups.coachId,
+        coachName: schema.fixtureLineups.coachName,
+        coachPhoto: schema.fixtureLineups.coachPhoto,
+        startXI: schema.fixtureLineups.startXI,
+        substitutes: schema.fixtureLineups.substitutes,
+        teamColors: schema.fixtureLineups.teamColors,
+        updatedAt: schema.fixtureLineups.updatedAt,
+      })
+      .from(schema.fixtureLineups)
+      .leftJoin(schema.teams, eq(schema.fixtureLineups.teamId, schema.teams.id))
+      .where(eq(schema.fixtureLineups.fixtureId, fixtureId));
+
+    return lineups;
+  }
+
+  /**
    * Fetch match statistics and upsert into fixture_statistics table.
    */
   async fetchFixtureStatistics(fixtureId: number): Promise<any[]> {
@@ -963,6 +1066,7 @@ export class FootballService {
     statistics: any[];
     events: any[];
     injuries: any[];
+    lineups: any[];
     prediction: any;
   } | null> {
     const fixtureRows = await this.db
@@ -974,7 +1078,7 @@ export class FootballService {
     const fixture = fixtureRows?.[0];
     if (!fixture) return null;
 
-    const [statistics, events, injuries] = await Promise.all([
+    const [statistics, events, injuries, lineups] = await Promise.all([
       this.db
         .select()
         .from(schema.fixtureStatistics)
@@ -988,6 +1092,7 @@ export class FootballService {
         .select()
         .from(schema.injuries)
         .where(eq(schema.injuries.fixtureId, id)),
+      this.getLineupsForFixture(id),
     ]);
 
     // Fetch live prediction from API if fixture hasn't started yet
@@ -1000,7 +1105,7 @@ export class FootballService {
       }
     }
 
-    return { fixture, statistics, events, injuries, prediction };
+    return { fixture, statistics, events, injuries, lineups, prediction };
   }
 
   /**

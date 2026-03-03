@@ -33,7 +33,7 @@ export const lineupPredictionTask = task({
     factor: 2,
   },
   run: async () => {
-    const { db, footballService } = initServices();
+    const { db, footballService, alertsService } = initServices();
 
     const now = new Date();
     // Check fixtures within the next 90 minutes — lineups can appear
@@ -61,6 +61,12 @@ export const lineupPredictionTask = task({
 
     const fixtureIdsToRegenerate: number[] = [];
     const fixtureIdsToGenerate: number[] = [];
+    const fixturesWithNewLineups: Array<{
+      id: number;
+      leagueName: string | null;
+      homeTeamId: number;
+      awayTeamId: number;
+    }> = [];
     let skipped = 0;
 
     for (const fixture of fixtures) {
@@ -90,14 +96,22 @@ export const lineupPredictionTask = task({
         }
 
         // Prediction exists but was made without lineups — check if lineups
-        // are now available from the API
+        // are now available from the API. Persist them to DB if found.
         try {
-          const lineups = await footballService.fetchLineups(fixture.id);
-          if (lineups.length > 0) {
+          const persisted = await footballService.fetchAndPersistLineups(
+            fixture.id,
+          );
+          if (persisted > 0) {
             logger.info(
-              `Lineups now available for fixture ${fixture.id} — will regenerate pre_match prediction`,
+              `Lineups now available for fixture ${fixture.id} — persisted and will regenerate pre_match prediction`,
             );
             fixtureIdsToRegenerate.push(fixture.id);
+            fixturesWithNewLineups.push({
+              id: fixture.id,
+              leagueName: fixture.leagueName,
+              homeTeamId: fixture.homeTeamId,
+              awayTeamId: fixture.awayTeamId,
+            });
           } else {
             skipped++;
           }
@@ -109,12 +123,20 @@ export const lineupPredictionTask = task({
         // No pre_match prediction exists yet — check if lineups are available
         // so we can generate one WITH lineup data from the start
         try {
-          const lineups = await footballService.fetchLineups(fixture.id);
-          if (lineups.length > 0) {
+          const persisted = await footballService.fetchAndPersistLineups(
+            fixture.id,
+          );
+          if (persisted > 0) {
             logger.info(
-              `Lineups available for fixture ${fixture.id} — generating pre_match prediction with lineups`,
+              `Lineups available for fixture ${fixture.id} — persisted and generating pre_match prediction with lineups`,
             );
             fixtureIdsToGenerate.push(fixture.id);
+            fixturesWithNewLineups.push({
+              id: fixture.id,
+              leagueName: fixture.leagueName,
+              homeTeamId: fixture.homeTeamId,
+              awayTeamId: fixture.awayTeamId,
+            });
           } else {
             skipped++;
           }
@@ -169,12 +191,38 @@ export const lineupPredictionTask = task({
       }
     }
 
+    // Fire lineup_change alerts for fixtures that got new lineups
+    for (const f of fixturesWithNewLineups) {
+      try {
+        // Fetch persisted lineups to include formation info in alert
+        const lineups = await footballService.getLineupsForFixture(f.id);
+        const homeLineup = lineups.find((l: any) => l.teamId === f.homeTeamId);
+        const awayLineup = lineups.find((l: any) => l.teamId === f.awayTeamId);
+
+        const homeName = homeLineup?.teamName ?? 'Home';
+        const awayName = awayLineup?.teamName ?? 'Away';
+        const matchTitle = `${homeName} vs ${awayName}`;
+
+        await alertsService.createLineupAlert(f.id, matchTitle, {
+          homeFormation: homeLineup?.formation ?? undefined,
+          awayFormation: awayLineup?.formation ?? undefined,
+          homeTeam: homeName,
+          awayTeam: awayName,
+        });
+      } catch (err) {
+        logger.warn(`Failed to create lineup alert for fixture ${f.id}`, {
+          error: (err as Error).message,
+        });
+      }
+    }
+
     logger.info('Lineup-aware prediction task complete', {
       checked: fixtures.length,
       regenerated,
       newlyGenerated,
       skipped,
       failed,
+      alertsCreated: fixturesWithNewLineups.length,
     });
 
     return {
@@ -183,6 +231,7 @@ export const lineupPredictionTask = task({
       newlyGenerated,
       skipped,
       failed,
+      alertsCreated: fixturesWithNewLineups.length,
     };
   },
 });
