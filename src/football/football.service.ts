@@ -191,7 +191,6 @@ export class FootballService {
    *   avoid FK constraint violations on teamId.
    * - Injuries that reference a fixtureId not yet in our database are inserted
    *   with fixtureId = null to avoid FK constraint violations.
-   * - Supports pagination: fetches all pages from the API if multiple exist.
    * - Uses (playerId, teamId, leagueId, type) as the conflict target instead
    *   of fixtureId to avoid duplicate rows caused by NULL != NULL in PG
    *   unique indexes.
@@ -205,35 +204,22 @@ export class FootballService {
         `Syncing injuries for league ${leagueId}, season ${season}`,
       );
 
-      // ── Fetch all pages from the API ──────────────────────────────
-      const allItems: any[] = [];
-      let currentPage = 1;
-      let totalPages = 1;
+      const data = await this.apiRequest<any>('/injuries', {
+        league: String(leagueId),
+        season: String(season),
+      });
 
-      do {
-        const data = await this.apiRequest<any>('/injuries', {
-          league: String(leagueId),
-          season: String(season),
-          page: String(currentPage),
-        });
-
-        if (data.response?.length) {
-          allItems.push(...data.response);
-        }
-
-        totalPages = data.paging?.total ?? 1;
-        currentPage++;
-      } while (currentPage <= totalPages);
-
-      if (!allItems.length) {
+      if (!data.response?.length) {
         this.logger.debug(
           `No injuries for league ${leagueId} season ${season}`,
         );
         continue;
       }
 
+      const allItems: any[] = data.response;
+
       this.logger.log(
-        `Fetched ${allItems.length} injury records for league ${leagueId} (season ${season}, ${totalPages} page(s))`,
+        `Fetched ${allItems.length} injury records for league ${leagueId} (season ${season})`,
       );
 
       // ── Check which referenced fixtures exist in our DB ───────────
