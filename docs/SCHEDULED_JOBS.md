@@ -179,3 +179,38 @@ This is within the 7,500/day Pro plan limit but leaves limited headroom. The liv
 ### Season Detection
 
 All sync methods auto-detect the correct season per league. Calendar-year leagues (MLS 253, Liga MX 262, Brasileirao 71, Argentina Liga 128) try both the current calendar year and the European season. The single source of truth for season logic is `FootballService.getCurrentSeason()` and `FootballService.getSeasonsForLeague()`.
+
+---
+
+## Historical Data Backfill
+
+**Script:** `scripts/backfill-historical.ts`
+
+One-time script to populate the database with 6 months of historical fixtures, match statistics, and match events. This enriches the AI prediction pipeline and enables frontend graph/chart data.
+
+### Usage
+
+```bash
+# Full 6-month backfill with stats and events:
+npx ts-node -r tsconfig-paths/register scripts/backfill-historical.ts --all
+
+# Quick 3-month backfill for Premier League only:
+npx ts-node -r tsconfig-paths/register scripts/backfill-historical.ts -l 39 -m 3 --all
+
+# Custom date range:
+npx ts-node -r tsconfig-paths/register scripts/backfill-historical.ts --from 2025-09-01 --to 2026-03-01 --all
+
+# Dry run (estimate API calls without making any):
+npx ts-node -r tsconfig-paths/register scripts/backfill-historical.ts --all --dry-run
+```
+
+### Phases
+
+1. **Fixture fetch** — Fetches completed fixtures for each league in 2-week date-range chunks via `/fixtures?league=X&season=Y&from=DATE&to=DATE`
+2. **Statistics fetch** — Fetches xG, shots, possession, passes per fixture via `/fixtures/statistics?fixture=ID` (skips if already in DB)
+3. **Events fetch** — Fetches goals, cards, substitutions per fixture via `/fixtures/events?fixture=ID` (skips if already in DB)
+4. **Lineups fetch** (optional) — Fetches formation + startXI for completed matches
+
+### Budget
+
+Estimated ~1,600–2,000 API calls for a full 6-month, 30-league backfill. Completable in a single day alongside normal operations. Includes 450ms throttle between calls (~130 req/min, well within the 300 req/min rate limit).

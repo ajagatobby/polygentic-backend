@@ -291,6 +291,58 @@ export class FootballController {
     }
   }
 
+  @Get('teams/:id/history')
+  @ApiOperation({
+    summary:
+      'Get team match history with results and stats (for graphs and analysis)',
+    description:
+      'Returns completed matches for a team with goals, result (W/D/L), ' +
+      'and per-match statistics (xG, shots, possession, etc.). ' +
+      'Useful for plotting form charts, scoring trends, and xG timelines.',
+  })
+  @ApiParam({ name: 'id', description: 'API-Football team ID', type: Number })
+  @ApiResponse({
+    status: 200,
+    description: 'Team match history with stats',
+  })
+  @ApiResponse({ status: 404, description: 'Team not found' })
+  async getTeamHistory(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('leagueId') leagueId?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    try {
+      const result = await this.footballService.getTeamMatchHistory(id, {
+        leagueId: leagueId ? Number(leagueId) : undefined,
+        limit: limit ? Number(limit) : 30,
+        offset: offset ? Number(offset) : 0,
+      });
+
+      if (!result.team) {
+        throw new NotFoundException(`Team ${id} not found`);
+      }
+
+      return {
+        team: result.team,
+        matches: result.matches,
+        total: result.total,
+        page: {
+          limit: limit ? Number(limit) : 30,
+          offset: offset ? Number(offset) : 0,
+        },
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(
+        `Failed to get team history for ${id}: ${error.message}`,
+      );
+      throw new InternalServerErrorException(
+        'Failed to retrieve team match history',
+      );
+    }
+  }
+
   // ─── LEAGUES ─────────────────────────────────────────────────────────
 
   @Get('leagues')

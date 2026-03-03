@@ -480,6 +480,55 @@ export class FootballService {
     return totalUpserted;
   }
 
+  /**
+   * Fetch fixtures for a specific league within a date range and upsert them.
+   * Used for historical backfill — does NOT use the `next` param.
+   *
+   * The API-Football `/fixtures` endpoint supports `from` and `to` params
+   * (YYYY-MM-DD format). Seasons are auto-detected per league.
+   *
+   * @returns Number of fixtures upserted
+   */
+  async syncFixturesByDateRange(
+    leagueId: number,
+    from: string,
+    to: string,
+  ): Promise<number> {
+    const seasonsToTry = FootballService.getSeasonsForLeague(leagueId);
+    let totalUpserted = 0;
+
+    for (const season of seasonsToTry) {
+      this.logger.log(
+        `Syncing fixtures for league ${leagueId}, season ${season}, ${from} to ${to}`,
+      );
+
+      const data = await this.apiRequest<any>('/fixtures', {
+        league: String(leagueId),
+        season: String(season),
+        from,
+        to,
+      });
+
+      if (!data.response?.length) {
+        this.logger.debug(
+          `No fixtures for league ${leagueId} season ${season} in range ${from}–${to}`,
+        );
+        continue;
+      }
+
+      for (const item of data.response) {
+        await this.upsertFixture(item);
+        totalUpserted++;
+      }
+
+      this.logger.debug(
+        `Synced ${data.response.length} fixtures for league ${leagueId} season ${season} (${from}–${to})`,
+      );
+    }
+
+    return totalUpserted;
+  }
+
   // ─── FETCH METHODS (Read-only from API, optionally persist) ──────────
 
   /**
@@ -1272,6 +1321,177 @@ export class FootballService {
       .orderBy(desc(schema.teamForm.season));
 
     return { team, form };
+  }
+
+  /**
+   * Get a team's match history with results and statistics.
+   * Returns completed fixtures (FT/AET/PEN) for the team, ordered by date desc,
+   * with match stats (xG, shots, possession) joined in.
+   *
+   * Used for frontend graph data (goals over time, form charts, xG trends).
+   */
+  async getTeamMatchHistory(
+    teamId: number,
+    options?: {
+      leagueId?: number;
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<{
+    team: any;
+    matches: any[];
+    total: number;
+  }> {
+    const limit = options?.limit ?? 30;
+    const offset = options?.offset ?? 0;
+
+    // Get team info
+    const teamRows = await this.db
+      .select()
+      .from(schema.teams)
+      .where(eq(schema.teams.id, teamId))
+      .limit(1);
+
+    const team = teamRows?.[0];
+    if (!team) return { team: null, matches: [], total: 0 };
+
+    // Build conditions for completed fixtures involving this team
+    const conditions: any[] = [
+      sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+      inArray(schema.fixtures.status, ['FT', 'AET', 'PEN']),
+    ];
+
+    if (options?.leagueId) {
+      conditions.push(eq(schema.fixtures.leagueId, options.leagueId));
+    }
+
+    const whereClause = and(...conditions);
+
+    // Get total count
+    const [countResult] = await this.db
+      .select({ count: sql<number>`count(*)` })
+      .from(schema.fixtures)
+      .where(whereClause);
+
+    const total = Number(countResult?.count ?? 0);
+
+    // Get fixtures
+    const fixtures = await this.db
+      .select()
+      .from(schema.fixtures)
+      .where(whereClause)
+      .orderBy(desc(schema.fixtures.date))
+      .limit(limit)
+      .offset(offset);
+
+    if (fixtures.length === 0) {
+      return { team, matches: [], total };
+    }
+
+    // Batch fetch stats for these fixtures
+    const fixtureIds = fixtures.map((f: any) => f.id);
+    const stats = await this.db
+      .select()
+      .from(schema.fixtureStatistics)
+      .where(
+        sql`${schema.fixtureStatistics.fixtureId} IN (${sql.join(
+          fixtureIds.map((id: number) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+
+    // Index stats by fixtureId + teamId
+    const statsMap = new Map<string, any>();
+    for (const s of stats) {
+      statsMap.set(`${s.fixtureId}-${s.teamId}`, s);
+    }
+
+    // Batch fetch opponent team names
+    const opponentIds = new Set<number>();
+    for (const f of fixtures) {
+      opponentIds.add(f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId);
+    }
+    // Also add the team itself for home/away name resolution
+    opponentIds.add(teamId);
+
+    const teamNames = await this.db
+      .select({
+        id: schema.teams.id,
+        name: schema.teams.name,
+        logo: schema.teams.logo,
+      })
+      .from(schema.teams)
+      .where(
+        sql`${schema.teams.id} IN (${sql.join(
+          [...opponentIds].map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+
+    const nameMap = new Map<number, { name: string; logo: string | null }>();
+    for (const t of teamNames) {
+      nameMap.set(t.id, { name: t.name, logo: t.logo });
+    }
+
+    // Assemble match history
+    const matches = fixtures.map((f: any) => {
+      const isHome = f.homeTeamId === teamId;
+      const opponentId = isHome ? f.awayTeamId : f.homeTeamId;
+      const opponent = nameMap.get(opponentId);
+      const goalsFor = isHome ? f.goalsHome : f.goalsAway;
+      const goalsAgainst = isHome ? f.goalsAway : f.goalsHome;
+
+      // Determine result from team's perspective
+      let result: 'W' | 'D' | 'L' = 'D';
+      if (goalsFor > goalsAgainst) result = 'W';
+      else if (goalsFor < goalsAgainst) result = 'L';
+
+      // Get this team's stats
+      const teamStats = statsMap.get(`${f.id}-${teamId}`);
+      const opponentStats = statsMap.get(`${f.id}-${opponentId}`);
+
+      return {
+        fixtureId: f.id,
+        date: f.date,
+        leagueId: f.leagueId,
+        leagueName: f.leagueName,
+        round: f.round,
+        isHome,
+        opponent: {
+          id: opponentId,
+          name: opponent?.name ?? null,
+          logo: opponent?.logo ?? null,
+        },
+        goalsFor,
+        goalsAgainst,
+        result,
+        score: `${f.goalsHome}-${f.goalsAway}`,
+        stats: teamStats
+          ? {
+              possession: teamStats.possession,
+              shotsOnGoal: teamStats.shotsOnGoal,
+              totalShots: teamStats.totalShots,
+              expectedGoals: teamStats.expectedGoals,
+              cornerKicks: teamStats.cornerKicks,
+              fouls: teamStats.fouls,
+              yellowCards: teamStats.yellowCards,
+              redCards: teamStats.redCards,
+              passesAccurate: teamStats.passesAccurate,
+              totalPasses: teamStats.totalPasses,
+              passesPct: teamStats.passesPct,
+            }
+          : null,
+        opponentStats: opponentStats
+          ? {
+              possession: opponentStats.possession,
+              expectedGoals: opponentStats.expectedGoals,
+              totalShots: opponentStats.totalShots,
+            }
+          : null,
+      };
+    });
+
+    return { team, matches, total };
   }
 
   /**
