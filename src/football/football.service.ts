@@ -711,6 +711,108 @@ export class FootballService {
   }
 
   /**
+   * Batch fetch lineups and injuries for multiple fixtures.
+   * Returns Maps keyed by fixtureId (lineups) and teamId (injuries).
+   * Used to enrich list endpoints without N+1 queries.
+   */
+  async getLineupsAndInjuriesForFixtures(fixtureIds: number[]): Promise<{
+    lineupsByFixture: Map<number, any[]>;
+    injuriesByTeam: Map<number, any[]>;
+  }> {
+    if (fixtureIds.length === 0) {
+      return {
+        lineupsByFixture: new Map(),
+        injuriesByTeam: new Map(),
+      };
+    }
+
+    // Get team IDs for these fixtures
+    const fixtures = await this.db
+      .select({
+        id: schema.fixtures.id,
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+      })
+      .from(schema.fixtures)
+      .where(
+        sql`${schema.fixtures.id} IN (${sql.join(
+          fixtureIds.map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+
+    const teamIds = new Set<number>();
+    for (const f of fixtures) {
+      if (f.homeTeamId) teamIds.add(f.homeTeamId);
+      if (f.awayTeamId) teamIds.add(f.awayTeamId);
+    }
+
+    const [allLineups, allInjuries] = await Promise.all([
+      this.db
+        .select({
+          fixtureId: schema.fixtureLineups.fixtureId,
+          teamId: schema.fixtureLineups.teamId,
+          teamName: schema.teams.name,
+          formation: schema.fixtureLineups.formation,
+          coachName: schema.fixtureLineups.coachName,
+          startXI: schema.fixtureLineups.startXI,
+          substitutes: schema.fixtureLineups.substitutes,
+        })
+        .from(schema.fixtureLineups)
+        .leftJoin(
+          schema.teams,
+          eq(schema.fixtureLineups.teamId, schema.teams.id),
+        )
+        .where(
+          sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+            fixtureIds.map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      teamIds.size > 0
+        ? this.db
+            .select()
+            .from(schema.injuries)
+            .where(
+              sql`${schema.injuries.teamId} IN (${sql.join(
+                [...teamIds].map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+            .orderBy(desc(schema.injuries.updatedAt))
+        : [],
+    ]);
+
+    const lineupsByFixture = new Map<number, any[]>();
+    for (const l of allLineups) {
+      const existing = lineupsByFixture.get(l.fixtureId) ?? [];
+      existing.push({
+        teamId: l.teamId,
+        teamName: l.teamName,
+        formation: l.formation,
+        coachName: l.coachName,
+        startXI: l.startXI,
+        substitutes: l.substitutes,
+      });
+      lineupsByFixture.set(l.fixtureId, existing);
+    }
+
+    const injuriesByTeam = new Map<number, any[]>();
+    for (const inj of allInjuries) {
+      const existing = injuriesByTeam.get(inj.teamId) ?? [];
+      existing.push({
+        playerId: inj.playerId,
+        playerName: inj.playerName,
+        type: inj.type,
+        reason: inj.reason,
+      });
+      injuriesByTeam.set(inj.teamId, existing);
+    }
+
+    return { lineupsByFixture, injuriesByTeam };
+  }
+
+  /**
    * Fetch match statistics and upsert into fixture_statistics table.
    */
   async fetchFixtureStatistics(fixtureId: number): Promise<any[]> {
@@ -962,8 +1064,141 @@ export class FootballService {
         .where(whereClause),
     ]);
 
+    if (data.length === 0) {
+      return {
+        data: [],
+        total: Number(countResult[0]?.count ?? 0),
+        page,
+        limit,
+      };
+    }
+
+    // Enrich with team names, lineups, and injuries
+    const fixtureIds = data.map((f: any) => f.id);
+    const teamIds = new Set<number>();
+    for (const f of data) {
+      if (f.homeTeamId) teamIds.add(f.homeTeamId);
+      if (f.awayTeamId) teamIds.add(f.awayTeamId);
+    }
+
+    const [teamRows, allLineups, allInjuries] = await Promise.all([
+      teamIds.size > 0
+        ? this.db
+            .select({
+              id: schema.teams.id,
+              name: schema.teams.name,
+              logo: schema.teams.logo,
+            })
+            .from(schema.teams)
+            .where(
+              sql`${schema.teams.id} IN (${sql.join(
+                [...teamIds].map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+        : [],
+      this.db
+        .select({
+          id: schema.fixtureLineups.id,
+          fixtureId: schema.fixtureLineups.fixtureId,
+          teamId: schema.fixtureLineups.teamId,
+          teamName: schema.teams.name,
+          formation: schema.fixtureLineups.formation,
+          coachName: schema.fixtureLineups.coachName,
+          startXI: schema.fixtureLineups.startXI,
+          substitutes: schema.fixtureLineups.substitutes,
+        })
+        .from(schema.fixtureLineups)
+        .leftJoin(
+          schema.teams,
+          eq(schema.fixtureLineups.teamId, schema.teams.id),
+        )
+        .where(
+          sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      teamIds.size > 0
+        ? this.db
+            .select()
+            .from(schema.injuries)
+            .where(
+              sql`${schema.injuries.teamId} IN (${sql.join(
+                [...teamIds].map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+            .orderBy(desc(schema.injuries.updatedAt))
+        : [],
+    ]);
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, { name: t.name, logo: t.logo });
+    }
+
+    const lineupsByFixture = new Map<number, any[]>();
+    for (const l of allLineups) {
+      const existing = lineupsByFixture.get(l.fixtureId) ?? [];
+      existing.push(l);
+      lineupsByFixture.set(l.fixtureId, existing);
+    }
+
+    const injuriesByTeam = new Map<number, any[]>();
+    for (const inj of allInjuries) {
+      const existing = injuriesByTeam.get(inj.teamId) ?? [];
+      existing.push(inj);
+      injuriesByTeam.set(inj.teamId, existing);
+    }
+
+    const enriched = data.map((fixture: any) => {
+      const homeTeam = teamMap.get(fixture.homeTeamId);
+      const awayTeam = teamMap.get(fixture.awayTeamId);
+      const fixtureLineups = lineupsByFixture.get(fixture.id) ?? [];
+      const homeInjuries = injuriesByTeam.get(fixture.homeTeamId) ?? [];
+      const awayInjuries = injuriesByTeam.get(fixture.awayTeamId) ?? [];
+
+      return {
+        ...fixture,
+        homeTeam: {
+          id: fixture.homeTeamId,
+          name: homeTeam?.name ?? null,
+          logo: homeTeam?.logo ?? null,
+          injuries: homeInjuries.map((inj: any) => ({
+            playerId: inj.playerId,
+            playerName: inj.playerName,
+            type: inj.type,
+            reason: inj.reason,
+          })),
+        },
+        awayTeam: {
+          id: fixture.awayTeamId,
+          name: awayTeam?.name ?? null,
+          logo: awayTeam?.logo ?? null,
+          injuries: awayInjuries.map((inj: any) => ({
+            playerId: inj.playerId,
+            playerName: inj.playerName,
+            type: inj.type,
+            reason: inj.reason,
+          })),
+        },
+        lineups:
+          fixtureLineups.length > 0
+            ? fixtureLineups.map((l: any) => ({
+                teamId: l.teamId,
+                teamName: l.teamName,
+                formation: l.formation,
+                coachName: l.coachName,
+                startXI: l.startXI,
+                substitutes: l.substitutes,
+              }))
+            : null,
+      };
+    });
+
     return {
-      data,
+      data: enriched,
       total: Number(countResult[0]?.count ?? 0),
       page,
       limit,
@@ -1021,22 +1256,20 @@ export class FootballService {
       if (f.awayTeamId) teamIds.add(f.awayTeamId);
     }
 
-    // Batch fetch predictions for all fixtures
-    const predictions = await this.db
-      .select()
-      .from(schema.predictions)
-      .where(
-        sql`${schema.predictions.fixtureId} IN (${sql.join(
-          fixtureIds.map((id: number) => sql`${id}`),
-          sql`, `,
-        )})`,
-      )
-      .orderBy(desc(schema.predictions.createdAt));
-
-    // Batch fetch team names
-    const teamRows =
+    // Batch fetch predictions, team names, lineups, and injuries for all fixtures
+    const [predictions, teamRows, allLineups, allInjuries] = await Promise.all([
+      this.db
+        .select()
+        .from(schema.predictions)
+        .where(
+          sql`${schema.predictions.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        )
+        .orderBy(desc(schema.predictions.createdAt)),
       teamIds.size > 0
-        ? await this.db
+        ? this.db
             .select({
               id: schema.teams.id,
               name: schema.teams.name,
@@ -1049,11 +1282,69 @@ export class FootballService {
                 sql`, `,
               )})`,
             )
-        : [];
+        : [],
+      // Batch fetch lineups for all fixtures
+      this.db
+        .select({
+          id: schema.fixtureLineups.id,
+          fixtureId: schema.fixtureLineups.fixtureId,
+          teamId: schema.fixtureLineups.teamId,
+          teamName: schema.teams.name,
+          teamLogo: schema.teams.logo,
+          formation: schema.fixtureLineups.formation,
+          coachId: schema.fixtureLineups.coachId,
+          coachName: schema.fixtureLineups.coachName,
+          coachPhoto: schema.fixtureLineups.coachPhoto,
+          startXI: schema.fixtureLineups.startXI,
+          substitutes: schema.fixtureLineups.substitutes,
+          teamColors: schema.fixtureLineups.teamColors,
+          updatedAt: schema.fixtureLineups.updatedAt,
+        })
+        .from(schema.fixtureLineups)
+        .leftJoin(
+          schema.teams,
+          eq(schema.fixtureLineups.teamId, schema.teams.id),
+        )
+        .where(
+          sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      // Batch fetch injuries for all teams in today's fixtures
+      teamIds.size > 0
+        ? this.db
+            .select()
+            .from(schema.injuries)
+            .where(
+              sql`${schema.injuries.teamId} IN (${sql.join(
+                [...teamIds].map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+            .orderBy(desc(schema.injuries.updatedAt))
+        : [],
+    ]);
 
     const teamMap = new Map<number, { name: string; logo: string | null }>();
     for (const t of teamRows) {
       teamMap.set(t.id, { name: t.name, logo: t.logo });
+    }
+
+    // Group lineups by fixture ID
+    const lineupsByFixture = new Map<number, any[]>();
+    for (const l of allLineups) {
+      const existing = lineupsByFixture.get(l.fixtureId) ?? [];
+      existing.push(l);
+      lineupsByFixture.set(l.fixtureId, existing);
+    }
+
+    // Group injuries by team ID
+    const injuriesByTeam = new Map<number, any[]>();
+    for (const inj of allInjuries) {
+      const existing = injuriesByTeam.get(inj.teamId) ?? [];
+      existing.push(inj);
+      injuriesByTeam.set(inj.teamId, existing);
     }
 
     // Group predictions by fixture ID
@@ -1069,6 +1360,9 @@ export class FootballService {
       const homeTeam = teamMap.get(fixture.homeTeamId);
       const awayTeam = teamMap.get(fixture.awayTeamId);
       const fixturePredictions = predictionsByFixture.get(fixture.id) ?? [];
+      const fixtureLineups = lineupsByFixture.get(fixture.id) ?? [];
+      const homeInjuries = injuriesByTeam.get(fixture.homeTeamId) ?? [];
+      const awayInjuries = injuriesByTeam.get(fixture.awayTeamId) ?? [];
 
       // Pick the best prediction: prefer pre_match, then daily, then on_demand
       const bestPrediction =
@@ -1099,12 +1393,35 @@ export class FootballService {
           id: fixture.homeTeamId,
           name: homeTeam?.name ?? null,
           logo: homeTeam?.logo ?? null,
+          injuries: homeInjuries.map((inj: any) => ({
+            playerId: inj.playerId,
+            playerName: inj.playerName,
+            type: inj.type,
+            reason: inj.reason,
+          })),
         },
         awayTeam: {
           id: fixture.awayTeamId,
           name: awayTeam?.name ?? null,
           logo: awayTeam?.logo ?? null,
+          injuries: awayInjuries.map((inj: any) => ({
+            playerId: inj.playerId,
+            playerName: inj.playerName,
+            type: inj.type,
+            reason: inj.reason,
+          })),
         },
+        lineups:
+          fixtureLineups.length > 0
+            ? fixtureLineups.map((l: any) => ({
+                teamId: l.teamId,
+                teamName: l.teamName,
+                formation: l.formation,
+                coachName: l.coachName,
+                startXI: l.startXI,
+                substitutes: l.substitutes,
+              }))
+            : null,
         prediction: bestPrediction
           ? {
               id: bestPrediction.id,
@@ -1202,10 +1519,10 @@ export class FootballService {
     const fixture = fixtureRows?.[0];
     if (!fixture) return null;
 
-    // Fetch predictions and team names in parallel
+    // Fetch predictions, team names, lineups, and injuries in parallel
     const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(Boolean);
 
-    const [predictions, teamRows] = await Promise.all([
+    const [predictions, teamRows, lineups, injuries] = await Promise.all([
       this.db
         .select()
         .from(schema.predictions)
@@ -1226,6 +1543,19 @@ export class FootballService {
               )})`,
             )
         : [],
+      this.getLineupsForFixture(fixtureId),
+      teamIds.length > 0
+        ? this.db
+            .select()
+            .from(schema.injuries)
+            .where(
+              sql`${schema.injuries.teamId} IN (${sql.join(
+                teamIds.map((id: number) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+            .orderBy(desc(schema.injuries.updatedAt))
+        : [],
     ]);
 
     const teamMap = new Map<number, { name: string; logo: string | null }>();
@@ -1235,6 +1565,14 @@ export class FootballService {
 
     const homeTeam = teamMap.get(fixture.homeTeamId);
     const awayTeam = teamMap.get(fixture.awayTeamId);
+
+    // Split injuries by team
+    const homeInjuries = injuries.filter(
+      (inj: any) => inj.teamId === fixture.homeTeamId,
+    );
+    const awayInjuries = injuries.filter(
+      (inj: any) => inj.teamId === fixture.awayTeamId,
+    );
 
     // Best prediction: pre_match > daily > on_demand
     const bestPrediction =
@@ -1269,12 +1607,35 @@ export class FootballService {
         id: fixture.homeTeamId,
         name: homeTeam?.name ?? null,
         logo: homeTeam?.logo ?? null,
+        injuries: homeInjuries.map((inj: any) => ({
+          playerId: inj.playerId,
+          playerName: inj.playerName,
+          type: inj.type,
+          reason: inj.reason,
+        })),
       },
       awayTeam: {
         id: fixture.awayTeamId,
         name: awayTeam?.name ?? null,
         logo: awayTeam?.logo ?? null,
+        injuries: awayInjuries.map((inj: any) => ({
+          playerId: inj.playerId,
+          playerName: inj.playerName,
+          type: inj.type,
+          reason: inj.reason,
+        })),
       },
+      lineups:
+        lineups.length > 0
+          ? lineups.map((l: any) => ({
+              teamId: l.teamId,
+              teamName: l.teamName,
+              formation: l.formation,
+              coachName: l.coachName,
+              startXI: l.startXI,
+              substitutes: l.substitutes,
+            }))
+          : null,
       prediction: bestPrediction
         ? {
             id: bestPrediction.id,

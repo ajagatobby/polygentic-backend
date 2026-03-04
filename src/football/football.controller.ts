@@ -116,7 +116,9 @@ export class FootballController {
   }
 
   @Get('fixtures/live')
-  @ApiOperation({ summary: 'Get currently live matches' })
+  @ApiOperation({
+    summary: 'Get currently live matches with lineups and injuries',
+  })
   @ApiResponse({ status: 200, description: 'List of live matches' })
   async getLiveFixtures() {
     try {
@@ -124,9 +126,31 @@ export class FootballController {
       const activeMatches = this.liveScoreService.getActiveMatches();
 
       if (activeMatches.length > 0) {
+        // Enrich live matches with lineups and injuries
+        const fixtureIds = activeMatches
+          .map((m: any) => m.fixtureId)
+          .filter(Boolean);
+
+        let enriched = activeMatches;
+        if (fixtureIds.length > 0) {
+          const enrichmentData =
+            await this.footballService.getLineupsAndInjuriesForFixtures(
+              fixtureIds,
+            );
+          enriched = activeMatches.map((match: any) => ({
+            ...match,
+            lineups:
+              enrichmentData.lineupsByFixture.get(match.fixtureId) ?? null,
+            homeInjuries:
+              enrichmentData.injuriesByTeam.get(match.homeTeamId) ?? [],
+            awayInjuries:
+              enrichmentData.injuriesByTeam.get(match.awayTeamId) ?? [],
+          }));
+        }
+
         return {
-          data: activeMatches,
-          count: activeMatches.length,
+          data: enriched,
+          count: enriched.length,
           source: 'live-monitor',
         };
       }
