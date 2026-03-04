@@ -45,6 +45,23 @@ export class AgentsController {
     return this.agentsService.getAccuracyStats();
   }
 
+  @Get('performance-feedback')
+  @ApiOperation({
+    summary:
+      'Get detailed performance feedback including bias analysis, confidence calibration, and league breakdown',
+  })
+  async getPerformanceFeedback() {
+    const feedback = await this.agentsService.getPerformanceFeedback();
+    if (!feedback) {
+      return {
+        message:
+          'Not enough resolved predictions yet (need at least 10). Keep generating and resolving predictions.',
+        totalResolved: 0,
+      };
+    }
+    return feedback;
+  }
+
   @Get(':fixtureId')
   @ApiOperation({ summary: 'Get predictions for a specific fixture' })
   @ApiParam({ name: 'fixtureId', type: Number })

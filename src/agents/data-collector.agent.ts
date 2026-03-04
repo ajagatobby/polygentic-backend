@@ -8,6 +8,44 @@ import { OddsService } from '../odds/odds.service';
  * All structured data collected for a single fixture,
  * to be passed to the Research and Analysis agents.
  */
+export interface TeamMatchStats {
+  fixtureId: number;
+  teamId: number;
+  shotsOnGoal: number | null;
+  shotsOffGoal: number | null;
+  totalShots: number | null;
+  blockedShots: number | null;
+  shotsInsideBox: number | null;
+  shotsOutsideBox: number | null;
+  fouls: number | null;
+  cornerKicks: number | null;
+  offsides: number | null;
+  possession: number | null;
+  yellowCards: number | null;
+  redCards: number | null;
+  goalkeeperSaves: number | null;
+  totalPasses: number | null;
+  passesAccurate: number | null;
+  passesPct: number | null;
+  expectedGoals: number | null;
+}
+
+export interface TeamRecentStats {
+  teamId: number;
+  matchCount: number;
+  stats: TeamMatchStats[];
+  averages: {
+    xG: number;
+    xGA: number;
+    shotsOnGoal: number;
+    shotsOnGoalAgainst: number;
+    totalShots: number;
+    possession: number;
+    passAccuracy: number;
+    cornerKicks: number;
+  };
+}
+
 export interface CollectedMatchData {
   fixture: any;
   homeTeam: { team: any; form: any[] } | null;
@@ -21,6 +59,10 @@ export interface CollectedMatchData {
     bookmakers: any[];
   };
   apiPrediction: any | null;
+  recentStats: {
+    home: TeamRecentStats | null;
+    away: TeamRecentStats | null;
+  };
 }
 
 @Injectable()
@@ -62,6 +104,8 @@ export class DataCollectorAgent {
       homeForm,
       awayForm,
       apiPrediction,
+      homeRecentStats,
+      awayRecentStats,
     ] = await Promise.allSettled([
       this.footballService.getTeamById(fixture.homeTeamId),
       this.footballService.getTeamById(fixture.awayTeamId),
@@ -75,6 +119,8 @@ export class DataCollectorAgent {
       this.getTeamForm(fixture.homeTeamId, fixture.leagueId),
       this.getTeamForm(fixture.awayTeamId, fixture.leagueId),
       this.fetchApiPredictionSafe(fixtureId),
+      this.getTeamRecentStats(fixture.homeTeamId, fixtureId),
+      this.getTeamRecentStats(fixture.awayTeamId, fixtureId),
     ]);
 
     // 3. Get odds data by matching team names
@@ -93,12 +139,17 @@ export class DataCollectorAgent {
       },
       odds,
       apiPrediction: this.unwrap(apiPrediction),
+      recentStats: {
+        home: this.unwrap(homeRecentStats),
+        away: this.unwrap(awayRecentStats),
+      },
     };
 
     this.logger.log(
       `Data collected for fixture ${fixtureId}: ` +
         `h2h=${result.h2h.length}, injuries=${result.injuries.length}, ` +
-        `lineups=${result.lineups.length}, odds_consensus=${result.odds.consensus.length}`,
+        `lineups=${result.lineups.length}, odds_consensus=${result.odds.consensus.length}, ` +
+        `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}`,
     );
 
     return result;
@@ -282,6 +333,175 @@ export class DataCollectorAgent {
     } catch (error) {
       this.logger.warn(`Odds fetch for fixture failed: ${error.message}`);
       return { consensus: [], bookmakers: [] };
+    }
+  }
+
+  /**
+   * Fetch the last N matches' statistics for a team from fixture_statistics.
+   * Computes rolling averages for xG, shots, possession, pass accuracy, etc.
+   * Also computes xGA (expected goals against) by looking up opponent stats in the same fixtures.
+   */
+  private async getTeamRecentStats(
+    teamId: number,
+    currentFixtureId: number,
+    matchCount: number = 10,
+  ): Promise<TeamRecentStats> {
+    try {
+      // Get the team's recent fixture stats (excluding current fixture)
+      const recentStats = await this.db
+        .select({
+          stat: schema.fixtureStatistics,
+          fixture: schema.fixtures,
+        })
+        .from(schema.fixtureStatistics)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.fixtureStatistics.fixtureId, schema.fixtures.id),
+        )
+        .where(
+          and(
+            eq(schema.fixtureStatistics.teamId, teamId),
+            eq(schema.fixtures.status, 'FT'),
+            sql`${schema.fixtureStatistics.fixtureId} != ${currentFixtureId}`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(matchCount);
+
+      if (recentStats.length === 0) {
+        return {
+          teamId,
+          matchCount: 0,
+          stats: [],
+          averages: {
+            xG: 0,
+            xGA: 0,
+            shotsOnGoal: 0,
+            shotsOnGoalAgainst: 0,
+            totalShots: 0,
+            possession: 0,
+            passAccuracy: 0,
+            cornerKicks: 0,
+          },
+        };
+      }
+
+      // Get opponent stats for xGA calculation (opponent's xG in same fixtures)
+      const fixtureIds = recentStats.map((r: any) => r.stat.fixtureId);
+      const opponentStats = await this.db
+        .select()
+        .from(schema.fixtureStatistics)
+        .where(
+          and(
+            sql`${schema.fixtureStatistics.fixtureId} IN (${sql.join(
+              fixtureIds.map((id: number) => sql`${id}`),
+              sql`, `,
+            )})`,
+            sql`${schema.fixtureStatistics.teamId} != ${teamId}`,
+          ),
+        );
+
+      // Build a map of fixtureId -> opponent stats
+      const opponentStatsMap = new Map<number, any>();
+      for (const os of opponentStats) {
+        opponentStatsMap.set(os.fixtureId, os);
+      }
+
+      const stats: TeamMatchStats[] = recentStats.map((r: any) => ({
+        fixtureId: r.stat.fixtureId,
+        teamId: r.stat.teamId,
+        shotsOnGoal: r.stat.shotsOnGoal,
+        shotsOffGoal: r.stat.shotsOffGoal,
+        totalShots: r.stat.totalShots,
+        blockedShots: r.stat.blockedShots,
+        shotsInsideBox: r.stat.shotsInsideBox,
+        shotsOutsideBox: r.stat.shotsOutsideBox,
+        fouls: r.stat.fouls,
+        cornerKicks: r.stat.cornerKicks,
+        offsides: r.stat.offsides,
+        possession: r.stat.possession ? Number(r.stat.possession) : null,
+        yellowCards: r.stat.yellowCards,
+        redCards: r.stat.redCards,
+        goalkeeperSaves: r.stat.goalkeeperSaves,
+        totalPasses: r.stat.totalPasses,
+        passesAccurate: r.stat.passesAccurate,
+        passesPct: r.stat.passesPct ? Number(r.stat.passesPct) : null,
+        expectedGoals: r.stat.expectedGoals
+          ? Number(r.stat.expectedGoals)
+          : null,
+      }));
+
+      // Compute averages
+      const validXG = stats.filter((s) => s.expectedGoals != null);
+      const validShots = stats.filter((s) => s.shotsOnGoal != null);
+      const validTotalShots = stats.filter((s) => s.totalShots != null);
+      const validPossession = stats.filter((s) => s.possession != null);
+      const validPassAcc = stats.filter((s) => s.passesPct != null);
+      const validCorners = stats.filter((s) => s.cornerKicks != null);
+
+      // xGA: average of opponent's xG in these fixtures
+      const opponentXGs = fixtureIds
+        .map((fid: number) => {
+          const os = opponentStatsMap.get(fid);
+          return os?.expectedGoals ? Number(os.expectedGoals) : null;
+        })
+        .filter((v: number | null): v is number => v != null);
+
+      // Opponent shots on goal against this team
+      const opponentShotsOnGoal = fixtureIds
+        .map((fid: number) => {
+          const os = opponentStatsMap.get(fid);
+          return os?.shotsOnGoal ?? null;
+        })
+        .filter((v: number | null): v is number => v != null);
+
+      const avg = (arr: number[]) =>
+        arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+
+      return {
+        teamId,
+        matchCount: stats.length,
+        stats,
+        averages: {
+          xG: Number(avg(validXG.map((s) => s.expectedGoals!)).toFixed(2)),
+          xGA: Number(avg(opponentXGs).toFixed(2)),
+          shotsOnGoal: Number(
+            avg(validShots.map((s) => s.shotsOnGoal!)).toFixed(1),
+          ),
+          shotsOnGoalAgainst: Number(avg(opponentShotsOnGoal).toFixed(1)),
+          totalShots: Number(
+            avg(validTotalShots.map((s) => s.totalShots!)).toFixed(1),
+          ),
+          possession: Number(
+            avg(validPossession.map((s) => s.possession!)).toFixed(1),
+          ),
+          passAccuracy: Number(
+            avg(validPassAcc.map((s) => s.passesPct!)).toFixed(1),
+          ),
+          cornerKicks: Number(
+            avg(validCorners.map((s) => s.cornerKicks!)).toFixed(1),
+          ),
+        },
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Recent stats fetch failed for team ${teamId}: ${error.message}`,
+      );
+      return {
+        teamId,
+        matchCount: 0,
+        stats: [],
+        averages: {
+          xG: 0,
+          xGA: 0,
+          shotsOnGoal: 0,
+          shotsOnGoalAgainst: 0,
+          totalShots: 0,
+          possession: 0,
+          passAccuracy: 0,
+          cornerKicks: 0,
+        },
+      };
     }
   }
 

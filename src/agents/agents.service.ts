@@ -5,9 +5,16 @@ import * as schema from '../database/schema';
 import { DataCollectorAgent, CollectedMatchData } from './data-collector.agent';
 import { ResearchAgent, ResearchResult } from './research.agent';
 import { AnalysisAgent, PredictionOutput } from './analysis.agent';
+import { PoissonModelService } from './poisson-model.service';
 import { AlertsService } from '../alerts/alerts.service';
+import {
+  PredictionType,
+  PerformanceFeedback,
+  PoissonModelOutput,
+} from './types';
 
-export type PredictionType = 'daily' | 'pre_match' | 'on_demand';
+// Re-export so existing importers don't break
+export { PredictionType, PerformanceFeedback } from './types';
 
 @Injectable()
 export class AgentsService {
@@ -19,6 +26,7 @@ export class AgentsService {
     private readonly dataCollector: DataCollectorAgent,
     private readonly researchAgent: ResearchAgent,
     private readonly analysisAgent: AnalysisAgent,
+    private readonly poissonModel: PoissonModelService,
     private readonly alertsService: AlertsService,
   ) {}
 
@@ -51,13 +59,57 @@ export class AgentsService {
       throw error;
     }
 
-    // Step 2: Web research
+    // Step 2: Web research + performance feedback + Poisson model (in parallel)
     let research: ResearchResult;
+    let feedback: PerformanceFeedback | null = null;
+    let poissonOutput: PoissonModelOutput | null = null;
     try {
-      research = await this.researchAgent.research(matchData);
+      const [researchResult, feedbackResult, poissonResult] =
+        await Promise.allSettled([
+          this.researchAgent.research(matchData),
+          this.getPerformanceFeedback(),
+          this.poissonModel.predict(
+            matchData.fixture.homeTeamId,
+            matchData.fixture.awayTeamId,
+            matchData.fixture.leagueId,
+            fixtureId,
+          ),
+        ]);
+
+      research =
+        researchResult.status === 'fulfilled'
+          ? researchResult.value
+          : {
+              matchPreview: null,
+              teamNews: null,
+              tacticalAnalysis: null,
+              combinedResearch:
+                'Research unavailable — proceeding with structured data only.',
+              citations: [],
+            };
+
+      if (researchResult.status === 'rejected') {
+        this.logger.warn(
+          `Research failed for fixture ${fixtureId}, proceeding with data only: ${researchResult.reason?.message}`,
+        );
+      }
+
+      feedback =
+        feedbackResult.status === 'fulfilled' ? feedbackResult.value : null;
+
+      poissonOutput =
+        poissonResult.status === 'fulfilled' ? poissonResult.value : null;
+
+      if (poissonOutput) {
+        this.logger.log(
+          `Poisson model for fixture ${fixtureId}: H=${(poissonOutput.homeWinProb * 100).toFixed(1)}% ` +
+            `D=${(poissonOutput.drawProb * 100).toFixed(1)}% A=${(poissonOutput.awayWinProb * 100).toFixed(1)}% ` +
+            `(conf=${poissonOutput.confidence}, data=${poissonOutput.dataPoints})`,
+        );
+      }
     } catch (error) {
       this.logger.warn(
-        `Research failed for fixture ${fixtureId}, proceeding with data only: ${error.message}`,
+        `Research/feedback/model failed for fixture ${fixtureId}: ${error.message}`,
       );
       research = {
         matchPreview: null,
@@ -69,16 +121,24 @@ export class AgentsService {
       };
     }
 
-    // Step 3: Analysis
+    // Step 3: Analysis (Claude gets Poisson output as input for reasoning)
     let prediction: PredictionOutput;
     try {
-      prediction = await this.analysisAgent.analyze(matchData, research);
+      prediction = await this.analysisAgent.analyze(
+        matchData,
+        research,
+        feedback,
+        poissonOutput,
+      );
     } catch (error) {
       this.logger.error(
         `Analysis failed for fixture ${fixtureId}: ${error.message}`,
       );
       throw error;
     }
+
+    // Step 3b: Ensemble — blend Claude + Poisson + Bookmaker odds
+    prediction = this.ensemblePredictions(prediction, poissonOutput, matchData);
 
     // Step 4: Store prediction
     const modelVersion =
@@ -538,7 +598,375 @@ export class AgentsService {
     };
   }
 
+  /**
+   * Generate performance feedback from historical predictions to inform future predictions.
+   * This creates a self-improving feedback loop by identifying systematic biases.
+   */
+  async getPerformanceFeedback(): Promise<PerformanceFeedback | null> {
+    try {
+      const resolved = await this.db
+        .select({
+          prediction: schema.predictions,
+          fixture: schema.fixtures,
+        })
+        .from(schema.predictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.predictions.fixtureId, schema.fixtures.id),
+        )
+        .where(sql`${schema.predictions.resolvedAt} IS NOT NULL`)
+        .orderBy(desc(schema.predictions.resolvedAt))
+        .limit(200); // Last 200 resolved predictions
+
+      if (resolved.length < 10) {
+        // Not enough data for meaningful feedback
+        return null;
+      }
+
+      const total = resolved.length;
+      const correct = resolved.filter(
+        (r: any) => r.prediction.wasCorrect === true,
+      ).length;
+      const avgBrier =
+        resolved.reduce(
+          (sum: number, r: any) =>
+            sum + (Number(r.prediction.probabilityAccuracy) || 0),
+          0,
+        ) / total;
+
+      // Track what we predicted vs what actually happened
+      const byResult = {
+        home_win: { predicted: 0, correct: 0, accuracy: 0 },
+        draw: { predicted: 0, correct: 0, accuracy: 0 },
+        away_win: { predicted: 0, correct: 0, accuracy: 0 },
+      };
+
+      const actualCounts = { home_win: 0, draw: 0, away_win: 0 };
+      let totalHomeProb = 0;
+      let totalDrawProb = 0;
+      let totalAwayProb = 0;
+
+      // Confidence calibration buckets
+      const confidenceBuckets = {
+        high: { total: 0, correct: 0 }, // confidence 8-10
+        med: { total: 0, correct: 0 }, // confidence 5-7
+        low: { total: 0, correct: 0 }, // confidence 1-4
+      };
+
+      // League breakdown
+      const leagueMap: Record<string, { total: number; correct: number }> = {};
+
+      for (const { prediction, fixture } of resolved) {
+        const homeProb = Number(prediction.homeWinProb);
+        const drawProb = Number(prediction.drawProb);
+        const awayProb = Number(prediction.awayWinProb);
+        totalHomeProb += homeProb;
+        totalDrawProb += drawProb;
+        totalAwayProb += awayProb;
+
+        // Determine predicted result
+        const predictedResult = this.getPredictedResultFromProbs(
+          homeProb,
+          drawProb,
+          awayProb,
+        );
+
+        // Track predicted outcomes
+        if (
+          predictedResult === 'home_win' ||
+          predictedResult === 'draw' ||
+          predictedResult === 'away_win'
+        ) {
+          byResult[predictedResult].predicted++;
+          if (prediction.wasCorrect) byResult[predictedResult].correct++;
+        }
+
+        // Track actual outcomes
+        const actual = prediction.actualResult as string;
+        if (
+          actual === 'home_win' ||
+          actual === 'draw' ||
+          actual === 'away_win'
+        ) {
+          actualCounts[actual]++;
+        }
+
+        // Confidence calibration
+        const conf = prediction.confidence ?? 5;
+        if (conf >= 8) {
+          confidenceBuckets.high.total++;
+          if (prediction.wasCorrect) confidenceBuckets.high.correct++;
+        } else if (conf >= 5) {
+          confidenceBuckets.med.total++;
+          if (prediction.wasCorrect) confidenceBuckets.med.correct++;
+        } else {
+          confidenceBuckets.low.total++;
+          if (prediction.wasCorrect) confidenceBuckets.low.correct++;
+        }
+
+        // League breakdown
+        const leagueName = fixture.leagueName ?? `League ${fixture.leagueId}`;
+        if (!leagueMap[leagueName]) {
+          leagueMap[leagueName] = { total: 0, correct: 0 };
+        }
+        leagueMap[leagueName].total++;
+        if (prediction.wasCorrect) leagueMap[leagueName].correct++;
+      }
+
+      // Compute accuracies
+      for (const key of Object.keys(byResult) as Array<keyof typeof byResult>) {
+        byResult[key].accuracy =
+          byResult[key].predicted > 0
+            ? byResult[key].correct / byResult[key].predicted
+            : 0;
+      }
+
+      // Generate bias insights
+      const biasInsights: string[] = [];
+      const avgHomeProb = totalHomeProb / total;
+      const avgDrawProb = totalDrawProb / total;
+      const avgAwayProb = totalAwayProb / total;
+      const actualHomePct = actualCounts.home_win / total;
+      const actualDrawPct = actualCounts.draw / total;
+      const actualAwayPct = actualCounts.away_win / total;
+
+      // Check for systematic probability miscalibration
+      if (avgDrawProb < actualDrawPct - 0.05) {
+        biasInsights.push(
+          `You have been UNDERESTIMATING draw probability. Your average draw prob is ${(avgDrawProb * 100).toFixed(1)}% but draws actually occur ${(actualDrawPct * 100).toFixed(1)}% of the time. Increase draw probability.`,
+        );
+      }
+      if (avgHomeProb > actualHomePct + 0.05) {
+        biasInsights.push(
+          `You have been OVERESTIMATING home win probability. Your average is ${(avgHomeProb * 100).toFixed(1)}% but home wins occur ${(actualHomePct * 100).toFixed(1)}% of the time.`,
+        );
+      }
+      if (avgAwayProb > actualAwayPct + 0.05) {
+        biasInsights.push(
+          `You have been OVERESTIMATING away win probability. Your average is ${(avgAwayProb * 100).toFixed(1)}% but away wins occur ${(actualAwayPct * 100).toFixed(1)}% of the time.`,
+        );
+      }
+
+      // Check confidence calibration
+      const highAcc =
+        confidenceBuckets.high.total > 0
+          ? confidenceBuckets.high.correct / confidenceBuckets.high.total
+          : 0;
+      const medAcc =
+        confidenceBuckets.med.total > 0
+          ? confidenceBuckets.med.correct / confidenceBuckets.med.total
+          : 0;
+      const lowAcc =
+        confidenceBuckets.low.total > 0
+          ? confidenceBuckets.low.correct / confidenceBuckets.low.total
+          : 0;
+
+      if (confidenceBuckets.high.total > 5 && highAcc < 0.6) {
+        biasInsights.push(
+          `High-confidence predictions (8-10) are only ${(highAcc * 100).toFixed(1)}% accurate. You are OVERCONFIDENT. Reserve high confidence for genuinely clear-cut matches.`,
+        );
+      }
+      if (confidenceBuckets.low.total > 5 && lowAcc > medAcc) {
+        biasInsights.push(
+          `Low-confidence predictions are more accurate than medium-confidence ones. Your confidence scoring is not well calibrated.`,
+        );
+      }
+
+      // Find worst-performing leagues
+      const leagueBreakdown: Record<
+        string,
+        { total: number; correct: number; accuracy: number }
+      > = {};
+      for (const [name, data] of Object.entries(leagueMap)) {
+        const acc = data.total > 0 ? data.correct / data.total : 0;
+        leagueBreakdown[name] = { ...data, accuracy: acc };
+        if (data.total >= 5 && acc < 0.4) {
+          biasInsights.push(
+            `Poor performance in ${name}: ${(acc * 100).toFixed(1)}% accuracy over ${data.total} predictions. Consider that this league may have different dynamics.`,
+          );
+        }
+      }
+
+      return {
+        totalResolved: total,
+        overallAccuracy: correct / total,
+        avgBrierScore: Number(avgBrier.toFixed(6)),
+        byResult,
+        avgProbabilities: {
+          homeWinProb: Number(avgHomeProb.toFixed(4)),
+          drawProb: Number(avgDrawProb.toFixed(4)),
+          awayWinProb: Number(avgAwayProb.toFixed(4)),
+        },
+        actualDistribution: {
+          homeWinPct: Number(actualHomePct.toFixed(4)),
+          drawPct: Number(actualDrawPct.toFixed(4)),
+          awayWinPct: Number(actualAwayPct.toFixed(4)),
+        },
+        biasInsights,
+        confidenceCalibration: {
+          highConfidence: {
+            total: confidenceBuckets.high.total,
+            correct: confidenceBuckets.high.correct,
+            accuracy: highAcc,
+          },
+          medConfidence: {
+            total: confidenceBuckets.med.total,
+            correct: confidenceBuckets.med.correct,
+            accuracy: medAcc,
+          },
+          lowConfidence: {
+            total: confidenceBuckets.low.total,
+            correct: confidenceBuckets.low.correct,
+            accuracy: lowAcc,
+          },
+        },
+        leagueBreakdown,
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Failed to compute performance feedback: ${error.message}`,
+      );
+      return null;
+    }
+  }
+
   // ─── Private helpers ────────────────────────────────────────────────
+
+  /**
+   * Ensemble Claude's prediction with Poisson model and bookmaker consensus.
+   *
+   * Weights (configurable via env):
+   * - Claude (LLM analysis): 40% — contextual reasoning, qualitative factors
+   * - Poisson model: 25% — mathematical, xG-based, well-calibrated
+   * - Bookmaker consensus: 35% — market-efficient, incorporates all information
+   *
+   * If Poisson or bookmaker data is unavailable, weights are redistributed.
+   */
+  private ensemblePredictions(
+    claudePrediction: PredictionOutput,
+    poissonOutput: PoissonModelOutput | null,
+    matchData: CollectedMatchData,
+  ): PredictionOutput {
+    // Get weights from config (or defaults)
+    const baseClaudeWeight = 0.4;
+    const basePoissonWeight = 0.25;
+    const baseBookmakerWeight = 0.35;
+
+    // Extract bookmaker consensus probabilities
+    let bookmakerProbs: {
+      home: number;
+      draw: number;
+      away: number;
+    } | null = null;
+
+    const h2hConsensus = matchData.odds?.consensus?.find(
+      (c: any) => c.marketKey === 'h2h',
+    );
+    if (h2hConsensus) {
+      const bHome = Number(h2hConsensus.consensusHomeWin) || 0;
+      const bDraw = Number(h2hConsensus.consensusDraw) || 0;
+      const bAway = Number(h2hConsensus.consensusAwayWin) || 0;
+      const bTotal = bHome + bDraw + bAway;
+      if (bTotal > 0.9 && bTotal < 1.1) {
+        // Looks like valid probabilities (close to 1.0)
+        bookmakerProbs = {
+          home: bHome / bTotal,
+          draw: bDraw / bTotal,
+          away: bAway / bTotal,
+        };
+      }
+    }
+
+    // Determine available signals and redistribute weights
+    const hasPoissonData =
+      poissonOutput != null &&
+      poissonOutput.dataPoints >= 6 &&
+      poissonOutput.confidence > 0;
+    const hasBookmakerData = bookmakerProbs != null;
+
+    let claudeWeight: number;
+    let poissonWeight: number;
+    let bookmakerWeight: number;
+
+    if (hasPoissonData && hasBookmakerData) {
+      // All three signals available
+      // Scale Poisson weight by its confidence
+      claudeWeight = baseClaudeWeight;
+      poissonWeight = basePoissonWeight * poissonOutput!.confidence;
+      bookmakerWeight = baseBookmakerWeight;
+    } else if (hasPoissonData && !hasBookmakerData) {
+      // No bookmaker data — split between Claude and Poisson
+      claudeWeight = 0.6;
+      poissonWeight = 0.4 * poissonOutput!.confidence;
+      bookmakerWeight = 0;
+    } else if (!hasPoissonData && hasBookmakerData) {
+      // No Poisson data — split between Claude and bookmaker
+      claudeWeight = 0.5;
+      poissonWeight = 0;
+      bookmakerWeight = 0.5;
+    } else {
+      // Only Claude available
+      claudeWeight = 1.0;
+      poissonWeight = 0;
+      bookmakerWeight = 0;
+    }
+
+    // Normalize weights to sum to 1.0
+    const totalWeight = claudeWeight + poissonWeight + bookmakerWeight;
+    claudeWeight /= totalWeight;
+    poissonWeight /= totalWeight;
+    bookmakerWeight /= totalWeight;
+
+    // Blend probabilities
+    let homeWinProb =
+      claudeWeight * claudePrediction.homeWinProb +
+      (hasPoissonData ? poissonWeight * poissonOutput!.homeWinProb : 0) +
+      (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.home : 0);
+
+    let drawProb =
+      claudeWeight * claudePrediction.drawProb +
+      (hasPoissonData ? poissonWeight * poissonOutput!.drawProb : 0) +
+      (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.draw : 0);
+
+    let awayWinProb =
+      claudeWeight * claudePrediction.awayWinProb +
+      (hasPoissonData ? poissonWeight * poissonOutput!.awayWinProb : 0) +
+      (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.away : 0);
+
+    // Normalize
+    const total = homeWinProb + drawProb + awayWinProb;
+    homeWinProb /= total;
+    drawProb /= total;
+    awayWinProb /= total;
+
+    // Blend expected goals
+    let predictedHomeGoals = claudePrediction.predictedHomeGoals;
+    let predictedAwayGoals = claudePrediction.predictedAwayGoals;
+    if (hasPoissonData) {
+      predictedHomeGoals =
+        claudeWeight * claudePrediction.predictedHomeGoals +
+        (1 - claudeWeight) * poissonOutput!.expectedHomeGoals;
+      predictedAwayGoals =
+        claudeWeight * claudePrediction.predictedAwayGoals +
+        (1 - claudeWeight) * poissonOutput!.expectedAwayGoals;
+    }
+
+    this.logger.log(
+      `Ensemble: Claude(${(claudeWeight * 100).toFixed(0)}%) + ` +
+        `Poisson(${(poissonWeight * 100).toFixed(0)}%) + ` +
+        `Bookmaker(${(bookmakerWeight * 100).toFixed(0)}%) → ` +
+        `H=${(homeWinProb * 100).toFixed(1)}% D=${(drawProb * 100).toFixed(1)}% A=${(awayWinProb * 100).toFixed(1)}%`,
+    );
+
+    return {
+      ...claudePrediction,
+      homeWinProb: Number(homeWinProb.toFixed(4)),
+      drawProb: Number(drawProb.toFixed(4)),
+      awayWinProb: Number(awayWinProb.toFixed(4)),
+      predictedHomeGoals: Number(predictedHomeGoals.toFixed(1)),
+      predictedAwayGoals: Number(predictedAwayGoals.toFixed(1)),
+    };
+  }
 
   /**
    * Enrich prediction rows with homeTeamName / awayTeamName by looking up the teams table.
