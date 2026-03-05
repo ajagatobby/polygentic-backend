@@ -259,6 +259,58 @@ export class PolymarketGammaService {
     }
   }
 
+  /**
+   * Fetch a single market by ID — including closed/resolved markets.
+   * Used for trade resolution: we need to see final outcome prices ($1/$0).
+   *
+   * Returns raw market data without filtering out closed markets.
+   */
+  async fetchMarketForResolution(marketId: string): Promise<{
+    closed: boolean;
+    active: boolean;
+    outcomePrices: number[];
+    outcomes: string[];
+  } | null> {
+    try {
+      const response = await this.client.get(`/markets/${marketId}`);
+      const raw = response.data;
+      if (!raw) return null;
+
+      let outcomePrices: number[] = [];
+      try {
+        outcomePrices = (
+          typeof raw.outcomePrices === 'string'
+            ? JSON.parse(raw.outcomePrices || '[]')
+            : (raw.outcomePrices ?? [])
+        ).map(Number);
+      } catch {
+        outcomePrices = [];
+      }
+
+      let outcomes: string[] = [];
+      try {
+        outcomes =
+          typeof raw.outcomes === 'string'
+            ? JSON.parse(raw.outcomes || '[]')
+            : (raw.outcomes ?? []);
+      } catch {
+        outcomes = [];
+      }
+
+      return {
+        closed: raw.closed ?? false,
+        active: raw.active ?? true,
+        outcomePrices,
+        outcomes,
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Failed to fetch market ${marketId} for resolution: ${error.message}`,
+      );
+      return null;
+    }
+  }
+
   // ─── Client-side soccer filtering ───────────────────────────────────
 
   /**

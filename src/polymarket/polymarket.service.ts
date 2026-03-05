@@ -1106,6 +1106,10 @@ export class PolymarketService {
 
   /**
    * Resolve outright trades by checking if the Polymarket market has closed.
+   *
+   * Uses fetchMarketForResolution() which returns raw market data INCLUDING
+   * closed markets — unlike fetchEventById which filters them out.
+   * When a market resolves, outcome prices go to $1 (winner) / $0 (loser).
    */
   private async resolveOutrightTrades(): Promise<{
     resolved: number;
@@ -1138,62 +1142,63 @@ export class PolymarketService {
 
     for (const { trade, market } of openTrades) {
       try {
-        // Check if the market has closed by re-fetching from Gamma
-        const freshEvent = await this.gammaService.fetchEventById(
-          market.eventId,
-        );
-        if (!freshEvent) continue;
-
-        // Find the specific market
-        const freshMarket = freshEvent.markets.find(
-          (m) => m.marketId === market.marketId,
+        // Fetch the market directly — this returns data even for closed markets
+        const freshMarket = await this.gammaService.fetchMarketForResolution(
+          market.marketId,
         );
 
-        // Market might have been removed from active markets list
-        // or the event itself is closed
-        if (!freshMarket || freshEvent.closed) {
-          // Check outcome prices — if one outcome is at $1 and other at $0, it's resolved
-          const prices =
-            freshMarket?.outcomePrices ??
-            (market.outcomePrices as string[])?.map(Number) ??
-            [];
+        if (!freshMarket) continue;
 
-          let resolvedOutcome: number | null = null;
-          for (let i = 0; i < prices.length; i++) {
-            if (Number(prices[i]) >= 0.99) resolvedOutcome = i;
-          }
+        // Only resolve if the market is actually closed
+        if (!freshMarket.closed) continue;
 
-          if (resolvedOutcome !== null) {
-            const tradeWon = trade.outcomeIndex === resolvedOutcome;
-            const exitPrice = tradeWon ? 1.0 : 0.0;
-            const entryPrice = Number(trade.entryPrice);
-            const positionSize = Number(trade.positionSizeUsd);
-            const tokenQty =
-              Number(trade.tokenQuantity) || positionSize / entryPrice;
-            const pnlUsd = tradeWon
-              ? tokenQty * (exitPrice - entryPrice)
-              : -positionSize;
-            const pnlPercent = positionSize > 0 ? pnlUsd / positionSize : 0;
+        // Check outcome prices — resolved markets have one outcome at ~$1
+        const prices = freshMarket.outcomePrices;
+        let resolvedOutcome: number | null = null;
 
-            await this.db
-              .update(schema.polymarketTrades)
-              .set({
-                exitPrice: String(exitPrice),
-                pnlUsd: String(pnlUsd),
-                pnlPercent: String(pnlPercent),
-                resolvedAt: new Date(),
-                resolutionOutcome: tradeWon ? 'win' : 'loss',
-                status: 'resolved',
-                updatedAt: new Date(),
-              })
-              .where(eq(schema.polymarketTrades.id, trade.id));
-
-            resolved++;
-            this.logger.log(
-              `Outright trade resolved: ${trade.outcomeName} — ${tradeWon ? 'WIN' : 'LOSS'} P&L: $${pnlUsd.toFixed(2)}`,
-            );
-          }
+        for (let i = 0; i < prices.length; i++) {
+          if (prices[i] >= 0.99) resolvedOutcome = i;
         }
+
+        if (resolvedOutcome === null) {
+          // Market is closed but no clear winner — might be cancelled/voided
+          this.logger.warn(
+            `Outright market ${market.marketId} is closed but no outcome >= 0.99. ` +
+              `Prices: ${prices.join(', ')}. Skipping resolution.`,
+          );
+          continue;
+        }
+
+        const tradeWon = trade.outcomeIndex === resolvedOutcome;
+        const exitPrice = tradeWon ? 1.0 : 0.0;
+        const entryPrice = Number(trade.entryPrice);
+        const positionSize = Number(trade.positionSizeUsd);
+        const tokenQty =
+          Number(trade.tokenQuantity) || positionSize / entryPrice;
+        const pnlUsd = tradeWon
+          ? tokenQty * (exitPrice - entryPrice)
+          : -positionSize;
+        const pnlPercent = positionSize > 0 ? pnlUsd / positionSize : 0;
+
+        await this.db
+          .update(schema.polymarketTrades)
+          .set({
+            exitPrice: String(exitPrice),
+            pnlUsd: String(pnlUsd),
+            pnlPercent: String(pnlPercent),
+            resolvedAt: new Date(),
+            resolutionOutcome: tradeWon ? 'win' : 'loss',
+            status: 'resolved',
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.polymarketTrades.id, trade.id));
+
+        resolved++;
+        this.logger.log(
+          `Outright trade resolved: ${trade.outcomeName} — ` +
+            `${tradeWon ? 'WIN' : 'LOSS'} P&L: $${pnlUsd.toFixed(2)} ` +
+            `(entry: ${entryPrice.toFixed(3)}, exit: ${exitPrice.toFixed(1)})`,
+        );
       } catch (error) {
         errors.push(
           `Failed to resolve outright trade ${trade.id}: ${error.message}`,
