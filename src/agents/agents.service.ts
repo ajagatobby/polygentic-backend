@@ -1033,10 +1033,15 @@ export class AgentsService {
    *
    * Each fetch is best-effort — failures are logged but don't block the prediction.
    */
-  private async freshenDataForFixture(fixtureId: number): Promise<void> {
-    this.logger.log(`Freshening data for fixture ${fixtureId}`);
+  /**
+   * Track when each league was last freshened to avoid redundant API calls.
+   * Key = leagueId, Value = timestamp of last sync.
+   */
+  private lastFreshened = new Map<number, number>();
+  private static readonly FRESHEN_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
-    // Get the fixture to know the league and teams
+  private async freshenDataForFixture(fixtureId: number): Promise<void> {
+    // Get the fixture to know the league
     const fixtureRows = await this.db
       .select()
       .from(schema.fixtures)
@@ -1052,61 +1057,60 @@ export class AgentsService {
     }
 
     const leagueId = fixture.leagueId;
-    const freshenStart = Date.now();
+    const now = Date.now();
 
-    // Run all freshening tasks in parallel — each is independent and best-effort
-    const results = await Promise.allSettled([
-      // 1. Sync injuries for the league (fetches all current injuries)
-      this.footballService.syncInjuries(leagueId).then((count) => {
-        this.logger.log(
-          `Freshened injuries for league ${leagueId}: ${count} records`,
-        );
-        return { type: 'injuries', count };
-      }),
+    // Skip heavy syncs (injuries, standings) if this league was freshened recently
+    const lastTime = this.lastFreshened.get(leagueId) ?? 0;
+    const needsLeagueSync = now - lastTime > AgentsService.FRESHEN_COOLDOWN_MS;
 
-      // 2. Sync standings/form for the league
-      this.footballService.syncStandings(leagueId).then((count) => {
-        this.logger.log(
-          `Freshened standings for league ${leagueId}: ${count} records`,
-        );
-        return { type: 'standings', count };
-      }),
+    const freshenStart = now;
+    const tasks: Promise<{ type: string; count: number }>[] = [];
 
-      // 3. Fetch and persist lineups (available ~1hr before kickoff)
-      this.footballService.fetchAndPersistLineups(fixtureId).then((count) => {
-        this.logger.log(
-          `Freshened lineups for fixture ${fixtureId}: ${count} team lineups`,
-        );
-        return { type: 'lineups', count };
-      }),
+    // Always fetch lineups — lightweight, fixture-specific, and critical
+    tasks.push(
+      this.footballService
+        .fetchAndPersistLineups(fixtureId)
+        .then((count) => ({ type: 'lineups', count }))
+        .catch(() => ({ type: 'lineups', count: 0 })),
+    );
 
-      // 4. Sync odds (uses The Odds API — only if we have credits)
-      this.oddsService.syncAllSoccerOdds().then((result) => {
-        this.logger.log(
-          `Freshened odds: ${result.eventsProcessed} events, ${result.fixturesLinked} linked`,
-        );
-        return { type: 'odds', count: result.eventsProcessed };
-      }),
-    ]);
+    // Only sync injuries and standings if not recently done for this league
+    if (needsLeagueSync) {
+      this.logger.log(
+        `Freshening injuries + standings for league ${leagueId} (fixture ${fixtureId})`,
+      );
+      tasks.push(
+        this.footballService
+          .syncInjuries(leagueId)
+          .then((count) => ({ type: 'injuries', count }))
+          .catch(() => ({ type: 'injuries', count: 0 })),
+      );
+      tasks.push(
+        this.footballService
+          .syncStandings(leagueId)
+          .then((count) => ({ type: 'standings', count }))
+          .catch(() => ({ type: 'standings', count: 0 })),
+      );
+    }
 
-    // Log results
-    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
-    const failed = results.filter((r) => r.status === 'rejected').length;
-    const failedTypes = results
-      .map((r, i) => {
-        if (r.status === 'rejected') {
-          const types = ['injuries', 'standings', 'lineups', 'odds'];
-          return `${types[i]}: ${r.reason?.message ?? 'unknown'}`;
-        }
-        return null;
-      })
-      .filter(Boolean);
+    // Odds sync is too heavy to run per-prediction — handled by the 6-hourly cron.
+    // No odds sync here.
+
+    const results = await Promise.all(tasks);
+
+    if (needsLeagueSync) {
+      this.lastFreshened.set(leagueId, Date.now());
+    }
 
     const duration = Date.now() - freshenStart;
+    const summary = results
+      .filter((r) => r.count > 0)
+      .map((r) => `${r.type}=${r.count}`)
+      .join(', ');
+
     this.logger.log(
-      `Data freshening complete for fixture ${fixtureId} in ${duration}ms: ` +
-        `${succeeded} succeeded, ${failed} failed` +
-        (failedTypes.length > 0 ? ` [${failedTypes.join('; ')}]` : ''),
+      `Data freshened for fixture ${fixtureId} in ${duration}ms` +
+        (summary ? `: ${summary}` : ' (all cached)'),
     );
   }
 
