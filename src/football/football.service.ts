@@ -1221,18 +1221,33 @@ export class FootballService {
     club?: string;
     round?: string;
     date?: string;
+    from?: string;
+    to?: string;
     hasPrediction?: boolean;
     minConfidence?: number;
   }): Promise<any[]> {
-    // Allow date override, default to today
-    const dateStr = filters?.date ?? new Date().toISOString().split('T')[0];
-    const startOfDay = new Date(`${dateStr}T00:00:00Z`);
-    const endOfDay = new Date(`${dateStr}T23:59:59Z`);
+    const conditions: any[] = [];
 
-    const conditions: any[] = [
-      gte(schema.fixtures.date, startOfDay),
-      lte(schema.fixtures.date, endOfDay),
-    ];
+    // Date range: from/to take priority over single date
+    if (filters?.from || filters?.to) {
+      if (filters.from) {
+        conditions.push(
+          gte(schema.fixtures.date, new Date(`${filters.from}T00:00:00Z`)),
+        );
+      }
+      if (filters.to) {
+        conditions.push(
+          lte(schema.fixtures.date, new Date(`${filters.to}T23:59:59Z`)),
+        );
+      }
+    } else {
+      // Single date, default to today
+      const dateStr = filters?.date ?? new Date().toISOString().split('T')[0];
+      const startOfDay = new Date(`${dateStr}T00:00:00Z`);
+      const endOfDay = new Date(`${dateStr}T23:59:59Z`);
+      conditions.push(gte(schema.fixtures.date, startOfDay));
+      conditions.push(lte(schema.fixtures.date, endOfDay));
+    }
 
     if (filters?.leagueId) {
       conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));

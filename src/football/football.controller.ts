@@ -153,6 +153,96 @@ export class FootballController {
     }
   }
 
+  @Get('fixtures/upcoming')
+  @ApiOperation({
+    summary: 'Get upcoming fixtures with predictions, lineups, and injuries',
+    description:
+      'Returns fixtures from today onwards (or a custom date range). ' +
+      'Supports all the same filters as /fixtures/today plus from/to date range.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Upcoming fixtures with predictions and team details',
+  })
+  async getUpcomingFixtures(
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('date') date?: string,
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('leagueCountry') leagueCountry?: string,
+    @Query('status') status?: string,
+    @Query('state') state?: string,
+    @Query('teamId') teamId?: string,
+    @Query('club') club?: string,
+    @Query('round') round?: string,
+    @Query('hasPrediction') hasPrediction?: string,
+    @Query('minConfidence') minConfidence?: string,
+  ) {
+    try {
+      // Default: from today, to 7 days out
+      const defaultFrom =
+        from ?? date ?? new Date().toISOString().split('T')[0];
+      const defaultTo =
+        to ??
+        (date
+          ? undefined
+          : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+              .toISOString()
+              .split('T')[0]);
+
+      let data = await this.footballService.getTodayFixturesWithPredictions({
+        from: defaultFrom,
+        to: defaultTo,
+        leagueId: leagueId ? Number(leagueId) : undefined,
+        leagueName,
+        leagueCountry,
+        status: status ?? 'NS',
+        state,
+        teamId: teamId ? Number(teamId) : undefined,
+        club,
+        round,
+      });
+
+      if (hasPrediction === 'true') {
+        data = data.filter((d: any) => d.prediction != null);
+      } else if (hasPrediction === 'false') {
+        data = data.filter((d: any) => d.prediction == null);
+      }
+
+      if (minConfidence) {
+        const minConf = Number(minConfidence);
+        data = data.filter(
+          (d: any) => d.prediction && d.prediction.confidence >= minConf,
+        );
+      }
+
+      return {
+        data,
+        count: data.length,
+        filters: {
+          from: defaultFrom,
+          to: defaultTo ?? null,
+          leagueId: leagueId ? Number(leagueId) : null,
+          leagueName: leagueName ?? null,
+          leagueCountry: leagueCountry ?? null,
+          status: status ?? 'NS',
+          state: state ?? null,
+          teamId: teamId ? Number(teamId) : null,
+          club: club ?? null,
+          round: round ?? null,
+          hasPrediction: hasPrediction ?? null,
+          minConfidence: minConfidence ? Number(minConfidence) : null,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get upcoming fixtures: ${error.message}`);
+      throw new InternalServerErrorException(
+        'Failed to retrieve upcoming fixtures',
+      );
+    }
+  }
+
   @Get('fixtures/live')
   @ApiOperation({
     summary: 'Get currently live matches with lineups and injuries',
