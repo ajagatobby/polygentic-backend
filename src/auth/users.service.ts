@@ -13,6 +13,51 @@ export class UsersService {
     @Inject(FIREBASE_ADMIN) private readonly firebaseApp: admin.app.App,
   ) {}
 
+  // ─── Registration ────────────────────────────────────────────────────
+
+  /**
+   * Create a new user in Firebase Auth and insert a DB row with role=user.
+   * Called by the public POST /api/auth/register endpoint.
+   *
+   * Throws Firebase error codes (auth/email-already-exists, etc.) on failure.
+   */
+  async createUser(input: {
+    email: string;
+    password: string;
+    displayName?: string;
+  }): Promise<User> {
+    // 1. Create in Firebase Auth
+    const firebaseUser = await this.firebaseApp.auth().createUser({
+      email: input.email,
+      password: input.password,
+      displayName: input.displayName || undefined,
+      emailVerified: false,
+    });
+
+    // 2. Insert into DB with default role=user
+    const [dbUser] = await this.db
+      .insert(users)
+      .values({
+        uid: firebaseUser.uid,
+        email: input.email,
+        emailVerified: false,
+        displayName: input.displayName || null,
+        photoUrl: null,
+        provider: 'password',
+        role: 'user',
+        disabled: false,
+        requestCount: 0,
+        lastActiveAt: new Date(),
+      })
+      .returning();
+
+    this.logger.log(
+      `Created user ${input.email} (${firebaseUser.uid}) with role=user`,
+    );
+
+    return dbUser;
+  }
+
   // ─── Upsert on every authenticated request ───────────────────────────
 
   /**
@@ -22,6 +67,8 @@ export class UsersService {
    * Uses ON CONFLICT DO UPDATE so the first request creates the row
    * and subsequent requests keep email/displayName/photo/lastActiveAt fresh.
    * Increments request_count atomically.
+   *
+   * NOTE: role is NOT touched on update — it can only be changed via direct DB access.
    */
   async upsertFromToken(decoded: admin.auth.DecodedIdToken): Promise<User> {
     const provider = decoded.firebase?.sign_in_provider || 'unknown';
@@ -48,6 +95,7 @@ export class UsersService {
           displayName: decoded.name || sql`${users.displayName}`,
           photoUrl: decoded.picture || sql`${users.photoUrl}`,
           provider,
+          // role is intentionally NOT updated here — immutable via API
           requestCount: sql`${users.requestCount} + 1`,
           lastActiveAt: new Date(),
           updatedAt: new Date(),
@@ -89,43 +137,11 @@ export class UsersService {
     return { data, total: count };
   }
 
-  // ─── Role management ─────────────────────────────────────────────────
-
-  /**
-   * Set a user's role in the DB and sync it to Firebase custom claims.
-   * Firebase custom claims propagate on the user's next token refresh.
-   */
-  async setRole(uid: string, role: 'user' | 'admin'): Promise<User> {
-    // Update DB
-    const [updated] = await this.db
-      .update(users)
-      .set({ role, updatedAt: new Date() })
-      .where(eq(users.uid, uid))
-      .returning();
-
-    if (!updated) {
-      throw new Error(`User ${uid} not found`);
-    }
-
-    // Sync to Firebase custom claims so the client token includes the role
-    try {
-      await this.firebaseApp.auth().setCustomUserClaims(uid, { role });
-      this.logger.log(
-        `Set role '${role}' for user ${uid} (DB + Firebase claims)`,
-      );
-    } catch (error: any) {
-      this.logger.error(
-        `Failed to set Firebase custom claims for ${uid}: ${error.message}`,
-      );
-      // DB is already updated — the guard reads from DB anyway,
-      // so this is non-fatal. Claims will be stale until next setRole call.
-    }
-
-    return updated;
-  }
+  // ─── Account management (admin-only, called from controller) ─────────
 
   /**
    * Disable or re-enable a user account.
+   * Blocks in DB + Firebase so they can't get new tokens either.
    */
   async setDisabled(uid: string, disabled: boolean): Promise<User> {
     const [updated] = await this.db

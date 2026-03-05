@@ -9,6 +9,7 @@ import {
   Logger,
   NotFoundException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -34,6 +35,68 @@ export class AuthController {
   ) {}
 
   // ─── Public endpoints ────────────────────────────────────────────────
+
+  /**
+   * Register a new user account.
+   * Creates the user in Firebase Auth and inserts a row in the DB with role=user.
+   */
+  @Public()
+  @Post('register')
+  @ApiOperation({
+    summary: 'Register a new user',
+    description:
+      'Creates a Firebase Auth account and a corresponding DB row with the default role of "user". Returns the user profile and Firebase custom token for immediate sign-in.',
+  })
+  async register(
+    @Body()
+    body: {
+      email: string;
+      password: string;
+      displayName?: string;
+    },
+  ) {
+    if (!body.email || !body.password) {
+      throw new BadRequestException('email and password are required');
+    }
+
+    if (body.password.length < 6) {
+      throw new BadRequestException('password must be at least 6 characters');
+    }
+
+    try {
+      const dbUser = await this.usersService.createUser({
+        email: body.email,
+        password: body.password,
+        displayName: body.displayName,
+      });
+
+      this.logger.log(`New user registered: ${body.email} (${dbUser.uid})`);
+
+      return {
+        uid: dbUser.uid,
+        email: dbUser.email,
+        displayName: dbUser.displayName,
+        role: dbUser.role,
+        createdAt: dbUser.createdAt,
+        message:
+          'Account created. Sign in with Firebase Auth on the client using your email and password to get an ID token.',
+      };
+    } catch (error: any) {
+      if (error.code === 'auth/email-already-exists') {
+        throw new ConflictException('A user with this email already exists');
+      }
+      if (error.code === 'auth/invalid-email') {
+        throw new BadRequestException('Invalid email address');
+      }
+      if (error.code === 'auth/weak-password') {
+        throw new BadRequestException(
+          'Password is too weak. Use at least 6 characters.',
+        );
+      }
+      this.logger.error(`Registration failed: ${error.message}`);
+      throw new BadRequestException(error.message || 'Registration failed');
+    }
+  }
 
   /**
    * Exchange a Firebase refresh token for a new ID token.
@@ -163,32 +226,6 @@ export class AuthController {
     if (!user) {
       throw new NotFoundException(`User ${uid} not found`);
     }
-    return user;
-  }
-
-  /**
-   * Set a user's role (user or admin).
-   * Also syncs to Firebase custom claims.
-   */
-  @Post('users/:uid/role')
-  @Roles('admin')
-  @ApiBearerAuth('firebase-auth')
-  @ApiOperation({
-    summary: '[Admin] Set user role',
-    description:
-      'Set a user\'s role to "user" or "admin". Syncs to Firebase custom claims. Admin only.',
-  })
-  @ApiParam({ name: 'uid', description: 'Firebase UID of the target user' })
-  async setUserRole(
-    @Param('uid') uid: string,
-    @Body() body: { role: 'user' | 'admin' },
-  ) {
-    if (!body.role || !['user', 'admin'].includes(body.role)) {
-      throw new BadRequestException('role must be "user" or "admin"');
-    }
-
-    const user = await this.usersService.setRole(uid, body.role);
-    this.logger.log(`Admin set role '${body.role}' for user ${uid}`);
     return user;
   }
 
