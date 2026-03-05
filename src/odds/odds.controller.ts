@@ -15,6 +15,7 @@ import {
   ApiResponse,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { Roles } from '../auth/roles.decorator';
 import { OddsService, SOCCER_SPORT_KEYS } from './odds.service';
 import {
   OddsSyncDto,
@@ -139,8 +140,11 @@ export class OddsController {
     }
   }
 
+  @Roles('admin')
   @Post('sync')
-  @ApiOperation({ summary: 'Manually trigger odds sync for soccer leagues' })
+  @ApiOperation({
+    summary: '[Admin] Manually trigger odds sync for soccer leagues',
+  })
   @ApiResponse({ status: 201, type: OddsSyncResultDto })
   async syncOdds(@Body() body: OddsSyncDto) {
     try {

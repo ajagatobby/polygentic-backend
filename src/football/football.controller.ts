@@ -19,6 +19,7 @@ import {
   ApiResponse,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { Roles } from '../auth/roles.decorator';
 import { FootballService, TRACKED_LEAGUES } from './football.service';
 import { LiveScoreService } from './live/live-score.service';
 import { OddsService } from '../odds/odds.service';
@@ -56,9 +57,10 @@ export class FootballController {
     }
   }
 
+  @Roles('admin')
   @Post('fixtures/live/start')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Start live match monitoring' })
+  @ApiOperation({ summary: '[Admin] Start live match monitoring' })
   @ApiResponse({ status: 200, description: 'Monitoring started' })
   startLiveMonitoring() {
     this.liveScoreService.startMonitoring();
@@ -69,9 +71,10 @@ export class FootballController {
     };
   }
 
+  @Roles('admin')
   @Post('fixtures/live/stop')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Stop live match monitoring' })
+  @ApiOperation({ summary: '[Admin] Stop live match monitoring' })
   @ApiResponse({ status: 200, description: 'Monitoring stopped' })
   stopLiveMonitoring() {
     this.liveScoreService.stopMonitoring();
@@ -609,9 +612,10 @@ export class FootballController {
 
   // ─── SYNC OPERATIONS ────────────────────────────────────────────────
 
+  @Roles('admin')
   @Post('fixtures/sync')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Trigger a manual fixture sync' })
+  @ApiOperation({ summary: '[Admin] Trigger a manual fixture sync' })
   @ApiResponse({ status: 200, description: 'Sync result with counts' })
   async syncFixtures(@Body() body: SyncFixturesDto) {
     this.logger.log('Manual fixture sync triggered');

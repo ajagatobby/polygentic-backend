@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { FootballModule } from './football/football.module';
@@ -10,6 +10,7 @@ import { AgentsModule } from './agents/agents.module';
 import { SyncModule } from './sync/sync.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
+import { UserThrottlerGuard } from './auth/user-throttler.guard';
 
 @Module({
   imports: [
@@ -18,8 +19,8 @@ import { AuthModule } from './auth/auth.module';
       envFilePath: ['.env', '.env.local'],
     }),
 
-    // Rate limiting: 60 requests per minute per IP (general),
-    // plus a stricter tier for expensive endpoints.
+    // Rate limiting: per-user (UID) for authenticated requests,
+    // per-IP for public routes. Three tiers:
     ThrottlerModule.forRoot([
       {
         name: 'short',
@@ -48,10 +49,10 @@ import { AuthModule } from './auth/auth.module';
     HealthModule,
   ],
   providers: [
-    // Apply rate limiting globally
+    // Apply per-user rate limiting globally
     {
       provide: APP_GUARD,
-      useClass: ThrottlerGuard,
+      useClass: UserThrottlerGuard,
     },
   ],
 })

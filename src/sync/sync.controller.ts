@@ -14,6 +14,7 @@ import {
   ApiQuery,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { Roles } from '../auth/roles.decorator';
 import { SyncService } from './sync.service';
 import { FootballService } from '../football/football.service';
 import {
@@ -34,6 +35,7 @@ import {
  */
 @ApiTags('Sync')
 @ApiBearerAuth('firebase-auth')
+@Roles('admin')
 @Controller('api/sync')
 export class SyncController {
   private readonly logger = new Logger(SyncController.name);

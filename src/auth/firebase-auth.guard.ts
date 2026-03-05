@@ -1,6 +1,7 @@
 import {
   CanActivate,
   ExecutionContext,
+  ForbiddenException,
   Inject,
   Injectable,
   Logger,
@@ -10,6 +11,7 @@ import { Reflector } from '@nestjs/core';
 import * as admin from 'firebase-admin';
 import { IS_PUBLIC_KEY } from './public.decorator';
 import { FIREBASE_ADMIN } from './firebase-admin.provider';
+import { UsersService } from './users.service';
 
 @Injectable()
 export class FirebaseAuthGuard implements CanActivate {
@@ -18,6 +20,7 @@ export class FirebaseAuthGuard implements CanActivate {
   constructor(
     @Inject(FIREBASE_ADMIN) private readonly firebaseApp: admin.app.App,
     private readonly reflector: Reflector,
+    private readonly usersService: UsersService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -41,22 +44,33 @@ export class FirebaseAuthGuard implements CanActivate {
 
     const idToken = authHeader.replace('Bearer ', '');
 
+    let decodedToken: admin.auth.DecodedIdToken;
     try {
-      const decodedToken = await this.firebaseApp.auth().verifyIdToken(idToken);
-      // Attach the decoded user info to the request for downstream use
-      request.user = {
-        uid: decodedToken.uid,
-        email: decodedToken.email,
-        emailVerified: decodedToken.email_verified,
-        displayName: decodedToken.name,
-        picture: decodedToken.picture,
-        // Pass through the full token for any custom claims
-        firebaseToken: decodedToken,
-      };
-      return true;
+      decodedToken = await this.firebaseApp.auth().verifyIdToken(idToken);
     } catch (error: any) {
       this.logger.warn(`Firebase token verification failed: ${error.message}`);
       throw new UnauthorizedException('Invalid or expired Firebase token');
     }
+
+    // Upsert user in DB (creates on first request, updates lastActiveAt + requestCount)
+    const dbUser = await this.usersService.upsertFromToken(decodedToken);
+
+    // Block disabled users
+    if (dbUser.disabled) {
+      throw new ForbiddenException('Account is disabled');
+    }
+
+    // Attach both Firebase token data and DB user to request
+    request.user = {
+      uid: decodedToken.uid,
+      email: decodedToken.email,
+      emailVerified: decodedToken.email_verified,
+      displayName: decodedToken.name,
+      picture: decodedToken.picture,
+      firebaseToken: decodedToken,
+      dbUser,
+    };
+
+    return true;
   }
 }

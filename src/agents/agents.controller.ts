@@ -15,6 +15,7 @@ import {
   ApiQuery,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { Roles } from '../auth/roles.decorator';
 import { AgentsService, PredictionType } from './agents.service';
 import { PredictionQueryDto } from './dto/prediction-query.dto';
 import { generatePredictionTask } from '../trigger/generate-prediction';
@@ -133,10 +134,11 @@ export class AgentsController {
     return predictions;
   }
 
+  @Roles('admin')
   @Post('generate/:fixtureId')
   @ApiOperation({
     summary:
-      'Trigger an on-demand prediction for a specific fixture (runs as background task)',
+      '[Admin] Trigger an on-demand prediction for a specific fixture (runs as background task)',
   })
   @ApiParam({ name: 'fixtureId', type: Number })
   @ApiQuery({
@@ -167,10 +169,11 @@ export class AgentsController {
     };
   }
 
+  @Roles('admin')
   @Post('generate-daily')
   @ApiOperation({
     summary:
-      'Trigger daily predictions for all upcoming fixtures (runs as background task)',
+      '[Admin] Trigger daily predictions for all upcoming fixtures (runs as background task)',
   })
   async generateDailyPredictions() {
     this.logger.log('Triggering daily prediction generation via API');
@@ -185,10 +188,11 @@ export class AgentsController {
     };
   }
 
+  @Roles('admin')
   @Post('resolve')
   @ApiOperation({
     summary:
-      'Trigger prediction resolution for finished matches (runs as background task)',
+      '[Admin] Trigger prediction resolution for finished matches (runs as background task)',
   })
   async resolvePredictions() {
     this.logger.log('Triggering prediction resolution via API');
@@ -201,10 +205,11 @@ export class AgentsController {
     };
   }
 
+  @Roles('admin')
   @Post('sync-and-resolve')
   @ApiOperation({
     summary:
-      'Trigger completed fixture sync + prediction resolution (runs as background task)',
+      '[Admin] Trigger completed fixture sync + prediction resolution (runs as background task)',
   })
   async syncAndResolve() {
     this.logger.log('Triggering completed fixtures sync + resolve via API');
