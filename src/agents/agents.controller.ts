@@ -45,6 +45,52 @@ export class AgentsController {
     return this.agentsService.getAccuracyStats();
   }
 
+  @Get('bullish')
+  @ApiOperation({
+    summary:
+      'Get predictions the model is most bullish on — ranked by confidence, dominant probability, and value edge',
+    description:
+      'Returns upcoming unresolved predictions sorted by a composite "bullish score" combining ' +
+      'confidence (1-10), dominant outcome probability, and value edge vs bookmaker odds. ' +
+      'Includes team details, lineups, and injuries.',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max predictions to return (default: 10)',
+  })
+  @ApiQuery({
+    name: 'minConfidence',
+    required: false,
+    type: Number,
+    description: 'Minimum confidence threshold 1-10 (default: 6)',
+  })
+  @ApiQuery({
+    name: 'minDominantProb',
+    required: false,
+    type: Number,
+    description: 'Minimum dominant outcome probability 0-1 (default: 0.45)',
+  })
+  async getBullishPredictions(
+    @Query('limit') limit?: string,
+    @Query('minConfidence') minConfidence?: string,
+    @Query('minDominantProb') minDominantProb?: string,
+  ) {
+    const picks = await this.agentsService.getBullishPredictions({
+      limit: limit ? Number(limit) : undefined,
+      minConfidence: minConfidence ? Number(minConfidence) : undefined,
+      minDominantProb: minDominantProb ? Number(minDominantProb) : undefined,
+    });
+
+    return {
+      data: picks,
+      count: picks.length,
+      description:
+        'Predictions ranked by bullish score (confidence + dominant probability + value edge)',
+    };
+  }
+
   @Get('performance-feedback')
   @ApiOperation({
     summary:

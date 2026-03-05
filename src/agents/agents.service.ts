@@ -837,6 +837,193 @@ export class AgentsService {
     }
   }
 
+  /**
+   * Get the predictions the model is most bullish on.
+   *
+   * "Bullish" = high confidence + a strongly dominant outcome probability.
+   * Sorted by a composite bullish score that combines:
+   *   - Confidence (1-10 scale)
+   *   - Dominant probability (how lopsided the prediction is)
+   *   - Value edge vs bookmaker odds (if available)
+   *
+   * Only returns unresolved predictions for upcoming matches.
+   */
+  async getBullishPredictions(options?: {
+    limit?: number;
+    minConfidence?: number;
+    minDominantProb?: number;
+  }): Promise<any[]> {
+    const limit = options?.limit ?? 10;
+    const minConfidence = options?.minConfidence ?? 6;
+    const minDominantProb = options?.minDominantProb ?? 0.45;
+
+    // Get unresolved predictions for upcoming fixtures with high confidence
+    const rows = await this.db
+      .select({
+        prediction: schema.predictions,
+        fixture: schema.fixtures,
+      })
+      .from(schema.predictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.predictions.fixtureId, schema.fixtures.id),
+      )
+      .where(
+        and(
+          isNull(schema.predictions.resolvedAt),
+          eq(schema.fixtures.status, 'NS'),
+          gte(schema.fixtures.date, new Date()),
+          gte(schema.predictions.confidence, minConfidence),
+        ),
+      )
+      .orderBy(desc(schema.predictions.confidence), asc(schema.fixtures.date));
+
+    if (rows.length === 0) return [];
+
+    // Score and rank each prediction by "bullishness"
+    const scored = rows
+      .map(({ prediction, fixture }: any) => {
+        const homeProb = Number(prediction.homeWinProb);
+        const drawProb = Number(prediction.drawProb);
+        const awayProb = Number(prediction.awayWinProb);
+        const confidence = prediction.confidence ?? 5;
+
+        // Dominant probability — the highest of the three outcomes
+        const dominantProb = Math.max(homeProb, drawProb, awayProb);
+
+        // Skip if dominant probability is too low (close match)
+        if (dominantProb < minDominantProb) return null;
+
+        // Determine the predicted outcome
+        let predictedOutcome: string;
+        if (homeProb >= drawProb && homeProb >= awayProb)
+          predictedOutcome = 'Home Win';
+        else if (awayProb >= homeProb && awayProb >= drawProb)
+          predictedOutcome = 'Away Win';
+        else predictedOutcome = 'Draw';
+
+        // Value edge from value bets (if available)
+        const valueBets = (prediction.valueBets as any[]) ?? [];
+        const maxEdge =
+          valueBets.length > 0
+            ? Math.max(
+                ...valueBets.map((vb: any) => Number(vb.edgePercent) || 0),
+              )
+            : 0;
+
+        // Composite bullish score (0-100):
+        // - Confidence contributes 40% (scaled from 1-10 to 0-40)
+        // - Dominant probability contributes 40% (scaled from 0.33-1.0 to 0-40)
+        // - Value edge contributes 20% (capped at 20% edge = 20 points)
+        const confidenceScore = (confidence / 10) * 40;
+        const probScore = ((dominantProb - 0.33) / 0.67) * 40;
+        const edgeScore = Math.min(20, maxEdge);
+        const bullishScore = Number(
+          (confidenceScore + probScore + edgeScore).toFixed(1),
+        );
+
+        return {
+          predictionId: prediction.id,
+          fixtureId: prediction.fixtureId,
+          homeTeamId: prediction.homeTeamId,
+          awayTeamId: prediction.awayTeamId,
+          predictedOutcome,
+          dominantProb: Number(dominantProb.toFixed(4)),
+          homeWinProb: homeProb,
+          drawProb,
+          awayWinProb: awayProb,
+          predictedHomeGoals: prediction.predictedHomeGoals,
+          predictedAwayGoals: prediction.predictedAwayGoals,
+          confidence,
+          bullishScore,
+          keyFactors: prediction.keyFactors,
+          riskFactors: prediction.riskFactors,
+          valueBets: prediction.valueBets,
+          detailedAnalysis: prediction.detailedAnalysis,
+          predictionType: prediction.predictionType,
+          fixture: {
+            id: fixture.id,
+            date: fixture.date,
+            status: fixture.status,
+            round: fixture.round,
+            leagueId: fixture.leagueId,
+            leagueName: fixture.leagueName,
+            leagueCountry: fixture.leagueCountry,
+            venueName: fixture.venueName,
+          },
+          createdAt: prediction.createdAt,
+        };
+      })
+      .filter(Boolean);
+
+    // Sort by bullish score descending
+    scored.sort((a: any, b: any) => b.bullishScore - a.bullishScore);
+
+    // Take top N
+    const topPicks = scored.slice(0, limit);
+
+    // Enrich with team names, lineups, and injuries
+    const teamIds = new Set<number>();
+    const fixtureIds: number[] = [];
+    for (const p of topPicks) {
+      if (p.homeTeamId) teamIds.add(p.homeTeamId);
+      if (p.awayTeamId) teamIds.add(p.awayTeamId);
+      fixtureIds.push(p.fixtureId);
+    }
+
+    const [teamRows, lineupsAndInjuries] = await Promise.all([
+      teamIds.size > 0
+        ? this.db
+            .select({
+              id: schema.teams.id,
+              name: schema.teams.name,
+              logo: schema.teams.logo,
+            })
+            .from(schema.teams)
+            .where(
+              sql`${schema.teams.id} IN (${sql.join(
+                [...teamIds].map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+        : [],
+      this.footballService.getLineupsAndInjuriesForFixtures(fixtureIds),
+    ]);
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, { name: t.name, logo: t.logo });
+    }
+
+    return topPicks.map((p: any) => {
+      const homeTeam = teamMap.get(p.homeTeamId);
+      const awayTeam = teamMap.get(p.awayTeamId);
+      const fixtureLineups =
+        lineupsAndInjuries.lineupsByFixture.get(p.fixtureId) ?? null;
+      const homeInjuries =
+        lineupsAndInjuries.injuriesByTeam.get(p.homeTeamId) ?? [];
+      const awayInjuries =
+        lineupsAndInjuries.injuriesByTeam.get(p.awayTeamId) ?? [];
+
+      return {
+        ...p,
+        homeTeam: {
+          id: p.homeTeamId,
+          name: homeTeam?.name ?? null,
+          logo: homeTeam?.logo ?? null,
+          injuries: homeInjuries,
+        },
+        awayTeam: {
+          id: p.awayTeamId,
+          name: awayTeam?.name ?? null,
+          logo: awayTeam?.logo ?? null,
+          injuries: awayInjuries,
+        },
+        lineups: fixtureLineups,
+      };
+    });
+  }
+
   // ─── Pre-prediction data freshening ──────────────────────────────────
 
   /**
