@@ -1207,16 +1207,27 @@ export class FootballService {
 
   /**
    * Get today's fixtures with their predictions and team names.
-   * Optionally filter by leagueId, status, or state group.
+   * Supports filtering by leagueId, leagueName, leagueCountry, status,
+   * state group, teamId, club (team name search), round, date override,
+   * and post-query filtering by hasPrediction and minConfidence.
    */
   async getTodayFixturesWithPredictions(filters?: {
     leagueId?: number;
+    leagueName?: string;
+    leagueCountry?: string;
     status?: string;
     state?: string;
+    teamId?: number;
+    club?: string;
+    round?: string;
+    date?: string;
+    hasPrediction?: boolean;
+    minConfidence?: number;
   }): Promise<any[]> {
-    const now = new Date();
-    const startOfDay = new Date(`${now.toISOString().split('T')[0]}T00:00:00Z`);
-    const endOfDay = new Date(`${now.toISOString().split('T')[0]}T23:59:59Z`);
+    // Allow date override, default to today
+    const dateStr = filters?.date ?? new Date().toISOString().split('T')[0];
+    const startOfDay = new Date(`${dateStr}T00:00:00Z`);
+    const endOfDay = new Date(`${dateStr}T23:59:59Z`);
 
     const conditions: any[] = [
       gte(schema.fixtures.date, startOfDay),
@@ -1225,6 +1236,16 @@ export class FootballService {
 
     if (filters?.leagueId) {
       conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+    if (filters?.leagueName) {
+      conditions.push(
+        sql`LOWER(${schema.fixtures.leagueName}) LIKE LOWER(${'%' + filters.leagueName + '%'})`,
+      );
+    }
+    if (filters?.leagueCountry) {
+      conditions.push(
+        sql`LOWER(${schema.fixtures.leagueCountry}) LIKE LOWER(${'%' + filters.leagueCountry + '%'})`,
+      );
     }
     if (filters?.status) {
       conditions.push(eq(schema.fixtures.status, filters.status));
@@ -1236,6 +1257,41 @@ export class FootballService {
         ];
       if (statuses?.length) {
         conditions.push(inArray(schema.fixtures.status, statuses));
+      }
+    }
+    if (filters?.teamId) {
+      conditions.push(
+        sql`(${schema.fixtures.homeTeamId} = ${filters.teamId} OR ${schema.fixtures.awayTeamId} = ${filters.teamId})`,
+      );
+    }
+    if (filters?.round) {
+      conditions.push(
+        sql`LOWER(${schema.fixtures.round}) LIKE LOWER(${'%' + filters.round + '%'})`,
+      );
+    }
+
+    // If filtering by club name, resolve team IDs first
+    if (filters?.club) {
+      const matchingTeams = await this.db
+        .select({ id: schema.teams.id })
+        .from(schema.teams)
+        .where(
+          sql`LOWER(${schema.teams.name}) LIKE LOWER(${'%' + filters.club + '%'})`,
+        );
+
+      const teamIdsByName = matchingTeams.map((t: any) => t.id);
+      if (teamIdsByName.length > 0) {
+        conditions.push(
+          sql`(${schema.fixtures.homeTeamId} IN (${sql.join(
+            teamIdsByName.map((id: number) => sql`${id}`),
+            sql`, `,
+          )}) OR ${schema.fixtures.awayTeamId} IN (${sql.join(
+            teamIdsByName.map((id: number) => sql`${id}`),
+            sql`, `,
+          )}))`,
+        );
+      } else {
+        return []; // No teams match the club name
       }
     }
 

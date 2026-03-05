@@ -79,7 +79,9 @@ export class FootballController {
     summary: "Get today's fixtures with their AI predictions and team details",
     description:
       'Filter by state: upcoming (not started), live (in play), finished (completed), cancelled. ' +
-      'Or use exact status codes: NS, 1H, HT, 2H, FT, etc.',
+      'Or use exact status codes: NS, 1H, HT, 2H, FT, etc. ' +
+      'Also supports filtering by league name, country, team, club name search, round, ' +
+      'prediction availability, and minimum confidence.',
   })
   @ApiResponse({
     status: 200,
@@ -88,23 +90,59 @@ export class FootballController {
   })
   async getTodayFixtures(
     @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('leagueCountry') leagueCountry?: string,
     @Query('status') status?: string,
     @Query('state') state?: string,
+    @Query('teamId') teamId?: string,
+    @Query('club') club?: string,
+    @Query('round') round?: string,
+    @Query('date') date?: string,
+    @Query('hasPrediction') hasPrediction?: string,
+    @Query('minConfidence') minConfidence?: string,
   ) {
     try {
-      const data = await this.footballService.getTodayFixturesWithPredictions({
+      let data = await this.footballService.getTodayFixturesWithPredictions({
         leagueId: leagueId ? Number(leagueId) : undefined,
+        leagueName,
+        leagueCountry,
         status,
         state,
+        teamId: teamId ? Number(teamId) : undefined,
+        club,
+        round,
+        date,
       });
+
+      // Post-query filters that depend on joined prediction data
+      if (hasPrediction === 'true') {
+        data = data.filter((d: any) => d.prediction != null);
+      } else if (hasPrediction === 'false') {
+        data = data.filter((d: any) => d.prediction == null);
+      }
+
+      if (minConfidence) {
+        const minConf = Number(minConfidence);
+        data = data.filter(
+          (d: any) => d.prediction && d.prediction.confidence >= minConf,
+        );
+      }
 
       return {
         data,
         count: data.length,
-        date: new Date().toISOString().split('T')[0],
+        date: date ?? new Date().toISOString().split('T')[0],
         filters: {
           leagueId: leagueId ? Number(leagueId) : null,
+          leagueName: leagueName ?? null,
+          leagueCountry: leagueCountry ?? null,
           status: status ?? null,
+          state: state ?? null,
+          teamId: teamId ? Number(teamId) : null,
+          club: club ?? null,
+          round: round ?? null,
+          hasPrediction: hasPrediction ?? null,
+          minConfidence: minConfidence ? Number(minConfidence) : null,
         },
       };
     } catch (error) {
