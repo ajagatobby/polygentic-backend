@@ -12,7 +12,13 @@ import {
   NotFoundException,
   InternalServerErrorException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiParam, ApiResponse } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiParam,
+  ApiResponse,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { FootballService, TRACKED_LEAGUES } from './football.service';
 import { LiveScoreService } from './live/live-score.service';
 import { OddsService } from '../odds/odds.service';
@@ -23,6 +29,7 @@ import {
 } from './dto/fixture-query.dto';
 
 @ApiTags('Football')
+@ApiBearerAuth('firebase-auth')
 @Controller('api')
 export class FootballController {
   private readonly logger = new Logger(FootballController.name);

@@ -7,10 +7,17 @@ import {
   ParseIntPipe,
   NotFoundException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiQuery, ApiParam } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiQuery,
+  ApiParam,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { AlertsService } from './alerts.service';
 
 @ApiTags('Alerts')
+@ApiBearerAuth('firebase-auth')
 @Controller('api/alerts')
 export class AlertsController {
   constructor(private readonly alertsService: AlertsService) {}

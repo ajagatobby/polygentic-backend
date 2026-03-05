@@ -2,6 +2,7 @@ import { Controller, Get, Inject, Logger } from '@nestjs/common';
 import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { desc, sql } from 'drizzle-orm';
 import * as schema from '../database/schema';
+import { Public } from '../auth/public.decorator';
 
 @ApiTags('Health')
 @Controller('api')
@@ -11,6 +12,7 @@ export class HealthController {
 
   constructor(@Inject('DRIZZLE') private db: any) {}
 
+  @Public()
   @Get('health')
   @ApiOperation({ summary: 'Health check' })
   async health() {

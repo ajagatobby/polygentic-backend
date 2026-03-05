@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { FootballModule } from './football/football.module';
 import { OddsModule } from './odds/odds.module';
@@ -7,6 +9,7 @@ import { AlertsModule } from './alerts/alerts.module';
 import { AgentsModule } from './agents/agents.module';
 import { SyncModule } from './sync/sync.module';
 import { HealthModule } from './health/health.module';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -14,6 +17,28 @@ import { HealthModule } from './health/health.module';
       isGlobal: true,
       envFilePath: ['.env', '.env.local'],
     }),
+
+    // Rate limiting: 60 requests per minute per IP (general),
+    // plus a stricter tier for expensive endpoints.
+    ThrottlerModule.forRoot([
+      {
+        name: 'short',
+        ttl: 1000, // 1 second window
+        limit: 5, // max 5 requests per second
+      },
+      {
+        name: 'medium',
+        ttl: 60000, // 1 minute window
+        limit: 60, // max 60 requests per minute
+      },
+      {
+        name: 'long',
+        ttl: 3600000, // 1 hour window
+        limit: 500, // max 500 requests per hour
+      },
+    ]),
+
+    AuthModule,
     DatabaseModule,
     FootballModule,
     OddsModule,
@@ -21,6 +46,13 @@ import { HealthModule } from './health/health.module';
     AgentsModule,
     SyncModule,
     HealthModule,
+  ],
+  providers: [
+    // Apply rate limiting globally
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
   ],
 })
 export class AppModule {}

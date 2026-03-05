@@ -8,7 +8,13 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiParam, ApiResponse } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiParam,
+  ApiResponse,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { OddsService, SOCCER_SPORT_KEYS } from './odds.service';
 import {
   OddsSyncDto,
@@ -18,6 +24,7 @@ import {
 } from './dto/odds-query.dto';
 
 @ApiTags('Odds')
+@ApiBearerAuth('firebase-auth')
 @Controller('api/odds')
 export class OddsController {
   private readonly logger = new Logger(OddsController.name);

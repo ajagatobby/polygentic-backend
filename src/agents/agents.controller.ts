@@ -8,7 +8,13 @@ import {
   NotFoundException,
   Logger,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiParam,
+  ApiQuery,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { AgentsService, PredictionType } from './agents.service';
 import { PredictionQueryDto } from './dto/prediction-query.dto';
 import { generatePredictionTask } from '../trigger/generate-prediction';
@@ -19,6 +25,7 @@ import {
 } from '../trigger/sync-and-resolve';
 
 @ApiTags('Predictions')
+@ApiBearerAuth('firebase-auth')
 @Controller('api/predictions')
 export class AgentsController {
   private readonly logger = new Logger(AgentsController.name);
