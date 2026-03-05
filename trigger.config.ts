@@ -41,7 +41,7 @@ export default defineConfig({
   // The max compute seconds a task is allowed to run. If the task run exceeds this duration, it will be stopped.
   // You can override this on an individual task.
   // See https://trigger.dev/docs/runs/max-duration
-  maxDuration: 3600,
+  maxDuration: 604800, // 1 week (7 days)
   retries: {
     enabledInDev: true,
     default: {
