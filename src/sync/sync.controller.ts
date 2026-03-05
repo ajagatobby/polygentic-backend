@@ -2,12 +2,15 @@ import {
   Controller,
   Post,
   Get,
+  Body,
   Query,
   HttpCode,
   HttpStatus,
+  Logger,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery } from '@nestjs/swagger';
 import { SyncService } from './sync.service';
+import { FootballService } from '../football/football.service';
 import {
   syncFixturesTask,
   syncCompletedFixturesTask,
@@ -27,7 +30,12 @@ import {
 @ApiTags('Sync')
 @Controller('api/sync')
 export class SyncController {
-  constructor(private readonly syncService: SyncService) {}
+  private readonly logger = new Logger(SyncController.name);
+
+  constructor(
+    private readonly syncService: SyncService,
+    private readonly footballService: FootballService,
+  ) {}
 
   // ─── Trigger.dev task endpoints ────────────────────────────────────
 
@@ -112,6 +120,75 @@ export class SyncController {
     return {
       message: 'Odds sync started.',
       taskRunId: handle.id,
+    };
+  }
+
+  // ─── Manual league sync ─────────────────────────────────────────────
+
+  @Post('league')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Sync a specific league — fixtures, teams, injuries, and standings. Runs inline and returns results.',
+  })
+  async syncLeague(@Body() body: { leagueId: number }) {
+    const { leagueId } = body;
+    if (!leagueId) {
+      return { success: false, message: 'leagueId is required' };
+    }
+
+    this.logger.log(`Manual sync triggered for league ${leagueId}`);
+    const startTime = Date.now();
+    const results: Record<string, { count: number; error?: string }> = {};
+
+    // Run all sync operations for this league in parallel
+    const [fixtures, teams, injuries, standings] = await Promise.allSettled([
+      this.footballService.syncFixtures([leagueId]),
+      this.footballService.syncTeams(
+        leagueId,
+        FootballService.getCurrentSeason(),
+      ),
+      this.footballService.syncInjuries(leagueId),
+      this.footballService.syncStandings(leagueId),
+    ]);
+
+    results.fixtures = {
+      count: fixtures.status === 'fulfilled' ? (fixtures.value as number) : 0,
+      ...(fixtures.status === 'rejected'
+        ? { error: fixtures.reason?.message }
+        : {}),
+    };
+    results.teams = {
+      count: teams.status === 'fulfilled' ? (teams.value as number) : 0,
+      ...(teams.status === 'rejected' ? { error: teams.reason?.message } : {}),
+    };
+    results.injuries = {
+      count: injuries.status === 'fulfilled' ? (injuries.value as number) : 0,
+      ...(injuries.status === 'rejected'
+        ? { error: injuries.reason?.message }
+        : {}),
+    };
+    results.standings = {
+      count: standings.status === 'fulfilled' ? (standings.value as number) : 0,
+      ...(standings.status === 'rejected'
+        ? { error: standings.reason?.message }
+        : {}),
+    };
+
+    const duration = Date.now() - startTime;
+    const succeeded = [fixtures, teams, injuries, standings].filter(
+      (r) => r.status === 'fulfilled',
+    ).length;
+
+    this.logger.log(
+      `League ${leagueId} sync complete in ${duration}ms: ${succeeded}/4 succeeded`,
+    );
+
+    return {
+      success: succeeded > 0,
+      leagueId,
+      durationMs: duration,
+      results,
     };
   }
 
