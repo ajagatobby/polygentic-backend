@@ -1693,6 +1693,7 @@ export class PolymarketService {
         marketQuestion: market.marketQuestion,
         marketType: market.marketType,
         outcomes: market.outcomes,
+        startDate: market.startDate,
         endDate: market.endDate,
         leagueName: market.leagueName,
         teamName: market.teamName,
