@@ -241,6 +241,91 @@ export class EnvConfig {
   @IsOptional()
   PREDICTION_MAX_CONCURRENT: number = 5; // Max concurrent prediction pipelines
 
+  // ─── POLYMARKET ─────────────────────────────────────────────────────
+
+  @IsString()
+  @IsOptional()
+  POLYMARKET_GAMMA_URL: string = 'https://gamma-api.polymarket.com';
+
+  @IsString()
+  @IsOptional()
+  POLYMARKET_CLOB_URL: string = 'https://clob.polymarket.com';
+
+  @IsString()
+  @IsOptional()
+  POLYMARKET_WS_URL: string =
+    'wss://ws-subscriptions-clob.polymarket.com/ws/market';
+
+  @IsString()
+  @IsOptional()
+  POLYMARKET_API_KEY: string;
+
+  @IsString()
+  @IsOptional()
+  POLYMARKET_API_SECRET: string;
+
+  @IsString()
+  @IsOptional()
+  POLYMARKET_API_PASSPHRASE: string;
+
+  /** Starting bankroll in USDC — agent enforces this as a soft cap */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_BUDGET: number = 500;
+
+  /** Target multiplier (3 = 3x, 10 = 10x) — affects Kelly fraction aggressiveness */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_TARGET_MULTIPLIER: number = 3;
+
+  /** Enable real order placement (false = paper trading only) */
+  @IsString()
+  @IsOptional()
+  POLYMARKET_LIVE_TRADING: string = 'false';
+
+  /** Minimum edge vs Polymarket price to consider a trade (0.05 = 5%) */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_MIN_EDGE: number = 0.05;
+
+  /** Minimum market liquidity in USD to consider trading */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_MIN_LIQUIDITY: number = 1000;
+
+  /** Kelly fraction (0.25 = quarter-Kelly, conservative; 1.0 = full Kelly, aggressive) */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_KELLY_FRACTION: number = 0.25;
+
+  /** Maximum single position size as fraction of bankroll (0.10 = 10%) */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_MAX_POSITION_PCT: number = 0.1;
+
+  /** Stop trading if bankroll drops below this fraction of initial budget (0.3 = 30%) */
+  @Type(() => Number)
+  @IsNumber()
+  @IsOptional()
+  POLYMARKET_STOP_LOSS_PCT: number = 0.3;
+
+  /** Minimum prediction confidence (1-10) to consider for Polymarket trading */
+  @Type(() => Number)
+  @IsInt()
+  @IsOptional()
+  POLYMARKET_MIN_CONFIDENCE: number = 6;
+
+  /** Cron schedule for Polymarket market scanning */
+  @IsString()
+  @IsOptional()
+  POLYMARKET_SCAN_CRON: string = '*/30 * * * *'; // Every 30 minutes
+
   get databaseUrl(): string {
     if (this.DATABASE_URL) {
       return this.DATABASE_URL;
@@ -258,6 +343,10 @@ export class EnvConfig {
 
   get databaseSsl(): boolean {
     return this.DATABASE_SSL === 'true';
+  }
+
+  get polymarketLiveTrading(): boolean {
+    return this.POLYMARKET_LIVE_TRADING === 'true';
   }
 }
 

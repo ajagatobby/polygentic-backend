@@ -21,6 +21,11 @@ import { AnalysisAgent } from '../agents/analysis.agent';
 import { PoissonModelService } from '../agents/poisson-model.service';
 import { AgentsService } from '../agents/agents.service';
 import { SyncService } from '../sync/sync.service';
+import { PolymarketGammaService } from '../polymarket/services/polymarket-gamma.service';
+import { PolymarketClobService } from '../polymarket/services/polymarket-clob.service';
+import { PolymarketMatcherService } from '../polymarket/services/polymarket-matcher.service';
+import { PolymarketTradingAgent } from '../polymarket/services/polymarket-trading.agent';
+import { PolymarketService } from '../polymarket/polymarket.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
 const postgres =
@@ -63,6 +68,7 @@ export interface Services {
   poissonModel: PoissonModelService;
   agentsService: AgentsService;
   syncService: SyncService;
+  polymarketService: PolymarketService;
 }
 
 /**
@@ -106,6 +112,20 @@ export function initServices(): Services {
     oddsService,
   );
 
+  // Polymarket trading agent services
+  const polymarketGamma = new PolymarketGammaService(config);
+  const polymarketClob = new PolymarketClobService(config);
+  const polymarketMatcher = new PolymarketMatcherService(db as any);
+  const polymarketTradingAgent = new PolymarketTradingAgent(config);
+  const polymarketService = new PolymarketService(
+    db as any,
+    config,
+    polymarketGamma,
+    polymarketClob,
+    polymarketMatcher,
+    polymarketTradingAgent,
+  );
+
   return {
     db,
     config,
@@ -119,5 +139,6 @@ export function initServices(): Services {
     poissonModel,
     agentsService,
     syncService,
+    polymarketService,
   };
 }
