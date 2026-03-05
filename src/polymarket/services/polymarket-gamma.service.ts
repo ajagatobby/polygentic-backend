@@ -215,10 +215,10 @@ export class PolymarketGammaService {
               !existing.markets.find((m) => m.marketId === parsed.marketId)
             ) {
               existing.markets.push(parsed);
-              // Update event-level stats
-              existing.liquidity += raw.liquidity ?? 0;
-              existing.volume += raw.volume ?? 0;
-              existing.volume24hr += raw.volume24hr ?? 0;
+              // Update event-level stats (coerce to number — API may return strings)
+              existing.liquidity += Number(raw.liquidity ?? 0) || 0;
+              existing.volume += Number(raw.volume ?? 0) || 0;
+              existing.volume24hr += Number(raw.volume24hr ?? 0) || 0;
             }
           }
         }
@@ -314,9 +314,9 @@ export class PolymarketGammaService {
         endDate: parentEvent.endDate,
         active: parentEvent.active,
         closed: parentEvent.closed,
-        liquidity: parentEvent.liquidity ?? raw.liquidity ?? 0,
-        volume: parentEvent.volume ?? raw.volume ?? 0,
-        volume24hr: parentEvent.volume24hr ?? raw.volume24hr ?? 0,
+        liquidity: Number(parentEvent.liquidity ?? raw.liquidity ?? 0) || 0,
+        volume: Number(parentEvent.volume ?? raw.volume ?? 0) || 0,
+        volume24hr: Number(parentEvent.volume24hr ?? raw.volume24hr ?? 0) || 0,
         tags: parentEvent.tags ?? [],
         markets: parsed ? [parsed] : [],
       };
@@ -332,9 +332,9 @@ export class PolymarketGammaService {
       endDate: null,
       active: raw.active,
       closed: raw.closed,
-      liquidity: raw.liquidity ?? 0,
-      volume: raw.volume ?? 0,
-      volume24hr: raw.volume24hr ?? 0,
+      liquidity: Number(raw.liquidity ?? 0) || 0,
+      volume: Number(raw.volume ?? 0) || 0,
+      volume24hr: Number(raw.volume24hr ?? 0) || 0,
       tags: [],
       markets: parsed ? [parsed] : [],
     };
@@ -350,9 +350,9 @@ export class PolymarketGammaService {
       endDate: raw.endDate,
       active: raw.active,
       closed: raw.closed,
-      liquidity: raw.liquidity ?? 0,
-      volume: raw.volume ?? 0,
-      volume24hr: raw.volume24hr ?? 0,
+      liquidity: Number(raw.liquidity ?? 0) || 0,
+      volume: Number(raw.volume ?? 0) || 0,
+      volume24hr: Number(raw.volume24hr ?? 0) || 0,
       tags: raw.tags ?? [],
       markets: (raw.markets ?? [])
         .filter((m) => m.active && !m.closed)
@@ -405,9 +405,9 @@ export class PolymarketGammaService {
       outcomes,
       outcomePrices,
       clobTokenIds,
-      volume: raw.volume ?? 0,
-      volume24hr: raw.volume24hr ?? 0,
-      liquidity: raw.liquidity ?? 0,
+      volume: Number(raw.volume ?? 0) || 0,
+      volume24hr: Number(raw.volume24hr ?? 0) || 0,
+      liquidity: Number(raw.liquidity ?? 0) || 0,
       active: raw.active,
       closed: raw.closed,
       acceptingOrders: raw.acceptingOrders ?? false,

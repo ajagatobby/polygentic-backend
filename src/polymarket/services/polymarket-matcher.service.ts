@@ -447,14 +447,16 @@ export class PolymarketMatcherService {
       | 'qualification'
       | 'top_4',
   ): Promise<OutrightMarketMatch | null> {
-    const text = `${event.title} ${market.question}`.toLowerCase();
+    const textLower = `${event.title} ${market.question}`.toLowerCase();
+    // Keep original case for team name extraction (so "Italy" stays capitalized)
+    const textOriginal = `${event.title} ${market.question}`;
 
     // Step 1: Identify the league/competition
     let leagueMatch: LeaguePattern | null = null;
 
     for (const mapping of LEAGUE_MAPPINGS) {
       for (const pattern of mapping.patterns) {
-        if (text.includes(pattern)) {
+        if (textLower.includes(pattern)) {
           leagueMatch = mapping;
           break;
         }
@@ -464,7 +466,7 @@ export class PolymarketMatcherService {
 
     // If no league found from text, try to infer from team name
     if (!leagueMatch) {
-      const teamName = this.extractTeamNameFromOutright(text);
+      const teamName = this.extractTeamNameFromOutright(textOriginal);
       if (teamName) {
         const inferredLeagueId = TEAM_LEAGUE_HINTS[teamName.toLowerCase()];
         if (inferredLeagueId) {
@@ -482,8 +484,8 @@ export class PolymarketMatcherService {
       return null;
     }
 
-    // Step 2: Extract team name from the market question
-    const teamName = this.extractTeamNameFromOutright(text);
+    // Step 2: Extract team name from the market question (using original case)
+    const teamName = this.extractTeamNameFromOutright(textOriginal);
 
     if (!teamName) {
       this.logger.debug(
@@ -518,9 +520,9 @@ export class PolymarketMatcherService {
    * - "PSG to win Ligue 1?" → "PSG"
    */
   private extractTeamNameFromOutright(text: string): string | null {
-    // Pattern 1: "Will X win ..."
+    // Pattern 1: "Will X win/qualify/be relegated ..."
     const willWinMatch = text.match(
-      /will\s+([a-z][a-z\s.'-]+?)\s+(?:win|qualify|make|reach)\b/i,
+      /will\s+([A-Za-z][A-Za-z\s.'-]+?)\s+(?:win|qualify|make|reach|be\s+relegated|finish)\b/i,
     );
     if (willWinMatch) {
       return this.cleanTeamName(willWinMatch[1]);
@@ -528,7 +530,7 @@ export class PolymarketMatcherService {
 
     // Pattern 2: "X to win ..."
     const toWinMatch = text.match(
-      /^([a-z][a-z\s.'-]+?)\s+to\s+(?:win|qualify|make|reach)\b/i,
+      /(?:^|\?\s+)([A-Za-z][A-Za-z\s.'-]+?)\s+to\s+(?:win|qualify|make|reach)\b/i,
     );
     if (toWinMatch) {
       return this.cleanTeamName(toWinMatch[1]);
@@ -536,7 +538,7 @@ export class PolymarketMatcherService {
 
     // Pattern 3: "Can X win ..."
     const canWinMatch = text.match(
-      /can\s+([a-z][a-z\s.'-]+?)\s+(?:win|qualify|make|reach)\b/i,
+      /can\s+([A-Za-z][A-Za-z\s.'-]+?)\s+(?:win|qualify|make|reach)\b/i,
     );
     if (canWinMatch) {
       return this.cleanTeamName(canWinMatch[1]);
