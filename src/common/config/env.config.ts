@@ -47,6 +47,19 @@ export class EnvConfig {
   @IsOptional()
   LOG_LEVEL: LogLevel = LogLevel.Info;
 
+  // ─── AUTHENTICATION ──────────────────────────────────────────────────
+
+  /**
+   * When 'false', authentication is completely disabled globally.
+   * All routes become publicly accessible and a mock admin user is
+   * attached to every request. Useful for local development and testing.
+   *
+   * WARNING: Never set to 'false' in production.
+   */
+  @IsString()
+  @IsOptional()
+  AUTH_REQUIRED: string = 'true';
+
   // ─── DATABASE ────────────────────────────────────────────────────────
 
   @ValidateIf((o) => !o.DATABASE_URL)
@@ -347,6 +360,10 @@ export class EnvConfig {
 
   get polymarketLiveTrading(): boolean {
     return this.POLYMARKET_LIVE_TRADING === 'true';
+  }
+
+  get authRequired(): boolean {
+    return this.AUTH_REQUIRED !== 'false';
   }
 }
 

@@ -6,8 +6,17 @@ export const FIREBASE_ADMIN = 'FIREBASE_ADMIN';
 
 export const firebaseAdminProvider: Provider = {
   provide: FIREBASE_ADMIN,
-  useFactory: (configService: ConfigService): admin.app.App => {
+  useFactory: (configService: ConfigService): admin.app.App | null => {
     const logger = new Logger('FirebaseAdmin');
+
+    // If auth is disabled globally, skip Firebase initialisation entirely
+    const authRequired = configService.get<string>('AUTH_REQUIRED') !== 'false';
+    if (!authRequired) {
+      logger.warn(
+        'AUTH_REQUIRED=false — Firebase Admin SDK NOT initialised. All routes are publicly accessible.',
+      );
+      return null as any;
+    }
 
     // If already initialised (hot-reload / tests), return existing app
     if (admin.apps.length > 0) {
