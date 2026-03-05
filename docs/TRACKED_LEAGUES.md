@@ -4,7 +4,6 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 
 ## Domestic Leagues
 
-
 | API ID | League                       | Country     | Teams | Format                |
 | ------ | ---------------------------- | ----------- | ----- | --------------------- |
 | 39     | Premier League               | England     | 20    | 38 matchdays, Aug–May |
@@ -16,9 +15,7 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | 88     | Eredivisie                   | Netherlands | 18    | 34 matchdays, Aug–May |
 | 94     | Primeira Liga                | Portugal    | 18    | 34 matchdays, Aug–May |
 
-
 ## International Club Competitions
-
 
 | API ID | League                 | Region | Teams | Format                            |
 | ------ | ---------------------- | ------ | ----- | --------------------------------- |
@@ -26,9 +23,7 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | 3      | UEFA Europa League     | Europe | 36    | League phase + knockouts, Sep–May |
 | 848    | UEFA Conference League | Europe | 36    | League phase + knockouts, Sep–May |
 
-
 ## Americas
-
 
 | API ID | League              | Country    | Teams | Format                             |
 | ------ | ------------------- | ---------- | ----- | ---------------------------------- |
@@ -37,17 +32,13 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | 71     | Brasileirao Serie A | Brazil     | 20    | 38 matchdays, Apr–Dec              |
 | 128    | Liga Profesional    | Argentina  | 28    | 27 matchdays, Jan–Dec              |
 
-
 ## Other
-
 
 | API ID | League           | Country      | Teams | Format                |
 | ------ | ---------------- | ------------ | ----- | --------------------- |
 | 307    | Saudi Pro League | Saudi Arabia | 18    | 34 matchdays, Aug–May |
 
-
 ## Domestic Cups
-
 
 | API ID | Cup          | Country | Format                |
 | ------ | ------------ | ------- | --------------------- |
@@ -55,11 +46,9 @@ All leagues tracked by the Polygentic prediction system. These are defined in `s
 | 143    | Copa del Rey | Spain   | Knockout, rounds vary |
 | 81     | DFB Pokal    | Germany | Knockout, rounds vary |
 
-
 ## International Tournaments
 
 These are periodic tournaments -- they produce zero fixtures during off-periods so there is no API cost when inactive.
-
 
 | API ID | Tournament            | Region        | Format                 |
 | ------ | --------------------- | ------------- | ---------------------- |
@@ -72,16 +61,13 @@ These are periodic tournaments -- they produce zero fixtures during off-periods 
 | 5      | UEFA Nations League   | Europe        | Biennial, Sep–Jun      |
 | 13     | CONCACAF Gold Cup     | North America | Every 2 years, Jun–Jul |
 
-
 ## World Cup Qualifiers
-
 
 | API ID | Tournament                                | Region        | Format                     |
 | ------ | ----------------------------------------- | ------------- | -------------------------- |
 | 32     | FIFA World Cup Qualifiers - Europe        | Europe        | Group stage + playoffs     |
 | 34     | FIFA World Cup Qualifiers - South America | South America | Round-robin (18 matchdays) |
 | 36     | FIFA World Cup Qualifiers - Africa        | Africa        | Group stage + playoffs     |
-
 
 ## How Tracking Works
 
@@ -100,4 +86,3 @@ Adding a league ID to the `TRACKED_LEAGUES` array automatically includes it in:
 1. Find the league ID on [API-Football](https://www.api-football.com/documentation-v3#tag/Leagues)
 2. Add the ID to `TRACKED_LEAGUES` in `src/football/football.service.ts`
 3. Deploy — the next sync cycle will pick up the new league automatically
-

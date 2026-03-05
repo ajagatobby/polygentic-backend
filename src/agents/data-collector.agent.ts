@@ -218,7 +218,7 @@ export class DataCollectorAgent {
       return await this.footballService.fetchPrediction(fixtureId);
     } catch (error) {
       this.logger.debug(
-        `API-Football prediction not available for fixture ${fixtureId}`,
+        `External prediction not available for fixture ${fixtureId}`,
       );
       return null;
     }

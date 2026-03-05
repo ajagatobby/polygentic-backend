@@ -392,10 +392,10 @@ export class AnalysisAgent {
       }
     }
 
-    // API-Football prediction
+    // External prediction reference
     if (data.apiPrediction) {
       const pred = data.apiPrediction;
-      sections.push(`\n## API-Football Prediction`);
+      sections.push(`\n## External Prediction Reference`);
       if (pred.predictions) {
         sections.push(
           `- Winner: ${pred.predictions.winner?.name ?? '?'}`,
