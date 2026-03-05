@@ -94,6 +94,8 @@ export function initServices(): Services {
     researchAgent,
     analysisAgent,
     poissonModel,
+    footballService,
+    oddsService,
     alertsService,
   );
 

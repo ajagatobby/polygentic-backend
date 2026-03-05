@@ -6,6 +6,8 @@ import { DataCollectorAgent, CollectedMatchData } from './data-collector.agent';
 import { ResearchAgent, ResearchResult } from './research.agent';
 import { AnalysisAgent, PredictionOutput } from './analysis.agent';
 import { PoissonModelService } from './poisson-model.service';
+import { FootballService } from '../football/football.service';
+import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
 import {
   PredictionType,
@@ -27,6 +29,8 @@ export class AgentsService {
     private readonly researchAgent: ResearchAgent,
     private readonly analysisAgent: AnalysisAgent,
     private readonly poissonModel: PoissonModelService,
+    private readonly footballService: FootballService,
+    private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
   ) {}
 
@@ -47,6 +51,9 @@ export class AgentsService {
     );
 
     const startTime = Date.now();
+
+    // Step 0: Freshen all data sources before prediction
+    await this.freshenDataForFixture(fixtureId);
 
     // Step 1: Collect data
     let matchData: CollectedMatchData;
@@ -828,6 +835,92 @@ export class AgentsService {
       );
       return null;
     }
+  }
+
+  // ─── Pre-prediction data freshening ──────────────────────────────────
+
+  /**
+   * Ensure all data sources are fresh before generating a prediction.
+   * Fetches injuries, lineups, standings, and odds from external APIs
+   * and persists them to the database so the DataCollector reads fresh data.
+   *
+   * Each fetch is best-effort — failures are logged but don't block the prediction.
+   */
+  private async freshenDataForFixture(fixtureId: number): Promise<void> {
+    this.logger.log(`Freshening data for fixture ${fixtureId}`);
+
+    // Get the fixture to know the league and teams
+    const fixtureRows = await this.db
+      .select()
+      .from(schema.fixtures)
+      .where(eq(schema.fixtures.id, fixtureId))
+      .limit(1);
+
+    const fixture = fixtureRows?.[0];
+    if (!fixture) {
+      this.logger.warn(
+        `Fixture ${fixtureId} not found, skipping data freshening`,
+      );
+      return;
+    }
+
+    const leagueId = fixture.leagueId;
+    const freshenStart = Date.now();
+
+    // Run all freshening tasks in parallel — each is independent and best-effort
+    const results = await Promise.allSettled([
+      // 1. Sync injuries for the league (fetches all current injuries)
+      this.footballService.syncInjuries(leagueId).then((count) => {
+        this.logger.log(
+          `Freshened injuries for league ${leagueId}: ${count} records`,
+        );
+        return { type: 'injuries', count };
+      }),
+
+      // 2. Sync standings/form for the league
+      this.footballService.syncStandings(leagueId).then((count) => {
+        this.logger.log(
+          `Freshened standings for league ${leagueId}: ${count} records`,
+        );
+        return { type: 'standings', count };
+      }),
+
+      // 3. Fetch and persist lineups (available ~1hr before kickoff)
+      this.footballService.fetchAndPersistLineups(fixtureId).then((count) => {
+        this.logger.log(
+          `Freshened lineups for fixture ${fixtureId}: ${count} team lineups`,
+        );
+        return { type: 'lineups', count };
+      }),
+
+      // 4. Sync odds (uses The Odds API — only if we have credits)
+      this.oddsService.syncAllSoccerOdds().then((result) => {
+        this.logger.log(
+          `Freshened odds: ${result.eventsProcessed} events, ${result.fixturesLinked} linked`,
+        );
+        return { type: 'odds', count: result.eventsProcessed };
+      }),
+    ]);
+
+    // Log results
+    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const failedTypes = results
+      .map((r, i) => {
+        if (r.status === 'rejected') {
+          const types = ['injuries', 'standings', 'lineups', 'odds'];
+          return `${types[i]}: ${r.reason?.message ?? 'unknown'}`;
+        }
+        return null;
+      })
+      .filter(Boolean);
+
+    const duration = Date.now() - freshenStart;
+    this.logger.log(
+      `Data freshening complete for fixture ${fixtureId} in ${duration}ms: ` +
+        `${succeeded} succeeded, ${failed} failed` +
+        (failedTypes.length > 0 ? ` [${failedTypes.join('; ')}]` : ''),
+    );
   }
 
   // ─── Private helpers ────────────────────────────────────────────────
