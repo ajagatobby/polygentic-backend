@@ -1,6 +1,6 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { eq, and, isNull, sql, desc } from 'drizzle-orm';
+import { eq, and, isNull, sql, desc, gte, lte, inArray } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { PolymarketGammaService } from './services/polymarket-gamma.service';
 import {
@@ -1626,5 +1626,343 @@ export class PolymarketService {
       .where(where)
       .orderBy(desc(schema.polymarketMarkets.lastSyncedAt))
       .limit(limit);
+  }
+
+  // ─── Trades by month ────────────────────────────────────────────────
+
+  /**
+   * Get trades filtered by month and year, joined with market details.
+   */
+  async getTradesByMonth(month: number, year: number): Promise<any[]> {
+    // Build date range for the given month (1-indexed)
+    const startDate = new Date(year, month - 1, 1); // First day of month
+    const endDate = new Date(year, month, 1); // First day of next month
+
+    const rows = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
+      .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
+      .where(
+        and(
+          gte(schema.polymarketTrades.createdAt, startDate),
+          lte(schema.polymarketTrades.createdAt, endDate),
+        ),
+      )
+      .orderBy(desc(schema.polymarketTrades.createdAt));
+
+    return rows.map(({ trade, market }: any) => ({
+      id: trade.id,
+      mode: trade.mode,
+      side: trade.side,
+      outcomeIndex: trade.outcomeIndex,
+      outcomeName: trade.outcomeName,
+      entryPrice: Number(trade.entryPrice),
+      fillPrice: trade.fillPrice ? Number(trade.fillPrice) : null,
+      positionSizeUsd: Number(trade.positionSizeUsd),
+      tokenQuantity: trade.tokenQuantity ? Number(trade.tokenQuantity) : null,
+      ensembleProbability: Number(trade.ensembleProbability),
+      polymarketProbability: Number(trade.polymarketProbability),
+      edgePercent: Number(trade.edgePercent),
+      kellyFraction: trade.kellyFraction ? Number(trade.kellyFraction) : null,
+      confidenceAtEntry: trade.confidenceAtEntry,
+      agentReasoning: trade.agentReasoning,
+      riskAssessment: trade.riskAssessment,
+      bankrollAtEntry: trade.bankrollAtEntry
+        ? Number(trade.bankrollAtEntry)
+        : null,
+      orderId: trade.orderId,
+      orderStatus: trade.orderStatus,
+      status: trade.status,
+      pnlUsd: trade.pnlUsd ? Number(trade.pnlUsd) : null,
+      pnlPercent: trade.pnlPercent ? Number(trade.pnlPercent) : null,
+      resolutionOutcome: trade.resolutionOutcome,
+      createdAt: trade.createdAt,
+      resolvedAt: trade.resolvedAt,
+      // Market details
+      market: {
+        eventTitle: market.eventTitle,
+        marketQuestion: market.marketQuestion,
+        marketType: market.marketType,
+        outcomes: market.outcomes,
+        endDate: market.endDate,
+        leagueName: market.leagueName,
+        teamName: market.teamName,
+        season: market.season,
+        liquidity: market.liquidity ? Number(market.liquidity) : null,
+        volume: market.volume ? Number(market.volume) : null,
+        active: market.active,
+        closed: market.closed,
+      },
+    }));
+  }
+
+  // ─── Go-live: convert paper trades to live trades ───────────────────
+
+  /**
+   * Convert paper trades to live by placing real orders on the Polymarket CLOB.
+   *
+   * Modes:
+   * - { tradeIds: [1, 2, 3] } — convert specific trades
+   * - { month: 5, year: 2026 } — convert all open paper trades from that month
+   * - { all: true } — convert all open paper trades
+   */
+  async goLiveTrades(params: {
+    tradeIds?: number[];
+    month?: number;
+    year?: number;
+    all?: boolean;
+  }): Promise<{
+    converted: number;
+    failed: number;
+    skipped: number;
+    results: Array<{
+      tradeId: number;
+      status: 'converted' | 'failed' | 'skipped';
+      orderId?: string;
+      reason?: string;
+    }>;
+  }> {
+    // Validate that CLOB credentials are available
+    const apiKey = this.config.get<string>('POLYMARKET_API_KEY');
+    if (!apiKey) {
+      throw new Error(
+        'CLOB API credentials not configured. Set POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_PASSPHRASE.',
+      );
+    }
+
+    // Find paper trades to convert
+    const conditions: any[] = [
+      eq(schema.polymarketTrades.mode, 'paper'),
+      eq(schema.polymarketTrades.status, 'open'),
+    ];
+
+    if (params.tradeIds && params.tradeIds.length > 0) {
+      conditions.push(inArray(schema.polymarketTrades.id, params.tradeIds));
+    } else if (params.month && params.year) {
+      const startDate = new Date(params.year, params.month - 1, 1);
+      const endDate = new Date(params.year, params.month, 1);
+      conditions.push(gte(schema.polymarketTrades.createdAt, startDate));
+      conditions.push(lte(schema.polymarketTrades.createdAt, endDate));
+    } else if (!params.all) {
+      throw new Error(
+        'Must provide tradeIds, month+year, or all=true to specify which trades to convert.',
+      );
+    }
+
+    const paperTrades = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
+      .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
+      .where(and(...conditions))
+      .orderBy(desc(schema.polymarketTrades.createdAt));
+
+    if (paperTrades.length === 0) {
+      return { converted: 0, failed: 0, skipped: 0, results: [] };
+    }
+
+    this.logger.log(
+      `Go-live: found ${paperTrades.length} paper trades to convert`,
+    );
+
+    // Get or create a live bankroll
+    const liveBankroll = await this.getOrCreateLiveBankroll();
+
+    let converted = 0;
+    let failed = 0;
+    let skipped = 0;
+    const results: Array<{
+      tradeId: number;
+      status: 'converted' | 'failed' | 'skipped';
+      orderId?: string;
+      reason?: string;
+    }> = [];
+
+    for (const { trade, market } of paperTrades) {
+      // Skip if market is closed or not accepting orders
+      if (market.closed || !market.acceptingOrders) {
+        skipped++;
+        results.push({
+          tradeId: trade.id,
+          status: 'skipped',
+          reason: market.closed
+            ? 'Market is closed'
+            : 'Market not accepting orders',
+        });
+        continue;
+      }
+
+      // Get the token ID for the trade's outcome
+      const clobTokenIds = market.clobTokenIds as string[];
+      const tokenId = clobTokenIds?.[trade.outcomeIndex];
+      if (!tokenId) {
+        failed++;
+        results.push({
+          tradeId: trade.id,
+          status: 'failed',
+          reason: `No token ID for outcome index ${trade.outcomeIndex}`,
+        });
+        continue;
+      }
+
+      try {
+        // Fetch current CLOB pricing
+        const currentPricing =
+          await this.clobService.getMarketPricingSnapshot(tokenId);
+
+        if (!currentPricing) {
+          failed++;
+          results.push({
+            tradeId: trade.id,
+            status: 'failed',
+            reason: 'Could not fetch current CLOB pricing',
+          });
+          continue;
+        }
+
+        // Use the current buy price (ask) or midpoint as the limit price
+        const limitPrice = currentPricing.buyPrice || currentPricing.midpoint;
+        const positionSizeUsd = Number(trade.positionSizeUsd);
+        const tokensToReceive = positionSizeUsd / limitPrice;
+
+        // Place the real order
+        const orderResult = await this.clobService.placeLimitOrder({
+          tokenId,
+          side: 'BUY',
+          price: limitPrice,
+          size: tokensToReceive,
+        });
+
+        if (!orderResult) {
+          failed++;
+          results.push({
+            tradeId: trade.id,
+            status: 'failed',
+            reason: 'Order placement returned null — check CLOB credentials',
+          });
+          continue;
+        }
+
+        // Update the trade record
+        await this.db
+          .update(schema.polymarketTrades)
+          .set({
+            mode: 'live',
+            orderId: orderResult.orderId,
+            orderStatus: orderResult.status,
+            fillPrice: String(limitPrice),
+            fillTimestamp: new Date(),
+            entryPrice: String(limitPrice), // Update entry price to actual live price
+            midpointAtEntry: String(currentPricing.midpoint),
+            spreadAtEntry: String(currentPricing.spread),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.polymarketTrades.id, trade.id));
+
+        // Update live bankroll
+        const newBalance =
+          Number(liveBankroll.currentBalance) - positionSizeUsd;
+        await this.db
+          .update(schema.polymarketBankroll)
+          .set({
+            currentBalance: String(newBalance),
+            openPositionsCount: liveBankroll.openPositionsCount + converted + 1,
+            openPositionsValue: String(
+              Number(liveBankroll.openPositionsValue) + positionSizeUsd,
+            ),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.polymarketBankroll.id, liveBankroll.id));
+
+        converted++;
+        results.push({
+          tradeId: trade.id,
+          status: 'converted',
+          orderId: orderResult.orderId,
+        });
+
+        this.logger.log(
+          `Go-live: trade #${trade.id} (${trade.outcomeName}) → order ${orderResult.orderId} ` +
+            `$${positionSizeUsd.toFixed(2)} @ ${limitPrice.toFixed(3)}`,
+        );
+      } catch (error) {
+        failed++;
+        results.push({
+          tradeId: trade.id,
+          status: 'failed',
+          reason: error.message,
+        });
+        this.logger.error(
+          `Go-live: failed to convert trade #${trade.id}: ${error.message}`,
+        );
+      }
+    }
+
+    this.logger.log(
+      `Go-live complete: ${converted} converted, ${failed} failed, ${skipped} skipped`,
+    );
+
+    return { converted, failed, skipped, results };
+  }
+
+  /**
+   * Get or create a live-mode bankroll record (separate from paper bankroll).
+   */
+  private async getOrCreateLiveBankroll(): Promise<any> {
+    const existing = await this.db
+      .select()
+      .from(schema.polymarketBankroll)
+      .where(eq(schema.polymarketBankroll.mode, 'live'))
+      .orderBy(desc(schema.polymarketBankroll.updatedAt))
+      .limit(1);
+
+    if (existing.length > 0) return existing[0];
+
+    const budget = this.config.get<number>('POLYMARKET_BUDGET') || 500;
+
+    const [created] = await this.db
+      .insert(schema.polymarketBankroll)
+      .values({
+        mode: 'live',
+        initialBudget: String(budget),
+        currentBalance: String(budget),
+        totalDeposited: String(budget),
+        totalWithdrawn: '0',
+        realizedPnl: '0',
+        unrealizedPnl: '0',
+        totalTrades: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        peakBalance: String(budget),
+        currentDrawdownPct: '0',
+        maxDrawdownPct: '0',
+        openPositionsCount: 0,
+        openPositionsValue: '0',
+        snapshotAt: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    this.logger.log(`Created live bankroll with initial budget: $${budget}`);
+
+    return created;
   }
 }

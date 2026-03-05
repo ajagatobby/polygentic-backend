@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Query, Logger } from '@nestjs/common';
+import { Controller, Get, Post, Query, Body, Logger } from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
   ApiQuery,
+  ApiBody,
   ApiBearerAuth,
 } from '@nestjs/swagger';
 import { Roles } from '../auth/roles.decorator';
@@ -109,6 +110,111 @@ export class PolymarketController {
 
     return {
       message: `Resolved ${result.resolved} trades`,
+      ...result,
+    };
+  }
+
+  @Get('trades')
+  @ApiOperation({
+    summary:
+      'Get trades filtered by month and year, with market details and P&L',
+  })
+  @ApiQuery({
+    name: 'month',
+    required: true,
+    type: Number,
+    description: 'Month (1-12)',
+  })
+  @ApiQuery({
+    name: 'year',
+    required: true,
+    type: Number,
+    description: 'Year (e.g. 2026)',
+  })
+  async getTradesByMonth(
+    @Query('month') month: string,
+    @Query('year') year: string,
+  ) {
+    const m = Number(month);
+    const y = Number(year);
+
+    if (!m || m < 1 || m > 12) {
+      return { error: 'month must be between 1 and 12' };
+    }
+    if (!y || y < 2020 || y > 2100) {
+      return { error: 'year must be a valid year (2020-2100)' };
+    }
+
+    const trades = await this.polymarketService.getTradesByMonth(m, y);
+
+    const totalPnl = trades.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0);
+    const openCount = trades.filter((t) => t.status === 'open').length;
+    const resolvedCount = trades.filter((t) => t.status === 'resolved').length;
+    const wins = trades.filter((t) => t.resolutionOutcome === 'win').length;
+    const losses = trades.filter((t) => t.resolutionOutcome === 'loss').length;
+
+    return {
+      data: trades,
+      count: trades.length,
+      summary: {
+        month: m,
+        year: y,
+        totalTrades: trades.length,
+        openCount,
+        resolvedCount,
+        wins,
+        losses,
+        winRate: resolvedCount > 0 ? wins / resolvedCount : null,
+        totalPnl: Number(totalPnl.toFixed(2)),
+      },
+    };
+  }
+
+  @Roles('admin')
+  @Post('trades/go-live')
+  @ApiOperation({
+    summary:
+      '[Admin] Convert paper trades to live by placing real orders on Polymarket CLOB',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        tradeIds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Specific trade IDs to convert',
+        },
+        month: {
+          type: 'number',
+          description: 'Convert all open paper trades from this month (1-12)',
+        },
+        year: {
+          type: 'number',
+          description: 'Year for month filter',
+        },
+        all: {
+          type: 'boolean',
+          description: 'Convert all open paper trades',
+        },
+      },
+    },
+  })
+  async goLiveTrades(
+    @Body()
+    body: {
+      tradeIds?: number[];
+      month?: number;
+      year?: number;
+      all?: boolean;
+    },
+  ) {
+    this.logger.log(`Go-live request: ${JSON.stringify(body)}`);
+
+    const result = await this.polymarketService.goLiveTrades(body);
+
+    return {
+      message: `Converted ${result.converted} trades to live (${result.failed} failed, ${result.skipped} skipped)`,
       ...result,
     };
   }
