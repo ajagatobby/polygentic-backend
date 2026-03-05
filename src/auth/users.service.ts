@@ -17,9 +17,7 @@ export class UsersService {
 
   /**
    * Create a new user in Firebase Auth and insert a DB row with role=user.
-   * Called by the public POST /api/auth/register endpoint.
-   *
-   * Throws Firebase error codes (auth/email-already-exists, etc.) on failure.
+   * Throws Firebase error codes on failure (caught by controller).
    */
   async createUser(input: {
     email: string;
@@ -35,27 +33,39 @@ export class UsersService {
     });
 
     // 2. Insert into DB with default role=user
-    const [dbUser] = await this.db
-      .insert(users)
-      .values({
-        uid: firebaseUser.uid,
-        email: input.email,
-        emailVerified: false,
-        displayName: input.displayName || null,
-        photoUrl: null,
-        provider: 'password',
-        role: 'user',
-        disabled: false,
-        requestCount: 0,
-        lastActiveAt: new Date(),
-      })
-      .returning();
+    try {
+      const [dbUser] = await this.db
+        .insert(users)
+        .values({
+          uid: firebaseUser.uid,
+          email: input.email,
+          emailVerified: false,
+          displayName: input.displayName || null,
+          photoUrl: null,
+          provider: 'password',
+          role: 'user',
+          disabled: false,
+          requestCount: 0,
+          lastActiveAt: new Date(),
+        })
+        .returning();
 
-    this.logger.log(
-      `Created user ${input.email} (${firebaseUser.uid}) with role=user`,
-    );
-
-    return dbUser;
+      this.logger.log(`Created user ${firebaseUser.uid} with role=user`);
+      return dbUser;
+    } catch (dbError: any) {
+      // DB insert failed — rollback Firebase user to avoid orphaned accounts
+      this.logger.error(
+        `DB insert failed for ${firebaseUser.uid}, rolling back Firebase user: ${dbError.message}`,
+      );
+      try {
+        await this.firebaseApp.auth().deleteUser(firebaseUser.uid);
+      } catch (deleteError: any) {
+        this.logger.error(
+          `Failed to rollback Firebase user ${firebaseUser.uid}: ${deleteError.message}`,
+        );
+      }
+      throw dbError;
+    }
   }
 
   // ─── Upsert on every authenticated request ───────────────────────────
@@ -68,7 +78,7 @@ export class UsersService {
    * and subsequent requests keep email/displayName/photo/lastActiveAt fresh.
    * Increments request_count atomically.
    *
-   * NOTE: role is NOT touched on update — it can only be changed via direct DB access.
+   * SECURITY: role and disabled are NOT touched on conflict update.
    */
   async upsertFromToken(decoded: admin.auth.DecodedIdToken): Promise<User> {
     const provider = decoded.firebase?.sign_in_provider || 'unknown';
@@ -95,7 +105,8 @@ export class UsersService {
           displayName: decoded.name || sql`${users.displayName}`,
           photoUrl: decoded.picture || sql`${users.photoUrl}`,
           provider,
-          // role is intentionally NOT updated here — immutable via API
+          // SECURITY: role is intentionally NOT updated — immutable via API
+          // SECURITY: disabled is intentionally NOT updated — preserves admin disable
           requestCount: sql`${users.requestCount} + 1`,
           lastActiveAt: new Date(),
           updatedAt: new Date(),
@@ -121,8 +132,8 @@ export class UsersService {
     data: User[];
     total: number;
   }> {
-    const limit = opts.limit ?? 50;
-    const offset = opts.offset ?? 0;
+    const limit = Math.min(opts.limit ?? 50, 100); // Hard cap at 100
+    const offset = Math.max(opts.offset ?? 0, 0);
 
     const [data, [{ count }]] = await Promise.all([
       this.db
@@ -137,13 +148,18 @@ export class UsersService {
     return { data, total: count };
   }
 
-  // ─── Account management (admin-only, called from controller) ─────────
+  // ─── Account management ──────────────────────────────────────────────
 
   /**
    * Disable or re-enable a user account.
-   * Blocks in DB + Firebase so they can't get new tokens either.
+   * Updates Firebase first, then DB. If Firebase fails, the operation is aborted
+   * to prevent inconsistency (user disabled in DB but active in Firebase).
    */
   async setDisabled(uid: string, disabled: boolean): Promise<User> {
+    // 1. Update Firebase FIRST — if this fails, we abort entirely
+    await this.firebaseApp.auth().updateUser(uid, { disabled });
+
+    // 2. Only update DB if Firebase succeeded
     const [updated] = await this.db
       .update(users)
       .set({ disabled, updatedAt: new Date() })
@@ -151,19 +167,15 @@ export class UsersService {
       .returning();
 
     if (!updated) {
+      // DB row doesn't exist but Firebase user was updated — rollback Firebase
+      this.logger.error(
+        `User ${uid} not in DB but Firebase was updated. Rolling back.`,
+      );
+      await this.firebaseApp.auth().updateUser(uid, { disabled: !disabled });
       throw new Error(`User ${uid} not found`);
     }
 
-    // Also disable in Firebase so they can't get new tokens
-    try {
-      await this.firebaseApp.auth().updateUser(uid, { disabled });
-      this.logger.log(`User ${uid} disabled=${disabled} (DB + Firebase)`);
-    } catch (error: any) {
-      this.logger.error(
-        `Failed to update Firebase disabled status for ${uid}: ${error.message}`,
-      );
-    }
-
+    this.logger.log(`User ${uid} disabled=${disabled} (Firebase + DB)`);
     return updated;
   }
 }

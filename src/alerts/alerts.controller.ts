@@ -14,10 +14,12 @@ import {
   ApiParam,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { Roles } from '../auth/roles.decorator';
 import { AlertsService } from './alerts.service';
 
 @ApiTags('Alerts')
 @ApiBearerAuth('firebase-auth')
+@Roles('admin')
 @Controller('api/alerts')
 export class AlertsController {
   constructor(private readonly alertsService: AlertsService) {}
@@ -44,8 +46,8 @@ export class AlertsController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    const pageNum = parseInt(page) || 1;
-    const limitNum = parseInt(limit) || 50;
+    const pageNum = Math.max(parseInt(page) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit) || 50, 1), 100);
 
     return this.alertsService.getAlerts({
       type: type as any,

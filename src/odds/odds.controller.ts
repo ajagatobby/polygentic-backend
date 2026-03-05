@@ -69,8 +69,9 @@ export class OddsController {
     }
   }
 
+  @Roles('admin')
   @Get('credits')
-  @ApiOperation({ summary: 'Get current Odds API credit usage' })
+  @ApiOperation({ summary: '[Admin] Get current Odds API credit usage' })
   async getCreditUsage() {
     return this.oddsService.getCreditUsage();
   }
@@ -160,7 +161,7 @@ export class OddsController {
     } catch (err) {
       this.logger.error(`Odds sync failed: ${err.message}`);
       throw new HttpException(
-        `Odds sync failed: ${err.message}`,
+        'Odds sync failed',
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }

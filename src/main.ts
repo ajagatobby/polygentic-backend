@@ -15,29 +15,32 @@ async function bootstrap() {
   // Security headers via helmet
   app.use(helmet());
 
-  // Global validation pipe
+  // Global validation pipe — strict mode
   app.useGlobalPipes(
     new ValidationPipe({
       transform: true,
       whitelist: true,
-      forbidNonWhitelisted: false,
+      forbidNonWhitelisted: true, // Reject requests with unexpected properties
       transformOptions: {
-        enableImplicitConversion: true,
+        enableImplicitConversion: false, // Require explicit @Type() decorators
       },
     }),
   );
 
   const configService = app.get(ConfigService);
+  const nodeEnv = configService.get<string>('NODE_ENV', 'development');
 
-  // CORS — reads allowed origins from env (comma-separated), defaults to * in dev
-  const corsOrigins = configService.get<string>('CORS_ORIGINS', '*');
-  const origin =
-    corsOrigins === '*'
-      ? true // allow all in dev
-      : corsOrigins.split(',').map((o) => o.trim());
+  // CORS — explicit allowlist only, never reflect arbitrary origins
+  const corsOrigins = configService.get<string>('CORS_ORIGINS', '');
+  const allowedOrigins = corsOrigins
+    ? corsOrigins
+        .split(',')
+        .map((o) => o.trim())
+        .filter(Boolean)
+    : [];
 
   app.enableCors({
-    origin,
+    origin: allowedOrigins.length > 0 ? allowedOrigins : false,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
@@ -48,40 +51,54 @@ async function bootstrap() {
     ],
   });
 
-  // Swagger
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('Polygentic API')
-    .setDescription(
-      'AI-powered soccer prediction backend using multi-agent analysis. Combines football data, bookmaker odds, and real-time research to produce match predictions.',
-    )
-    .setVersion('2.0')
-    .addBearerAuth(
-      {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'Firebase ID Token',
-        description: 'Enter your Firebase ID token',
-      },
-      'firebase-auth',
-    )
-    .addTag('Health', 'System health and status')
-    .addTag('Auth', 'Authentication and user info')
-    .addTag('Football', 'Fixtures, teams, and match data')
-    .addTag('Odds', 'Bookmaker odds and consensus probabilities')
-    .addTag('Predictions', 'AI-powered match predictions')
-    .addTag('Alerts', 'Alert management')
-    .build();
+  if (allowedOrigins.length === 0) {
+    logger.warn(
+      'CORS_ORIGINS is empty — cross-origin requests are blocked. Set CORS_ORIGINS=http://localhost:3000 for development.',
+    );
+  }
 
-  const document = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('api/docs', app, document);
+  // Swagger — only in non-production environments
+  if (nodeEnv !== 'production') {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('Polygentic API')
+      .setDescription(
+        'AI-powered soccer prediction backend using multi-agent analysis.',
+      )
+      .setVersion('2.0')
+      .addBearerAuth(
+        {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'Firebase ID Token',
+          description: 'Enter your Firebase ID token',
+        },
+        'firebase-auth',
+      )
+      .addTag('Health', 'System health and status')
+      .addTag('Auth', 'Authentication and user info')
+      .addTag('Football', 'Fixtures, teams, and match data')
+      .addTag('Odds', 'Bookmaker odds and consensus probabilities')
+      .addTag('Predictions', 'AI-powered match predictions')
+      .addTag('Alerts', 'Alert management')
+      .build();
+
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('api/docs', app, document);
+    logger.log('Swagger docs enabled at /api/docs (non-production)');
+  } else {
+    logger.log('Swagger docs DISABLED in production');
+  }
 
   const port = configService.get<number>('PORT', 3000);
+  const host = configService.get<string>(
+    'HOST',
+    nodeEnv === 'production' ? '0.0.0.0' : '127.0.0.1',
+  );
 
-  await app.listen(port, '0.0.0.0');
+  await app.listen(port, host);
 
-  logger.log(`Polygentic backend running on http://localhost:${port}`);
-  logger.log(`Swagger docs available at http://localhost:${port}/api/docs`);
-  logger.log(`Health check at http://localhost:${port}/api/health`);
+  logger.log(`Polygentic backend running on http://${host}:${port}`);
+  logger.log(`Health check at http://${host}:${port}/api/health`);
 }
 
 bootstrap();

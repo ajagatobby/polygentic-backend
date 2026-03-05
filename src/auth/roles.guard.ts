@@ -3,6 +3,7 @@ import {
   ExecutionContext,
   ForbiddenException,
   Injectable,
+  Logger,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { ROLES_KEY } from './roles.decorator';
@@ -19,6 +20,8 @@ import { IS_PUBLIC_KEY } from './public.decorator';
  */
 @Injectable()
 export class RolesGuard implements CanActivate {
+  private readonly logger = new Logger(RolesGuard.name);
+
   constructor(private readonly reflector: Reflector) {}
 
   canActivate(context: ExecutionContext): boolean {
@@ -40,18 +43,20 @@ export class RolesGuard implements CanActivate {
     const user = request.user;
 
     if (!user?.dbUser) {
-      throw new ForbiddenException('User profile not loaded');
+      throw new ForbiddenException('Access denied');
     }
 
     if (user.dbUser.disabled) {
-      throw new ForbiddenException('Account is disabled');
+      throw new ForbiddenException('Access denied');
     }
 
     const hasRole = requiredRoles.includes(user.dbUser.role);
     if (!hasRole) {
-      throw new ForbiddenException(
-        `This endpoint requires one of: [${requiredRoles.join(', ')}]. Your role: ${user.dbUser.role}`,
+      // Log the details server-side but return generic message to client
+      this.logger.warn(
+        `Access denied for user ${user.uid} (role: ${user.dbUser.role}, required: [${requiredRoles.join(', ')}]) on ${request.method} ${request.url}`,
       );
+      throw new ForbiddenException('Access denied');
     }
 
     return true;

@@ -19,41 +19,22 @@ export const firebaseAdminProvider: Provider = {
     const clientEmail = configService.get<string>('FIREBASE_CLIENT_EMAIL');
     const privateKey = configService.get<string>('FIREBASE_PRIVATE_KEY');
 
-    if (projectId && clientEmail && privateKey) {
-      // Prefer env-var credentials (production / CI)
-      const app = admin.initializeApp({
-        credential: admin.credential.cert({
-          projectId,
-          clientEmail,
-          // Private key comes from .env with literal \n — replace them
-          privateKey: privateKey.replace(/\\n/g, '\n'),
-        }),
-      });
-      logger.log(
-        `Firebase Admin initialised via env vars (project: ${projectId})`,
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new Error(
+        'Firebase Admin initialisation failed — FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY env vars are all required.',
       );
-      return app;
     }
 
-    // Fallback: local service account JSON file
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const serviceAccount = require('../../firebase-service-account.json');
-      const app = admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-      logger.log(
-        `Firebase Admin initialised via service-account file (project: ${serviceAccount.project_id})`,
-      );
-      return app;
-    } catch {
-      logger.error(
-        'Firebase Admin could not be initialised. Set FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY env vars, or place firebase-service-account.json in project root.',
-      );
-      throw new Error(
-        'Firebase Admin initialisation failed — missing credentials',
-      );
-    }
+    const app = admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId,
+        clientEmail,
+        // Private key comes from .env with literal \n — replace them
+        privateKey: privateKey.replace(/\\n/g, '\n'),
+      }),
+    });
+    logger.log(`Firebase Admin initialised (project: ${projectId})`);
+    return app;
   },
   inject: [ConfigService],
 };
