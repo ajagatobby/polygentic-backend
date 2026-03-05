@@ -2,36 +2,13 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { MarketPricingSnapshot } from './polymarket-clob.service';
-import { MarketFixtureMatch } from './polymarket-matcher.service';
+import {
+  MarketMatch,
+  OutrightMarketMatch,
+  FixtureMarketMatch,
+} from './polymarket-matcher.service';
 
-/**
- * A trading candidate — enriched with prediction data and pricing.
- */
-export interface TradingCandidate {
-  match: MarketFixtureMatch;
-  pricing: MarketPricingSnapshot; // Pricing for the "Yes" token
-  pricingNo?: MarketPricingSnapshot; // Pricing for the "No" token (if available)
-
-  // From our prediction pipeline
-  prediction: {
-    id: number;
-    homeWinProb: number;
-    drawProb: number;
-    awayWinProb: number;
-    predictedHomeGoals: number;
-    predictedAwayGoals: number;
-    confidence: number;
-    keyFactors: string[];
-    riskFactors: string[];
-    valueBets: any[];
-    detailedAnalysis: string;
-  };
-
-  // Calculated edge
-  ensembleProbability: number; // Our model's probability for the outcome this market tracks
-  polymarketProbability: number; // Polymarket's midpoint price
-  rawEdge: number; // ensembleProbability - polymarketProbability
-}
+// ─── Shared types ─────────────────────────────────────────────────────
 
 /**
  * The agent's trading decision output.
@@ -66,7 +43,171 @@ export interface BankrollContext {
   peakBalance: number;
 }
 
-const TRADING_SYSTEM_PROMPT = `You are an autonomous sports betting trading agent. Your job is to analyze soccer market opportunities on Polymarket and make disciplined trading decisions.
+// ─── Outright trading candidate ───────────────────────────────────────
+
+/**
+ * Standings/form data for the team this outright market is about.
+ */
+export interface TeamStandingsContext {
+  leaguePosition: number;
+  totalTeams: number; // Total teams in the league
+  points: number;
+  pointsFromTop: number; // How many points behind the leader (0 if leading)
+  formString: string; // e.g. "WWDLW"
+  last5: {
+    wins: number;
+    draws: number;
+    losses: number;
+    goalsFor: number;
+    goalsAgainst: number;
+  };
+  home: { wins: number; draws: number; losses: number };
+  away: { wins: number; draws: number; losses: number };
+  goalsForAvg: number;
+  goalsAgainstAvg: number;
+  attackRating: number;
+  defenseRating: number;
+  gamesPlayed: number;
+  gamesRemaining: number; // Estimated
+}
+
+/**
+ * A trading candidate for outright markets (league/tournament winner, qualification).
+ */
+export interface OutrightTradingCandidate {
+  type: 'outright';
+  match: OutrightMarketMatch;
+  pricing: MarketPricingSnapshot;
+
+  // Our estimated probability for this outcome
+  estimatedProbability: number;
+  polymarketProbability: number;
+  rawEdge: number;
+
+  // Standings context
+  teamStandings: TeamStandingsContext;
+
+  // Top competitors for context
+  topCompetitors: Array<{
+    teamName: string;
+    position: number;
+    points: number;
+    formString: string;
+  }>;
+}
+
+// ─── Match outcome trading candidate ──────────────────────────────────
+
+/**
+ * A trading candidate for match outcome markets.
+ */
+export interface FixtureTradingCandidate {
+  type: 'fixture';
+  match: FixtureMarketMatch;
+  pricing: MarketPricingSnapshot;
+  pricingNo?: MarketPricingSnapshot;
+
+  prediction: {
+    id: number;
+    homeWinProb: number;
+    drawProb: number;
+    awayWinProb: number;
+    predictedHomeGoals: number;
+    predictedAwayGoals: number;
+    confidence: number;
+    keyFactors: string[];
+    riskFactors: string[];
+    valueBets: any[];
+    detailedAnalysis: string;
+  };
+
+  ensembleProbability: number;
+  polymarketProbability: number;
+  rawEdge: number;
+}
+
+export type TradingCandidate =
+  | OutrightTradingCandidate
+  | FixtureTradingCandidate;
+
+// ─── System prompts ───────────────────────────────────────────────────
+
+const OUTRIGHT_TRADING_SYSTEM_PROMPT = `You are an autonomous sports betting trading agent. Your job is to analyze soccer OUTRIGHT market opportunities on Polymarket and make disciplined trading decisions.
+
+## CONTEXT
+
+Outright markets on Polymarket are season-long/tournament-long bets, such as:
+- "Will Liverpool win the Premier League 2025-26?"
+- "Will Barcelona win the Champions League 2025-26?"
+- "Will Italy qualify for the 2026 World Cup?"
+
+These are fundamentally different from match-by-match bets. Key differences:
+1. **Time horizon**: Months, not days. Prices fluctuate with each matchday
+2. **Information**: League standings, form, injuries, and remaining schedule matter more than any single match
+3. **Pricing**: These markets are often inefficient because fewer traders specialize in soccer outrights
+4. **Resolution**: Binary — the team either wins or doesn't
+
+## YOUR ROLE
+
+You receive:
+1. The team's current league standings and form data
+2. Top competitors' standings (to assess relative strength)
+3. Polymarket's current pricing
+4. Your bankroll state and open positions
+
+You must decide: BET or SKIP, and if betting, how much.
+
+## DECISION FRAMEWORK
+
+### Step 1: Estimate True Probability
+Use the standings data to estimate the team's true probability of winning:
+- **League position & points gap**: A team 10 points clear with 10 games left is very likely to win. A team 15 points behind is very unlikely
+- **Form**: Recent form (last 5 matches) shows trajectory — improving or declining?
+- **Season stage**: Early season (much uncertainty) vs late season (standings more predictive)
+- **Historical base rates**: In the Premier League, the team leading at the halfway point wins the title ~70-80% of the time
+- For tournament winners: Consider the draw, remaining opponents, and knockout format
+- For qualification: Consider how many spots are available and the team's position relative to the cutoff
+
+### Step 2: Compare to Polymarket Price
+- The Polymarket price IS the market's implied probability
+- Your edge = your estimated probability - Polymarket's probability
+- Be humble: Polymarket aggregates many opinions. If you see a large edge, ask yourself WHY
+- Small edges (3-8%) on clear situations are more reliable than large edges (>15%) which often indicate you're wrong
+
+### Step 3: Assess Market Quality
+- Liquidity: Can you fill at the displayed price?
+- Spread: Wide spreads eat into edge
+- Volume: Low volume = potentially stale prices
+
+### Step 4: Position Sizing (Kelly Criterion)
+- Kelly = (edge / (1 - price)) * kellyModifier
+- For outrights with long resolution times, use EXTRA conservative sizing (max quarter-Kelly)
+- Why: Your capital is locked up for months. Opportunity cost is real
+- Cap positions at the configured max
+
+### Step 5: Risk Assessment
+- **Correlation**: Multiple bets in the same league are correlated
+- **Time risk**: Season-long bets can go sideways before recovering
+- **Injury risk**: A key player injury can drastically change title odds
+- **Drawdown**: If in drawdown, be extra selective
+
+## OUTPUT FORMAT
+
+Respond with ONLY valid JSON:
+{
+  "action": "bet" | "skip",
+  "outcomeIndex": <0 or 1>,
+  "outcomeName": "<the outcome name>",
+  "positionSizeUsd": <number, 0 if skip>,
+  "entryPrice": <number>,
+  "kellyFraction": <number>,
+  "edgePercent": <number, effective edge after spread>,
+  "reasoning": "<2-4 paragraphs explaining your decision>",
+  "riskAssessment": "<1-2 paragraphs on what could go wrong>",
+  "confidenceInEdge": <1-10>
+}`;
+
+const FIXTURE_TRADING_SYSTEM_PROMPT = `You are an autonomous sports betting trading agent. Your job is to analyze soccer market opportunities on Polymarket and make disciplined trading decisions.
 
 ## YOUR ROLE
 
@@ -83,50 +224,23 @@ You must decide: BET or SKIP, and if betting, how much.
 - Compare our ensemble probability against Polymarket's midpoint price
 - An edge ONLY exists if our probability differs significantly from Polymarket's price
 - Consider: Is our model likely right, or is Polymarket pricing in information we don't have?
-- Polymarket is often efficient. A 5% edge is meaningful. A 15%+ edge should make you suspicious — either we know something the market doesn't, or we're wrong
+- Polymarket is often efficient. A 5% edge is meaningful. A 15%+ edge should make you suspicious
 
 ### Step 2: Assess Market Quality
 - Liquidity: Can we actually fill at the displayed price? Check order book depth
 - Spread: Wide spreads (>5%) eat into edge. Effective edge = raw edge - (spread / 2)
-- Volume: Low volume markets may have stale prices — the "edge" might be an illusion
-- Time to resolution: Markets close to expiry are less risky (shorter time for adverse movement)
+- Volume: Low volume markets may have stale prices
+- Time to resolution: Markets close to expiry are less risky
 
 ### Step 3: Position Sizing (Kelly Criterion)
-- Kelly fraction = (edge * (payout - 1) - (1 - edge)) / (payout - 1)
-- For Polymarket binary tokens: payout = 1/price, so Kelly simplifies to: (edge / (1 - price))
-- Apply the Kelly fraction modifier from config (typically 0.25 = quarter-Kelly for safety)
-- Cap at max position size (typically 10% of bankroll)
-- REDUCE size when:
-  - Bankroll is below starting point (preserve capital)
-  - You have many open positions (correlation risk)
-  - Confidence in the prediction is moderate (6-7)
-  - Market liquidity is thin
+- Kelly fraction = (edge / (1 - price)) * kellyModifier
+- Cap at max position size
+- REDUCE size when in drawdown, many open positions, or moderate confidence
 
 ### Step 4: Risk Assessment
 - Correlation: Don't overload on the same league/day/outcome type
-- Drawdown: If in drawdown, size down or skip marginal opportunities
-- Stop loss: If bankroll has dropped below the stop threshold, recommend SKIP
-- Narrative risk: Consider what could make the market right and us wrong
-
-### Step 5: Decision
-- BET only when:
-  - Edge is real and significant (effective edge > 3% after spread)
-  - Market quality is adequate (sufficient liquidity, reasonable spread)
-  - Position size makes sense given bankroll state
-  - No excessive correlation with existing positions
-- SKIP when:
-  - Edge is small or uncertain
-  - Market is illiquid or has wide spreads
-  - We're in drawdown and this isn't a high-conviction opportunity
-  - Too much correlation with existing positions
-  - Something feels off — the market may know something we don't
-
-## COMMON TRAPS TO AVOID
-- **Phantom edge**: A "mispricing" might be because the market has newer information (last-minute injury, team news)
-- **Illiquidity premium**: Thin markets show edges that disappear when you try to fill
-- **Overtrading**: Not every prediction needs a bet. Quality over quantity
-- **Revenge trading**: Don't increase size after losses to "make it back"
-- **Correlated bets**: 5 bets on Premier League home wins this weekend is really 1 bet on home advantage
+- Drawdown: Size down or skip marginal opportunities
+- Narrative risk: What could make the market right and us wrong?
 
 ## OUTPUT FORMAT
 
@@ -134,14 +248,14 @@ Respond with ONLY valid JSON:
 {
   "action": "bet" | "skip",
   "outcomeIndex": <0 or 1>,
-  "outcomeName": "<the outcome name you're betting on>",
+  "outcomeName": "<the outcome name>",
   "positionSizeUsd": <number, 0 if skip>,
-  "entryPrice": <number, the price you'd enter at>,
-  "kellyFraction": <number, calculated Kelly>,
+  "entryPrice": <number>,
+  "kellyFraction": <number>,
   "edgePercent": <number, effective edge after spread>,
   "reasoning": "<2-4 paragraphs explaining your decision>",
   "riskAssessment": "<1-2 paragraphs on what could go wrong>",
-  "confidenceInEdge": <1-10, how confident you are the edge is real>
+  "confidenceInEdge": <1-10>
 }`;
 
 @Injectable()
@@ -166,22 +280,36 @@ export class PolymarketTradingAgent {
     bankroll: BankrollContext,
     openPositions: Array<{
       outcomeName: string;
-      fixtureId: number;
+      fixtureId?: number;
+      leagueId?: number;
       positionSizeUsd: number;
     }>,
   ): Promise<TradingDecision> {
-    const prompt = this.buildPrompt(candidate, bankroll, openPositions);
+    const systemPrompt =
+      candidate.type === 'outright'
+        ? OUTRIGHT_TRADING_SYSTEM_PROMPT
+        : FIXTURE_TRADING_SYSTEM_PROMPT;
+
+    const prompt =
+      candidate.type === 'outright'
+        ? this.buildOutrightPrompt(candidate, bankroll, openPositions)
+        : this.buildFixturePrompt(candidate, bankroll, openPositions);
+
+    const logLabel =
+      candidate.type === 'outright'
+        ? `${candidate.match.teamName} to win ${candidate.match.leagueName}`
+        : `${candidate.match.homeTeamName} vs ${candidate.match.awayTeamName}`;
 
     this.logger.log(
-      `Evaluating trade: ${candidate.match.homeTeamName} vs ${candidate.match.awayTeamName} ` +
-        `(edge: ${(candidate.rawEdge * 100).toFixed(1)}%, midpoint: ${candidate.pricing.midpoint.toFixed(3)})`,
+      `Evaluating trade: ${logLabel} ` +
+        `(edge: ${(candidate.rawEdge * 100).toFixed(1)}%)`,
     );
 
     const response = await this.anthropic.messages.create({
       model: this.model,
       max_tokens: 2048,
-      temperature: 0.1, // Very low — we want consistent, disciplined decisions
-      system: TRADING_SYSTEM_PROMPT,
+      temperature: 0.1,
+      system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -191,21 +319,26 @@ export class PolymarketTradingAgent {
     return this.parseDecision(rawText, candidate);
   }
 
-  // ─── Prompt construction ────────────────────────────────────────────
+  // ─── Outright prompt construction ───────────────────────────────────
 
-  private buildPrompt(
-    candidate: TradingCandidate,
+  private buildOutrightPrompt(
+    candidate: OutrightTradingCandidate,
     bankroll: BankrollContext,
     openPositions: Array<{
       outcomeName: string;
-      fixtureId: number;
+      fixtureId?: number;
+      leagueId?: number;
       positionSizeUsd: number;
     }>,
   ): string {
     const sections: string[] = [];
-    const { match, pricing, prediction } = candidate;
+    const {
+      match,
+      pricing,
+      teamStandings: standings,
+      topCompetitors,
+    } = candidate;
 
-    // Config
     const kellyFraction =
       this.config.get<number>('POLYMARKET_KELLY_FRACTION') || 0.25;
     const maxPositionPct =
@@ -217,17 +350,131 @@ export class PolymarketTradingAgent {
     sections.push(`# BANKROLL STATE`);
     sections.push(
       `- Initial budget: $${bankroll.initialBudget}`,
-      `- Current balance: $${bankroll.currentBalance}`,
-      `- Target: ${bankroll.targetMultiplier}x ($${bankroll.initialBudget * bankroll.targetMultiplier})`,
-      `- Realized P&L: $${bankroll.realizedPnl}`,
+      `- Current balance: $${bankroll.currentBalance.toFixed(2)}`,
+      `- Target: ${bankroll.targetMultiplier}x ($${(bankroll.initialBudget * bankroll.targetMultiplier).toFixed(0)})`,
+      `- Realized P&L: $${bankroll.realizedPnl.toFixed(2)}`,
       `- Win rate: ${bankroll.totalTrades > 0 ? (bankroll.winRate * 100).toFixed(1) : 'N/A'}% (${bankroll.totalTrades} trades)`,
-      `- Peak balance: $${bankroll.peakBalance}`,
       `- Current drawdown: ${(bankroll.currentDrawdownPct * 100).toFixed(1)}%`,
-      `- Max drawdown: ${(bankroll.maxDrawdownPct * 100).toFixed(1)}%`,
-      `- Stop loss threshold: ${(stopLossPct * 100).toFixed(0)}% of initial`,
-      `- Open positions: ${bankroll.openPositionsCount} ($${bankroll.openPositionsValue} at risk)`,
-      `- Kelly fraction: ${kellyFraction} (${kellyFraction === 0.25 ? 'quarter' : kellyFraction === 0.5 ? 'half' : 'custom'}-Kelly)`,
-      `- Max single position: ${(maxPositionPct * 100).toFixed(0)}% of bankroll ($${(bankroll.currentBalance * maxPositionPct).toFixed(2)})`,
+      `- Open positions: ${bankroll.openPositionsCount} ($${bankroll.openPositionsValue.toFixed(0)} at risk)`,
+      `- Kelly fraction: ${kellyFraction} (quarter-Kelly)`,
+      `- Max position: ${(maxPositionPct * 100).toFixed(0)}% of bankroll ($${(bankroll.currentBalance * maxPositionPct).toFixed(2)})`,
+    );
+
+    // Open positions
+    if (openPositions.length > 0) {
+      sections.push(`\n# CURRENT OPEN POSITIONS`);
+      const sameLeague = openPositions.filter(
+        (p) => p.leagueId === match.leagueId,
+      );
+      for (const pos of openPositions) {
+        const leagueNote =
+          pos.leagueId === match.leagueId ? ' [SAME LEAGUE]' : '';
+        sections.push(
+          `- ${pos.outcomeName}: $${pos.positionSizeUsd.toFixed(2)}${leagueNote}`,
+        );
+      }
+      if (sameLeague.length > 0) {
+        sections.push(
+          `  ⚠ ${sameLeague.length} position(s) in the SAME league — high correlation risk`,
+        );
+      }
+    }
+
+    // Market info
+    sections.push(`\n# POLYMARKET MARKET`);
+    sections.push(
+      `- Type: ${match.marketType}`,
+      `- Event: ${match.event.title}`,
+      `- Market: ${match.market.question}`,
+      `- Team: ${match.teamName}`,
+      `- League: ${match.leagueName} (${match.season}-${match.season + 1} season)`,
+      `- Outcomes: ${match.market.outcomes.join(' / ')}`,
+      `- Current prices: ${match.market.outcomes.map((o, i) => `${o}: ${match.market.outcomePrices[i]?.toFixed(3) ?? '?'}`).join(', ')}`,
+      `- Liquidity: $${Number(match.event.liquidity).toLocaleString()}`,
+      `- 24h Volume: $${Number(match.event.volume24hr).toLocaleString()}`,
+      `- Total Volume: $${Number(match.event.volume).toLocaleString()}`,
+    );
+
+    // CLOB pricing
+    sections.push(`\n# CLOB PRICING`);
+    sections.push(
+      `- Midpoint: ${pricing.midpoint.toFixed(4)}`,
+      `- Buy price: ${pricing.buyPrice.toFixed(4)}`,
+      `- Sell price: ${pricing.sellPrice.toFixed(4)}`,
+      `- Spread: ${pricing.spread.toFixed(4)} (${(pricing.spread * 100).toFixed(2)}%)`,
+      `- Book depth — Bids: $${pricing.bookDepth.totalBidSize.toFixed(0)} | Asks: $${pricing.bookDepth.totalAskSize.toFixed(0)}`,
+    );
+
+    // Team standings
+    sections.push(`\n# ${match.teamName.toUpperCase()} — CURRENT STANDINGS`);
+    sections.push(
+      `- League position: ${standings.leaguePosition} / ${standings.totalTeams}`,
+      `- Points: ${standings.points} (${standings.pointsFromTop === 0 ? 'LEADING' : `${standings.pointsFromTop} behind leader`})`,
+      `- Games played: ${standings.gamesPlayed} | Remaining: ~${standings.gamesRemaining}`,
+      `- Form (last 5): ${standings.formString} (W${standings.last5.wins} D${standings.last5.draws} L${standings.last5.losses})`,
+      `- Last 5 goals: ${standings.last5.goalsFor}F ${standings.last5.goalsAgainst}A`,
+      `- Home record: W${standings.home.wins} D${standings.home.draws} L${standings.home.losses}`,
+      `- Away record: W${standings.away.wins} D${standings.away.draws} L${standings.away.losses}`,
+      `- Goals avg: ${standings.goalsForAvg.toFixed(2)} for / ${standings.goalsAgainstAvg.toFixed(2)} against`,
+      `- Ratings: Attack ${standings.attackRating.toFixed(1)} | Defense ${standings.defenseRating.toFixed(1)}`,
+    );
+
+    // Top competitors
+    if (topCompetitors.length > 0) {
+      sections.push(`\n# TOP COMPETITORS`);
+      for (const comp of topCompetitors.slice(0, 5)) {
+        sections.push(
+          `- #${comp.position} ${comp.teamName}: ${comp.points} pts (form: ${comp.formString})`,
+        );
+      }
+    }
+
+    // Edge analysis
+    sections.push(`\n# EDGE ANALYSIS`);
+    sections.push(
+      `- Our estimated probability: ${(candidate.estimatedProbability * 100).toFixed(1)}%`,
+      `- Polymarket price: ${(candidate.polymarketProbability * 100).toFixed(1)}%`,
+      `- Raw edge: ${(candidate.rawEdge * 100).toFixed(1)}%`,
+      `- Effective edge (after half-spread): ${((candidate.rawEdge - pricing.spread / 2) * 100).toFixed(1)}%`,
+    );
+
+    return sections.join('\n');
+  }
+
+  // ─── Fixture prompt construction ────────────────────────────────────
+
+  private buildFixturePrompt(
+    candidate: FixtureTradingCandidate,
+    bankroll: BankrollContext,
+    openPositions: Array<{
+      outcomeName: string;
+      fixtureId?: number;
+      leagueId?: number;
+      positionSizeUsd: number;
+    }>,
+  ): string {
+    const sections: string[] = [];
+    const { match, pricing, prediction } = candidate;
+
+    const kellyFraction =
+      this.config.get<number>('POLYMARKET_KELLY_FRACTION') || 0.25;
+    const maxPositionPct =
+      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
+    const stopLossPct =
+      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+
+    // Bankroll state
+    sections.push(`# BANKROLL STATE`);
+    sections.push(
+      `- Initial budget: $${bankroll.initialBudget}`,
+      `- Current balance: $${bankroll.currentBalance.toFixed(2)}`,
+      `- Target: ${bankroll.targetMultiplier}x ($${(bankroll.initialBudget * bankroll.targetMultiplier).toFixed(0)})`,
+      `- Realized P&L: $${bankroll.realizedPnl.toFixed(2)}`,
+      `- Win rate: ${bankroll.totalTrades > 0 ? (bankroll.winRate * 100).toFixed(1) : 'N/A'}% (${bankroll.totalTrades} trades)`,
+      `- Current drawdown: ${(bankroll.currentDrawdownPct * 100).toFixed(1)}%`,
+      `- Open positions: ${bankroll.openPositionsCount} ($${bankroll.openPositionsValue.toFixed(0)} at risk)`,
+      `- Kelly fraction: ${kellyFraction}`,
+      `- Max position: ${(maxPositionPct * 100).toFixed(0)}% of bankroll ($${(bankroll.currentBalance * maxPositionPct).toFixed(2)})`,
     );
 
     // Open positions
@@ -235,7 +482,7 @@ export class PolymarketTradingAgent {
       sections.push(`\n# CURRENT OPEN POSITIONS`);
       for (const pos of openPositions) {
         sections.push(
-          `- ${pos.outcomeName} (fixture ${pos.fixtureId}): $${pos.positionSizeUsd}`,
+          `- ${pos.outcomeName}: $${pos.positionSizeUsd.toFixed(2)}`,
         );
       }
     }
@@ -245,7 +492,7 @@ export class PolymarketTradingAgent {
     sections.push(
       `- ${match.homeTeamName} vs ${match.awayTeamName}`,
       `- Fixture ID: ${match.fixtureId}`,
-      `- Match confidence: ${(match.matchScore * 100).toFixed(0)}% (market-to-fixture linking)`,
+      `- Match confidence: ${(match.matchScore * 100).toFixed(0)}%`,
     );
 
     // Polymarket market
@@ -257,18 +504,16 @@ export class PolymarketTradingAgent {
       `- Current prices: ${match.market.outcomes.map((o, i) => `${o}: ${match.market.outcomePrices[i]?.toFixed(3) ?? '?'}`).join(', ')}`,
       `- Liquidity: $${Number(match.event.liquidity).toLocaleString()}`,
       `- 24h Volume: $${Number(match.event.volume24hr).toLocaleString()}`,
-      `- Total Volume: $${Number(match.event.volume).toLocaleString()}`,
     );
 
-    // CLOB pricing details
+    // CLOB pricing
     sections.push(`\n# CLOB PRICING (Primary Token)`);
     sections.push(
       `- Midpoint: ${pricing.midpoint.toFixed(4)}`,
       `- Buy price: ${pricing.buyPrice.toFixed(4)}`,
       `- Sell price: ${pricing.sellPrice.toFixed(4)}`,
       `- Spread: ${pricing.spread.toFixed(4)} (${(pricing.spread * 100).toFixed(2)}%)`,
-      `- Book depth — Bids: $${pricing.bookDepth.totalBidSize.toFixed(0)} (top: $${pricing.bookDepth.topBidSize.toFixed(0)})`,
-      `- Book depth — Asks: $${pricing.bookDepth.totalAskSize.toFixed(0)} (top: $${pricing.bookDepth.topAskSize.toFixed(0)})`,
+      `- Book depth — Bids: $${pricing.bookDepth.totalBidSize.toFixed(0)} | Asks: $${pricing.bookDepth.totalAskSize.toFixed(0)}`,
     );
 
     // Our prediction
@@ -279,44 +524,27 @@ export class PolymarketTradingAgent {
       `- Away Win: ${(prediction.awayWinProb * 100).toFixed(1)}%`,
       `- Predicted Score: ${prediction.predictedHomeGoals} - ${prediction.predictedAwayGoals}`,
       `- Confidence: ${prediction.confidence}/10`,
-      `- Model: ensemble (Claude 40% + Poisson 25% + Bookmaker 35%)`,
     );
 
-    // Edge calculation
+    // Edge
     sections.push(`\n# EDGE ANALYSIS`);
     sections.push(
-      `- Our probability for this outcome: ${(candidate.ensembleProbability * 100).toFixed(1)}%`,
+      `- Our probability: ${(candidate.ensembleProbability * 100).toFixed(1)}%`,
       `- Polymarket midpoint: ${(candidate.polymarketProbability * 100).toFixed(1)}%`,
       `- Raw edge: ${(candidate.rawEdge * 100).toFixed(1)}%`,
       `- Effective edge (after half-spread): ${((candidate.rawEdge - pricing.spread / 2) * 100).toFixed(1)}%`,
     );
 
-    // Key factors from prediction
+    // Key/risk factors
     if (prediction.keyFactors.length > 0) {
       sections.push(`\n# KEY FACTORS`);
-      for (const factor of prediction.keyFactors) {
-        sections.push(`- ${factor}`);
-      }
+      prediction.keyFactors.forEach((f) => sections.push(`- ${f}`));
     }
-
     if (prediction.riskFactors.length > 0) {
       sections.push(`\n# RISK FACTORS`);
-      for (const factor of prediction.riskFactors) {
-        sections.push(`- ${factor}`);
-      }
+      prediction.riskFactors.forEach((f) => sections.push(`- ${f}`));
     }
 
-    // Existing value bets from the prediction
-    if (prediction.valueBets.length > 0) {
-      sections.push(`\n# VALUE BETS (from prediction pipeline)`);
-      for (const vb of prediction.valueBets) {
-        sections.push(
-          `- ${vb.market}: ${vb.selection} — edge ${vb.edgePercent}% — ${vb.reasoning}`,
-        );
-      }
-    }
-
-    // Brief analysis context
     if (prediction.detailedAnalysis) {
       sections.push(
         `\n# PREDICTION ANALYSIS SUMMARY`,
@@ -370,7 +598,6 @@ export class PolymarketTradingAgent {
       );
       this.logger.debug(`Raw response: ${rawText.substring(0, 500)}`);
 
-      // Default to skip on parse failure
       return {
         action: 'skip',
         outcomeIndex: 0,

@@ -38,6 +38,9 @@ export interface GammaMarket {
   closed: boolean;
   acceptingOrders: boolean;
   enableOrderBook: boolean;
+  // /markets endpoint returns these as top-level fields
+  groupItemTitle?: string;
+  events?: GammaEvent[];
 }
 
 /**
@@ -80,40 +83,71 @@ export interface ParsedMarket {
  *
  * Client for Polymarket's Gamma API — market/event discovery.
  * No authentication required.
+ *
+ * NOTE: The Gamma API's `tag` parameter on /events is broken — it returns
+ * generic events regardless of tag value. We instead paginate through the
+ * /markets endpoint and filter client-side using soccer keywords in the
+ * question, slug, and groupItemTitle fields.
  */
 @Injectable()
 export class PolymarketGammaService {
   private readonly logger = new Logger(PolymarketGammaService.name);
   private readonly client: AxiosInstance;
 
-  // Tags to search for soccer markets
-  private static readonly SOCCER_TAGS = [
-    'soccer',
-    'football',
-    'premier-league',
-    'la-liga',
-    'serie-a',
-    'bundesliga',
-    'ligue-1',
-    'champions-league',
-    'europa-league',
-    'world-cup',
-    'euro',
-    'mls',
-    'copa-america',
-  ];
-
-  // Keywords for search fallback
+  /**
+   * Soccer keywords used for client-side filtering.
+   * Covers leagues, competitions, teams, and generic terms.
+   */
   private static readonly SOCCER_KEYWORDS = [
+    // Competitions / leagues
     'premier league',
     'champions league',
+    'europa league',
     'la liga',
     'serie a',
     'bundesliga',
+    'ligue 1',
     'world cup',
-    'europa league',
+    'euro 2026',
+    'euro 2028',
+    'copa america',
+    'copa libertadores',
+    'conference league',
+    'fa cup',
+    'carabao cup',
+    'copa del rey',
+    'dfb-pokal',
+    'coppa italia',
+    'coupe de france',
+    'mls',
+    'liga mx',
+    'eredivisie',
+    'primeira liga',
+    'scottish premiership',
+    'super lig',
+    // Generic soccer terms
     'soccer',
-    'football match',
+    'football club',
+    // Note: We intentionally do NOT include bare club names here (e.g. "chelsea",
+    // "arsenal") as they cause false positives ("Chelsea Clinton" etc.).
+    // Club names are handled by the matcher service when classifying events.
+  ];
+
+  /**
+   * Patterns that exclude false positives — markets that mention
+   * soccer-sounding words but aren't actually soccer.
+   */
+  private static readonly EXCLUSION_PATTERNS = [
+    /\bamerican football\b/i,
+    /\bnfl\b/i,
+    /\bsuper bowl\b/i,
+    /\bfootball.*nfl/i,
+    /\bnfl.*football/i,
+    /\bpresidential\b/i,
+    /\bdemocratic\b/i,
+    /\brepublican\b/i,
+    /\belection\b/i,
+    /\bnomination\b/i,
   ];
 
   constructor(private readonly config: ConfigService) {
@@ -130,67 +164,26 @@ export class PolymarketGammaService {
 
   /**
    * Fetch all active soccer events from Polymarket.
-   * Searches multiple tags and deduplicates by event ID.
+   *
+   * Strategy: Paginate through /markets (limit=100), filter client-side
+   * by soccer keywords, group markets into events by their parent event.
    */
   async fetchSoccerEvents(): Promise<ParsedPolymarketEvent[]> {
     const eventMap = new Map<string, ParsedPolymarketEvent>();
+    let offset = 0;
+    const limit = 100;
+    const maxPages = 20; // Safety cap: 2000 markets max
+    let pagesScanned = 0;
+    let totalMarketsScanned = 0;
 
-    // Search by tags in parallel
-    const tagResults = await Promise.allSettled(
-      PolymarketGammaService.SOCCER_TAGS.map((tag) =>
-        this.fetchEventsByTag(tag),
-      ),
-    );
-
-    for (const result of tagResults) {
-      if (result.status === 'fulfilled') {
-        for (const event of result.value) {
-          if (!eventMap.has(event.eventId)) {
-            eventMap.set(event.eventId, event);
-          }
-        }
-      }
-    }
-
-    // Also do keyword searches for broader coverage
-    const keywordResults = await Promise.allSettled(
-      PolymarketGammaService.SOCCER_KEYWORDS.slice(0, 4).map((kw) =>
-        this.searchEvents(kw),
-      ),
-    );
-
-    for (const result of keywordResults) {
-      if (result.status === 'fulfilled') {
-        for (const event of result.value) {
-          if (!eventMap.has(event.eventId)) {
-            eventMap.set(event.eventId, event);
-          }
-        }
-      }
-    }
-
-    const events = [...eventMap.values()];
     this.logger.log(
-      `Fetched ${events.length} unique soccer events from Polymarket`,
+      'Scanning Polymarket /markets endpoint for soccer markets (client-side filter)',
     );
 
-    return events;
-  }
-
-  /**
-   * Fetch events by a specific tag.
-   */
-  async fetchEventsByTag(tag: string): Promise<ParsedPolymarketEvent[]> {
-    try {
-      const allEvents: ParsedPolymarketEvent[] = [];
-      let offset = 0;
-      const limit = 100;
-
-      // Paginate through results
-      while (true) {
-        const response = await this.client.get('/events', {
+    while (pagesScanned < maxPages) {
+      try {
+        const response = await this.client.get('/markets', {
           params: {
-            tag,
             active: true,
             closed: false,
             limit,
@@ -198,48 +191,58 @@ export class PolymarketGammaService {
           },
         });
 
-        const rawEvents: GammaEvent[] = response.data ?? [];
-        if (rawEvents.length === 0) break;
+        const rawMarkets: GammaMarket[] = response.data ?? [];
+        if (rawMarkets.length === 0) break;
 
-        const parsed = rawEvents
-          .map((e) => this.parseEvent(e))
-          .filter((e) => e.markets.length > 0);
+        totalMarketsScanned += rawMarkets.length;
 
-        allEvents.push(...parsed);
+        for (const raw of rawMarkets) {
+          if (!this.isSoccerMarket(raw)) continue;
+
+          // Markets from /markets may have nested events[] or be standalone
+          const parentEvent = raw.events?.[0];
+          const eventId = parentEvent?.id ?? raw.id;
+
+          if (!eventMap.has(eventId)) {
+            // Build event from parent if available, or synthesize from market
+            eventMap.set(eventId, this.buildEventFromMarket(raw, parentEvent));
+          } else {
+            // Add this market to the existing event
+            const existing = eventMap.get(eventId)!;
+            const parsed = this.parseMarket(raw);
+            if (
+              parsed &&
+              !existing.markets.find((m) => m.marketId === parsed.marketId)
+            ) {
+              existing.markets.push(parsed);
+              // Update event-level stats
+              existing.liquidity += raw.liquidity ?? 0;
+              existing.volume += raw.volume ?? 0;
+              existing.volume24hr += raw.volume24hr ?? 0;
+            }
+          }
+        }
+
         offset += limit;
+        pagesScanned++;
 
-        // Safety: max 5 pages
-        if (offset >= 500) break;
+        // If we got fewer than limit, we've reached the end
+        if (rawMarkets.length < limit) break;
+      } catch (error) {
+        this.logger.warn(
+          `Failed to fetch markets page at offset ${offset}: ${error.message}`,
+        );
+        break;
       }
-
-      return allEvents;
-    } catch (error) {
-      this.logger.warn(
-        `Failed to fetch events for tag "${tag}": ${error.message}`,
-      );
-      return [];
     }
-  }
 
-  /**
-   * Search events by keyword.
-   */
-  async searchEvents(query: string): Promise<ParsedPolymarketEvent[]> {
-    try {
-      const response = await this.client.get('/public-search', {
-        params: { query, limit: 20 },
-      });
+    const events = [...eventMap.values()];
+    this.logger.log(
+      `Scanned ${totalMarketsScanned} markets across ${pagesScanned} pages → ` +
+        `found ${events.length} soccer events with ${events.reduce((sum, e) => sum + e.markets.length, 0)} markets`,
+    );
 
-      const rawEvents: GammaEvent[] = response.data ?? [];
-      return rawEvents
-        .map((e) => this.parseEvent(e))
-        .filter((e) => e.markets.length > 0);
-    } catch (error) {
-      this.logger.warn(
-        `Failed to search events for "${query}": ${error.message}`,
-      );
-      return [];
-    }
+    return events;
   }
 
   /**
@@ -256,7 +259,86 @@ export class PolymarketGammaService {
     }
   }
 
-  // ─── Private helpers ────────────────────────────────────────────────
+  // ─── Client-side soccer filtering ───────────────────────────────────
+
+  /**
+   * Determine if a raw market from /markets is soccer-related by
+   * checking question, slug, groupItemTitle, and parent event title
+   * against our keyword list.
+   */
+  private isSoccerMarket(raw: GammaMarket): boolean {
+    // Skip inactive or closed
+    if (!raw.active || raw.closed) return false;
+
+    const searchText = [
+      raw.question ?? '',
+      raw.slug ?? '',
+      raw.groupItemTitle ?? '',
+      ...(raw.events ?? []).map((e) => `${e.title ?? ''} ${e.slug ?? ''}`),
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    // Check exclusions first
+    for (const pattern of PolymarketGammaService.EXCLUSION_PATTERNS) {
+      if (pattern.test(searchText)) return false;
+    }
+
+    // Check if any soccer keyword appears in the text
+    for (const keyword of PolymarketGammaService.SOCCER_KEYWORDS) {
+      if (searchText.includes(keyword.toLowerCase())) return true;
+    }
+
+    return false;
+  }
+
+  // ─── Parsing helpers ────────────────────────────────────────────────
+
+  /**
+   * Build a ParsedPolymarketEvent from a /markets response item.
+   * /markets returns individual markets, optionally with parent events[].
+   */
+  private buildEventFromMarket(
+    raw: GammaMarket,
+    parentEvent?: GammaEvent,
+  ): ParsedPolymarketEvent {
+    const parsed = this.parseMarket(raw);
+
+    if (parentEvent) {
+      return {
+        eventId: parentEvent.id,
+        slug: parentEvent.slug,
+        title: parentEvent.title,
+        description: parentEvent.description ?? '',
+        startDate: parentEvent.startDate,
+        endDate: parentEvent.endDate,
+        active: parentEvent.active,
+        closed: parentEvent.closed,
+        liquidity: parentEvent.liquidity ?? raw.liquidity ?? 0,
+        volume: parentEvent.volume ?? raw.volume ?? 0,
+        volume24hr: parentEvent.volume24hr ?? raw.volume24hr ?? 0,
+        tags: parentEvent.tags ?? [],
+        markets: parsed ? [parsed] : [],
+      };
+    }
+
+    // No parent event — synthesize from the market itself
+    return {
+      eventId: raw.id,
+      slug: raw.slug ?? '',
+      title: raw.question ?? '',
+      description: '',
+      startDate: null,
+      endDate: null,
+      active: raw.active,
+      closed: raw.closed,
+      liquidity: raw.liquidity ?? 0,
+      volume: raw.volume ?? 0,
+      volume24hr: raw.volume24hr ?? 0,
+      tags: [],
+      markets: parsed ? [parsed] : [],
+    };
+  }
 
   private parseEvent(raw: GammaEvent): ParsedPolymarketEvent {
     return {
@@ -274,38 +356,52 @@ export class PolymarketGammaService {
       tags: raw.tags ?? [],
       markets: (raw.markets ?? [])
         .filter((m) => m.active && !m.closed)
-        .map((m) => this.parseMarket(m)),
+        .map((m) => this.parseMarket(m))
+        .filter((m): m is ParsedMarket => m !== null),
     };
   }
 
-  private parseMarket(raw: GammaMarket): ParsedMarket {
+  private parseMarket(raw: GammaMarket): ParsedMarket | null {
     let outcomes: string[] = [];
     let outcomePrices: number[] = [];
     let clobTokenIds: string[] = [];
 
     try {
-      outcomes = JSON.parse(raw.outcomes || '[]');
+      outcomes =
+        typeof raw.outcomes === 'string'
+          ? JSON.parse(raw.outcomes || '[]')
+          : (raw.outcomes ?? []);
     } catch {
       outcomes = [];
     }
 
     try {
-      outcomePrices = JSON.parse(raw.outcomePrices || '[]').map(Number);
+      outcomePrices = (
+        typeof raw.outcomePrices === 'string'
+          ? JSON.parse(raw.outcomePrices || '[]')
+          : (raw.outcomePrices ?? [])
+      ).map(Number);
     } catch {
       outcomePrices = [];
     }
 
     try {
-      clobTokenIds = JSON.parse(raw.clobTokenIds || '[]');
+      clobTokenIds =
+        typeof raw.clobTokenIds === 'string'
+          ? JSON.parse(raw.clobTokenIds || '[]')
+          : (raw.clobTokenIds ?? []);
     } catch {
       clobTokenIds = [];
     }
 
+    // Skip markets with no token IDs
+    if (clobTokenIds.length === 0) return null;
+
     return {
       marketId: raw.id,
-      question: raw.question,
+      question: raw.question ?? raw.groupItemTitle ?? '',
       conditionId: raw.conditionId,
-      slug: raw.slug,
+      slug: raw.slug ?? '',
       outcomes,
       outcomePrices,
       clobTokenIds,

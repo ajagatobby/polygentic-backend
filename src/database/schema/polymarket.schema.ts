@@ -12,7 +12,7 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
 import { relations } from 'drizzle-orm';
-import { fixtures } from './fixtures.schema';
+import { fixtures, teams } from './fixtures.schema';
 import { predictions } from './predictions.schema';
 
 // ─── polymarket_markets ────────────────────────────────────────────────
@@ -36,7 +36,7 @@ export const polymarketMarkets = pgTable(
     clobTokenIds: jsonb('clob_token_ids').$type<string[]>().notNull(), // Token IDs for each outcome
 
     // Classification
-    marketType: varchar('market_type', { length: 50 }).notNull(), // 'match_outcome' | 'league_winner' | 'top_4' | 'player_prop' | 'other'
+    marketType: varchar('market_type', { length: 50 }).notNull(), // 'match_outcome' | 'league_winner' | 'tournament_winner' | 'qualification' | 'top_4' | 'player_prop' | 'other'
     tags: jsonb('tags').$type<
       Array<{ id: string; slug: string; label: string }>
     >(),
@@ -60,8 +60,18 @@ export const polymarketMarkets = pgTable(
     startDate: timestamp('start_date'),
     endDate: timestamp('end_date'),
 
-    // Linking to our fixtures (null if not matched yet)
+    // ── Linking to internal data ──────────────────────────────────
+
+    // For match_outcome markets: links to a specific fixture
     fixtureId: integer('fixture_id').references(() => fixtures.id),
+
+    // For outright markets (league_winner, tournament_winner, qualification, top_4)
+    leagueId: integer('league_id'), // API-Football league ID (no FK — no leagues table)
+    leagueName: varchar('league_name', { length: 255 }), // Denormalized league name
+    teamId: integer('team_id').references(() => teams.id), // The team this market is about
+    teamName: varchar('team_name', { length: 255 }), // Denormalized team name
+    season: integer('season'), // Season year (e.g. 2025 for 2025-26)
+
     matchScore: numeric('match_score', { precision: 5, scale: 4 }), // Fuzzy match confidence 0-1
 
     lastSyncedAt: timestamp('last_synced_at').defaultNow(),
@@ -72,6 +82,8 @@ export const polymarketMarkets = pgTable(
     uniqueIndex('uq_polymarket_markets_market_id').on(table.marketId),
     index('idx_polymarket_markets_event').on(table.eventId),
     index('idx_polymarket_markets_fixture').on(table.fixtureId),
+    index('idx_polymarket_markets_league').on(table.leagueId, table.season),
+    index('idx_polymarket_markets_team').on(table.teamId),
     index('idx_polymarket_markets_type').on(table.marketType),
     index('idx_polymarket_markets_active').on(table.active, table.closed),
     index('idx_polymarket_markets_synced').on(table.lastSyncedAt),
@@ -91,7 +103,11 @@ export const polymarketTrades = pgTable(
       .notNull()
       .references(() => polymarketMarkets.id),
     predictionId: integer('prediction_id').references(() => predictions.id),
-    fixtureId: integer('fixture_id').references(() => fixtures.id),
+    fixtureId: integer('fixture_id').references(() => fixtures.id), // For match_outcome trades
+
+    // For outright trades (league_winner, tournament_winner, etc.)
+    leagueId: integer('league_id'), // API-Football league ID
+    teamId: integer('team_id').references(() => teams.id),
 
     // Trade details
     mode: varchar('mode', { length: 20 }).notNull(), // 'paper' | 'live'
@@ -240,6 +256,10 @@ export const polymarketMarketsRelations = relations(
       fields: [polymarketMarkets.fixtureId],
       references: [fixtures.id],
     }),
+    team: one(teams, {
+      fields: [polymarketMarkets.teamId],
+      references: [teams.id],
+    }),
     trades: many(polymarketTrades),
   }),
 );
@@ -258,6 +278,10 @@ export const polymarketTradesRelations = relations(
     fixture: one(fixtures, {
       fields: [polymarketTrades.fixtureId],
       references: [fixtures.id],
+    }),
+    team: one(teams, {
+      fields: [polymarketTrades.teamId],
+      references: [teams.id],
     }),
   }),
 );

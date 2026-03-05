@@ -1,6 +1,6 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { eq, and, isNull, sql, desc, gte, asc } from 'drizzle-orm';
+import { eq, and, isNull, sql, desc } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { PolymarketGammaService } from './services/polymarket-gamma.service';
 import {
@@ -9,25 +9,31 @@ import {
 } from './services/polymarket-clob.service';
 import {
   PolymarketMatcherService,
-  MarketFixtureMatch,
+  MarketMatch,
+  OutrightMarketMatch,
+  FixtureMarketMatch,
 } from './services/polymarket-matcher.service';
 import {
   PolymarketTradingAgent,
   TradingCandidate,
+  OutrightTradingCandidate,
+  FixtureTradingCandidate,
   TradingDecision,
   BankrollContext,
+  TeamStandingsContext,
 } from './services/polymarket-trading.agent';
 
 /**
  * PolymarketService — Orchestrator
  *
  * Runs the full Polymarket trading agent loop:
- * 1. Discover soccer markets on Polymarket (Gamma API)
- * 2. Match markets to internal fixtures
- * 3. Find markets with predictions that show edge
- * 4. Let the trading agent (Claude) evaluate each candidate
- * 5. Log paper trades or execute real trades
- * 6. Track bankroll and P&L
+ * 1. Discover soccer markets on Polymarket (Gamma API, client-side filter)
+ * 2. Match markets to internal leagues/teams (outrights) or fixtures
+ * 3. Enrich with standings data and price snapshots
+ * 4. Estimate probabilities and identify edge
+ * 5. Let the trading agent (Claude) evaluate each candidate
+ * 6. Log paper trades or execute real trades
+ * 7. Track bankroll and P&L
  */
 @Injectable()
 export class PolymarketService {
@@ -45,12 +51,7 @@ export class PolymarketService {
   // ─── Main agent loop ────────────────────────────────────────────────
 
   /**
-   * Run a full scan cycle:
-   * 1. Fetch Polymarket soccer markets
-   * 2. Match to fixtures with predictions
-   * 3. Identify value opportunities
-   * 4. Run trading agent on each candidate
-   * 5. Log trades
+   * Run a full scan cycle.
    */
   async runScanCycle(): Promise<{
     marketsFound: number;
@@ -81,7 +82,7 @@ export class PolymarketService {
       };
     }
 
-    // Step 1: Fetch soccer markets
+    // Step 1: Fetch soccer markets (client-side filtered)
     let events;
     try {
       events = await this.gammaService.fetchSoccerEvents();
@@ -97,17 +98,20 @@ export class PolymarketService {
       };
     }
 
-    // Step 2: Match to fixtures
-    const matches = await this.matcherService.matchEventsToFixtures(events);
+    const totalMarkets = events.reduce((sum, e) => sum + e.markets.length, 0);
+
+    // Step 2: Match to internal data (leagues/teams for outrights, fixtures for match outcomes)
+    const matches = await this.matcherService.matchEvents(events);
 
     // Step 3: Persist markets to DB
     await this.persistMarkets(matches);
 
-    // Step 4: Find candidates with predictions and edge
+    // Step 4: Build trading candidates with pricing + edge
     const candidates = await this.buildTradingCandidates(matches);
 
     this.logger.log(
-      `Scan: ${events.length} events → ${matches.length} matched → ${candidates.length} candidates with edge`,
+      `Scan: ${events.length} events (${totalMarkets} markets) → ` +
+        `${matches.length} matched → ${candidates.length} candidates with edge`,
     );
 
     // Step 5: Evaluate each candidate with the trading agent
@@ -132,7 +136,14 @@ export class PolymarketService {
           // Update open positions for next evaluation
           openPositions.push({
             outcomeName: decision.outcomeName,
-            fixtureId: candidate.match.fixtureId,
+            fixtureId:
+              candidate.type === 'fixture'
+                ? candidate.match.fixtureId
+                : undefined,
+            leagueId:
+              candidate.type === 'outright'
+                ? candidate.match.leagueId
+                : undefined,
             positionSizeUsd: decision.positionSizeUsd,
           });
         } else {
@@ -140,8 +151,12 @@ export class PolymarketService {
           tradesSkipped++;
         }
       } catch (error) {
+        const label =
+          candidate.type === 'outright'
+            ? `${candidate.match.teamName} in ${candidate.match.leagueName}`
+            : `fixture ${(candidate.match as FixtureMarketMatch).fixtureId}`;
         this.logger.error(
-          `Failed to evaluate candidate (fixture ${candidate.match.fixtureId}): ${error.message}`,
+          `Failed to evaluate candidate (${label}): ${error.message}`,
         );
         errors.push(error.message);
       }
@@ -157,7 +172,7 @@ export class PolymarketService {
     );
 
     return {
-      marketsFound: events.length,
+      marketsFound: totalMarkets,
       marketsMatched: matches.length,
       candidatesEvaluated: candidates.length,
       tradesPlaced,
@@ -169,43 +184,21 @@ export class PolymarketService {
   // ─── Candidate building ─────────────────────────────────────────────
 
   /**
-   * Build trading candidates by enriching matched markets with:
-   * - Our prediction data
-   * - CLOB pricing snapshots
-   * - Edge calculations
-   *
-   * Filters out candidates below minimum edge/confidence/liquidity thresholds.
+   * Build trading candidates from matched markets.
+   * Handles both outright and fixture market types.
    */
   private async buildTradingCandidates(
-    matches: MarketFixtureMatch[],
+    matches: MarketMatch[],
   ): Promise<TradingCandidate[]> {
     const minEdge = this.config.get<number>('POLYMARKET_MIN_EDGE') || 0.05;
     const minLiquidity =
       this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') || 1000;
-    const minConfidence =
-      this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
 
     const candidates: TradingCandidate[] = [];
 
     for (const match of matches) {
       // Skip low-liquidity markets
       if (Number(match.event.liquidity) < minLiquidity) continue;
-
-      // Get our prediction for this fixture
-      const [prediction] = await this.db
-        .select()
-        .from(schema.predictions)
-        .where(
-          and(
-            eq(schema.predictions.fixtureId, match.fixtureId),
-            isNull(schema.predictions.resolvedAt),
-          ),
-        )
-        .orderBy(desc(schema.predictions.createdAt))
-        .limit(1);
-
-      if (!prediction) continue;
-      if ((prediction.confidence ?? 0) < minConfidence) continue;
 
       // Check if we already have an open trade for this market
       const existingTrades = await this.db
@@ -228,87 +221,557 @@ export class PolymarketService {
 
       if (existingTrades.length > 0) continue;
 
-      // Get CLOB pricing for the first token (Yes/primary outcome)
-      const primaryTokenId = match.market.clobTokenIds[0];
-      if (!primaryTokenId) continue;
-
-      const pricing =
-        await this.clobService.getMarketPricingSnapshot(primaryTokenId);
-      if (!pricing) continue;
-
-      // Determine which probability maps to this market
-      const { ensembleProb, outcomeDescription } =
-        this.mapPredictionToMarketOutcome(match, prediction);
-
-      if (ensembleProb == null) continue;
-
-      // Calculate edge
-      const polymarketProb = pricing.midpoint;
-      const rawEdge = ensembleProb - polymarketProb;
-
-      // Also check the inverse: maybe betting "No" has edge
-      // (if our probability is much lower than Polymarket's)
-      const inverseEdge = 1 - ensembleProb - (1 - polymarketProb);
-
-      // We want positive edge — either on Yes (rawEdge > 0) or No (inverseEdge > 0)
-      if (rawEdge < minEdge && inverseEdge < minEdge) continue;
-
-      // Get No token pricing if betting No has more edge
-      let pricingNo: MarketPricingSnapshot | undefined;
-      const secondTokenId = match.market.clobTokenIds[1];
-      if (inverseEdge > rawEdge && secondTokenId) {
-        const noSnapshot =
-          await this.clobService.getMarketPricingSnapshot(secondTokenId);
-        if (noSnapshot) pricingNo = noSnapshot;
+      if (match.marketType === 'match_outcome') {
+        const candidate = await this.buildFixtureCandidate(
+          match as FixtureMarketMatch,
+          minEdge,
+        );
+        if (candidate) candidates.push(candidate);
+      } else {
+        const candidate = await this.buildOutrightCandidate(
+          match as OutrightMarketMatch,
+          minEdge,
+        );
+        if (candidate) candidates.push(candidate);
       }
-
-      // Use whichever direction has more edge
-      const bestEdge = Math.max(rawEdge, inverseEdge);
-      const bestPricing =
-        inverseEdge > rawEdge && pricingNo ? pricingNo : pricing;
-      const bestEnsembleProb =
-        inverseEdge > rawEdge ? 1 - ensembleProb : ensembleProb;
-      const bestPolymarketProb =
-        inverseEdge > rawEdge ? 1 - polymarketProb : polymarketProb;
-
-      candidates.push({
-        match,
-        pricing: bestPricing,
-        pricingNo: inverseEdge > rawEdge ? undefined : pricingNo,
-        prediction: {
-          id: prediction.id,
-          homeWinProb: Number(prediction.homeWinProb),
-          drawProb: Number(prediction.drawProb),
-          awayWinProb: Number(prediction.awayWinProb),
-          predictedHomeGoals: Number(prediction.predictedHomeGoals),
-          predictedAwayGoals: Number(prediction.predictedAwayGoals),
-          confidence: prediction.confidence ?? 5,
-          keyFactors: (prediction.keyFactors as string[]) ?? [],
-          riskFactors: (prediction.riskFactors as string[]) ?? [],
-          valueBets: (prediction.valueBets as any[]) ?? [],
-          detailedAnalysis: prediction.detailedAnalysis ?? '',
-        },
-        ensembleProbability: bestEnsembleProb,
-        polymarketProbability: bestPolymarketProb,
-        rawEdge: bestEdge,
-      });
     }
 
-    // Sort by edge descending — evaluate best opportunities first
+    // Sort by edge descending
     candidates.sort((a, b) => b.rawEdge - a.rawEdge);
 
     return candidates;
   }
 
+  // ─── Outright candidate building ────────────────────────────────────
+
   /**
-   * Map our prediction probabilities to the market's outcome.
-   *
-   * Polymarket match outcome markets are typically "Will X beat Y?" (Yes/No).
-   * We need to figure out which of our probabilities (homeWin, draw, awayWin)
-   * corresponds to the market's "Yes" outcome.
+   * Build an outright trading candidate with standings data and probability estimate.
    */
-  private mapPredictionToMarketOutcome(
-    match: MarketFixtureMatch,
+  private async buildOutrightCandidate(
+    match: OutrightMarketMatch,
+    minEdge: number,
+  ): Promise<OutrightTradingCandidate | null> {
+    // Get primary token pricing
+    const primaryTokenId = match.market.clobTokenIds[0];
+    if (!primaryTokenId) return null;
+
+    const pricing =
+      await this.clobService.getMarketPricingSnapshot(primaryTokenId);
+    if (!pricing) return null;
+
+    const polymarketProb = pricing.midpoint;
+
+    // We need the team in our DB to get standings
+    if (!match.teamId) {
+      this.logger.debug(
+        `No teamId for outright: "${match.market.question}" — skipping`,
+      );
+      return null;
+    }
+
+    // Fetch standings for this team
+    const teamStandings = await this.getTeamStandings(
+      match.teamId,
+      match.leagueId,
+      match.season,
+    );
+
+    if (!teamStandings) {
+      this.logger.debug(
+        `No standings data for ${match.teamName} in league ${match.leagueId} — skipping`,
+      );
+      return null;
+    }
+
+    // Fetch top competitors for context
+    const topCompetitors = await this.getTopCompetitors(
+      match.leagueId,
+      match.season,
+      match.teamId,
+    );
+
+    // Estimate probability from standings
+    const estimatedProb = this.estimateOutrightProbability(
+      match,
+      teamStandings,
+      topCompetitors,
+    );
+
+    // Calculate edge
+    const rawEdge = estimatedProb - polymarketProb;
+
+    // Also check inverse (bet No / against this team)
+    const inverseEdge = 1 - estimatedProb - (1 - polymarketProb);
+
+    if (rawEdge < minEdge && inverseEdge < minEdge) return null;
+
+    // Use whichever direction has more edge
+    const bestEdge = Math.max(rawEdge, inverseEdge);
+    const bestProb = inverseEdge > rawEdge ? 1 - estimatedProb : estimatedProb;
+    const bestPolymarketProb =
+      inverseEdge > rawEdge ? 1 - polymarketProb : polymarketProb;
+
+    // If betting No, get No token pricing
+    let finalPricing = pricing;
+    if (inverseEdge > rawEdge) {
+      const noTokenId = match.market.clobTokenIds[1];
+      if (noTokenId) {
+        const noPricing =
+          await this.clobService.getMarketPricingSnapshot(noTokenId);
+        if (noPricing) finalPricing = noPricing;
+      }
+    }
+
+    return {
+      type: 'outright',
+      match,
+      pricing: finalPricing,
+      estimatedProbability: bestProb,
+      polymarketProbability: bestPolymarketProb,
+      rawEdge: bestEdge,
+      teamStandings,
+      topCompetitors,
+    };
+  }
+
+  /**
+   * Get team standings from team_form table.
+   */
+  private async getTeamStandings(
+    teamId: number,
+    leagueId: number,
+    season: number,
+  ): Promise<TeamStandingsContext | null> {
+    const [form] = await this.db
+      .select()
+      .from(schema.teamForm)
+      .where(
+        and(
+          eq(schema.teamForm.teamId, teamId),
+          eq(schema.teamForm.leagueId, leagueId),
+          eq(schema.teamForm.season, season),
+        ),
+      )
+      .limit(1);
+
+    if (!form) return null;
+
+    // Calculate games played
+    const homeGames =
+      (form.homeWins ?? 0) + (form.homeDraws ?? 0) + (form.homeLosses ?? 0);
+    const awayGames =
+      (form.awayWins ?? 0) + (form.awayDraws ?? 0) + (form.awayLosses ?? 0);
+    const gamesPlayed = homeGames + awayGames;
+
+    // Get the leader's points
+    const [leader] = await this.db
+      .select({ points: schema.teamForm.points })
+      .from(schema.teamForm)
+      .where(
+        and(
+          eq(schema.teamForm.leagueId, leagueId),
+          eq(schema.teamForm.season, season),
+        ),
+      )
+      .orderBy(desc(schema.teamForm.points))
+      .limit(1);
+
+    const leaderPoints = leader?.points ?? form.points ?? 0;
+
+    // Count total teams in the league
+    const teamsInLeague = await this.db
+      .select({ count: sql<number>`count(*)` })
+      .from(schema.teamForm)
+      .where(
+        and(
+          eq(schema.teamForm.leagueId, leagueId),
+          eq(schema.teamForm.season, season),
+        ),
+      );
+    const totalTeams = Number(teamsInLeague[0]?.count ?? 20);
+
+    // Estimate total games in the season (each team plays others twice in most leagues)
+    const totalGamesEstimate = (totalTeams - 1) * 2;
+    const gamesRemaining = Math.max(0, totalGamesEstimate - gamesPlayed);
+
+    return {
+      leaguePosition: form.leaguePosition ?? 99,
+      totalTeams,
+      points: form.points ?? 0,
+      pointsFromTop: Math.max(0, leaderPoints - (form.points ?? 0)),
+      formString: form.formString ?? '',
+      last5: {
+        wins: form.last5Wins ?? 0,
+        draws: form.last5Draws ?? 0,
+        losses: form.last5Losses ?? 0,
+        goalsFor: form.last5GoalsFor ?? 0,
+        goalsAgainst: form.last5GoalsAgainst ?? 0,
+      },
+      home: {
+        wins: form.homeWins ?? 0,
+        draws: form.homeDraws ?? 0,
+        losses: form.homeLosses ?? 0,
+      },
+      away: {
+        wins: form.awayWins ?? 0,
+        draws: form.awayDraws ?? 0,
+        losses: form.awayLosses ?? 0,
+      },
+      goalsForAvg: Number(form.goalsForAvg ?? 0),
+      goalsAgainstAvg: Number(form.goalsAgainstAvg ?? 0),
+      attackRating: Number(form.attackRating ?? 50),
+      defenseRating: Number(form.defenseRating ?? 50),
+      gamesPlayed,
+      gamesRemaining,
+    };
+  }
+
+  /**
+   * Get top competitors' standings for a league (excluding the target team).
+   */
+  private async getTopCompetitors(
+    leagueId: number,
+    season: number,
+    excludeTeamId: number,
+  ): Promise<
+    Array<{
+      teamName: string;
+      position: number;
+      points: number;
+      formString: string;
+    }>
+  > {
+    const rows = await this.db
+      .select({
+        teamId: schema.teamForm.teamId,
+        position: schema.teamForm.leaguePosition,
+        points: schema.teamForm.points,
+        formString: schema.teamForm.formString,
+      })
+      .from(schema.teamForm)
+      .where(
+        and(
+          eq(schema.teamForm.leagueId, leagueId),
+          eq(schema.teamForm.season, season),
+        ),
+      )
+      .orderBy(desc(schema.teamForm.points))
+      .limit(10);
+
+    // Fetch team names
+    const teamIds = rows
+      .filter((r: any) => r.teamId !== excludeTeamId)
+      .map((r: any) => r.teamId);
+
+    if (teamIds.length === 0) return [];
+
+    const teamRows = await this.db
+      .select({ id: schema.teams.id, name: schema.teams.name })
+      .from(schema.teams)
+      .where(
+        sql`${schema.teams.id} IN (${sql.join(
+          teamIds.map((id: number) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+
+    const teamNameMap = new Map<number, string>();
+    for (const t of teamRows) {
+      teamNameMap.set(t.id, t.name);
+    }
+
+    return rows
+      .filter((r: any) => r.teamId !== excludeTeamId)
+      .map((r: any) => ({
+        teamName: teamNameMap.get(r.teamId) ?? `Team ${r.teamId}`,
+        position: r.position ?? 99,
+        points: r.points ?? 0,
+        formString: r.formString ?? '',
+      }))
+      .slice(0, 5);
+  }
+
+  /**
+   * Estimate the probability of an outright outcome from standings data.
+   *
+   * This is a heuristic model — not a sophisticated one. It provides a
+   * reasonable starting point that Claude will refine during evaluation.
+   *
+   * The model considers:
+   * - Current league position and points
+   * - Points gap to leader / to competitors
+   * - Season stage (games remaining)
+   * - Form quality
+   */
+  private estimateOutrightProbability(
+    match: OutrightMarketMatch,
+    standings: TeamStandingsContext,
+    competitors: Array<{
+      teamName: string;
+      position: number;
+      points: number;
+      formString: string;
+    }>,
+  ): number {
+    const { marketType } = match;
+
+    if (marketType === 'league_winner' || marketType === 'tournament_winner') {
+      return this.estimateWinnerProbability(standings, competitors);
+    }
+
+    if (marketType === 'qualification') {
+      return this.estimateQualificationProbability(standings);
+    }
+
+    if (marketType === 'top_4') {
+      return this.estimateTop4Probability(standings);
+    }
+
+    return 0.1; // Default low probability for unknown types
+  }
+
+  /**
+   * Estimate probability of winning the league/tournament.
+   */
+  private estimateWinnerProbability(
+    standings: TeamStandingsContext,
+    competitors: Array<{
+      teamName: string;
+      position: number;
+      points: number;
+      formString: string;
+    }>,
+  ): number {
+    const {
+      leaguePosition,
+      totalTeams,
+      pointsFromTop,
+      gamesPlayed,
+      gamesRemaining,
+    } = standings;
+
+    // Base rate: 1/N where N = total teams
+    let prob = 1 / totalTeams;
+
+    // Early season (< 25% of games played) — revert more to base rate
+    const seasonProgress = gamesPlayed / (gamesPlayed + gamesRemaining);
+
+    if (seasonProgress < 0.1) {
+      // Very early — almost pure base rate with slight position adjustment
+      prob =
+        (1 / totalTeams) * (1 + (totalTeams - leaguePosition) / totalTeams);
+      return Math.max(0.01, Math.min(0.5, prob));
+    }
+
+    // Points per game for the team
+    const ppg = gamesPlayed > 0 ? standings.points / gamesPlayed : 0;
+
+    // Max possible points
+    const maxPossiblePoints = standings.points + gamesRemaining * 3;
+
+    // Leader's projected points (simple projection)
+    const leaderPoints = standings.points + pointsFromTop;
+    const leaderPpg = gamesPlayed > 0 ? leaderPoints / gamesPlayed : 0;
+    const leaderProjected = leaderPoints + gamesRemaining * leaderPpg;
+
+    if (leaguePosition === 1) {
+      // Currently leading
+      if (gamesRemaining === 0) return 1.0; // Season over, they won
+      if (seasonProgress > 0.75) {
+        // Late season leader — strong probability
+        // Points gap matters more
+        const gapPerGame =
+          pointsFromTop === 0 && competitors.length > 0
+            ? (standings.points - competitors[0].points) / gamesRemaining
+            : 0;
+
+        if (standings.points > (competitors[0]?.points ?? 0)) {
+          const gap = standings.points - (competitors[0]?.points ?? 0);
+          // If gap > remaining games * 3, it's mathematically certain
+          if (gap > gamesRemaining * 3) return 0.99;
+          // Rough heuristic: probability increases with gap relative to remaining points
+          prob = 0.5 + (gap / (gamesRemaining * 3)) * 0.45;
+        } else {
+          prob = 0.4; // Leading on GD or tiebreaker
+        }
+      } else if (seasonProgress > 0.5) {
+        // Midseason leader — historically ~60-75% chance
+        prob = 0.55 + (seasonProgress - 0.5) * 0.4;
+      } else {
+        // Early-ish leader
+        prob = 0.3 + seasonProgress * 0.3;
+      }
+    } else {
+      // Not leading
+      if (maxPossiblePoints < leaderProjected * 0.9) {
+        // Mathematically very difficult
+        prob = Math.max(0.01, 0.05 * (1 - seasonProgress));
+      } else {
+        // Still in contention
+        const positionFactor = Math.max(0, 1 - (leaguePosition - 1) / 5);
+        const gapFactor = Math.max(
+          0,
+          1 - pointsFromTop / (gamesRemaining * 3 + 1),
+        );
+        const formFactor = this.formQuality(standings.formString);
+
+        prob = positionFactor * 0.3 + gapFactor * 0.4 + formFactor * 0.3;
+        prob *= 1 - seasonProgress * 0.3; // Discount more as season progresses (harder to catch up)
+
+        // Cap at reasonable levels
+        prob = Math.max(0.01, Math.min(0.4, prob));
+      }
+    }
+
+    return Math.max(0.01, Math.min(0.99, prob));
+  }
+
+  /**
+   * Estimate probability of qualifying (e.g., for World Cup).
+   */
+  private estimateQualificationProbability(
+    standings: TeamStandingsContext,
+  ): number {
+    // Qualification typically means finishing in top N positions
+    // For European WC qualifiers: top 2 in group + some 3rd-place playoff
+    const qualifyingPositions = Math.ceil(standings.totalTeams * 0.4); // ~40% qualify
+
+    if (standings.leaguePosition <= qualifyingPositions) {
+      // Currently in a qualifying position
+      const buffer = qualifyingPositions - standings.leaguePosition;
+      return Math.min(0.95, 0.6 + buffer * 0.1);
+    } else {
+      // Outside qualifying positions
+      const deficit = standings.leaguePosition - qualifyingPositions;
+      return Math.max(0.05, 0.4 - deficit * 0.1);
+    }
+  }
+
+  /**
+   * Estimate probability of finishing in top 4.
+   */
+  private estimateTop4Probability(standings: TeamStandingsContext): number {
+    if (standings.leaguePosition <= 4) {
+      const buffer = 4 - standings.leaguePosition;
+      return Math.min(0.95, 0.55 + buffer * 0.1);
+    } else {
+      const deficit = standings.leaguePosition - 4;
+      return Math.max(0.05, 0.4 - deficit * 0.08);
+    }
+  }
+
+  /**
+   * Calculate form quality from a form string like "WWDLW".
+   * Returns 0-1 where 1 = all wins.
+   */
+  private formQuality(formString: string): number {
+    if (!formString) return 0.5;
+    let score = 0;
+    let count = 0;
+    for (const ch of formString.toUpperCase()) {
+      if (ch === 'W') {
+        score += 1;
+        count++;
+      } else if (ch === 'D') {
+        score += 0.33;
+        count++;
+      } else if (ch === 'L') {
+        count++;
+      }
+    }
+    return count > 0 ? score / count : 0.5;
+  }
+
+  // ─── Fixture candidate building (kept for match_outcome markets) ────
+
+  private async buildFixtureCandidate(
+    match: FixtureMarketMatch,
+    minEdge: number,
+  ): Promise<FixtureTradingCandidate | null> {
+    const minConfidence =
+      this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
+
+    // Get our prediction for this fixture
+    const [prediction] = await this.db
+      .select()
+      .from(schema.predictions)
+      .where(
+        and(
+          eq(schema.predictions.fixtureId, match.fixtureId),
+          isNull(schema.predictions.resolvedAt),
+        ),
+      )
+      .orderBy(desc(schema.predictions.createdAt))
+      .limit(1);
+
+    if (!prediction) return null;
+    if ((prediction.confidence ?? 0) < minConfidence) return null;
+
+    const primaryTokenId = match.market.clobTokenIds[0];
+    if (!primaryTokenId) return null;
+
+    const pricing =
+      await this.clobService.getMarketPricingSnapshot(primaryTokenId);
+    if (!pricing) return null;
+
+    // Map prediction to market outcome
+    const { ensembleProb, outcomeDescription } =
+      this.mapFixturePredictionToOutcome(match, prediction);
+
+    if (ensembleProb == null) return null;
+
+    const polymarketProb = pricing.midpoint;
+    const rawEdge = ensembleProb - polymarketProb;
+    const inverseEdge = 1 - ensembleProb - (1 - polymarketProb);
+
+    if (rawEdge < minEdge && inverseEdge < minEdge) return null;
+
+    let pricingNo: MarketPricingSnapshot | undefined;
+    const secondTokenId = match.market.clobTokenIds[1];
+    if (inverseEdge > rawEdge && secondTokenId) {
+      const noSnapshot =
+        await this.clobService.getMarketPricingSnapshot(secondTokenId);
+      if (noSnapshot) pricingNo = noSnapshot;
+    }
+
+    const bestEdge = Math.max(rawEdge, inverseEdge);
+    const bestPricing =
+      inverseEdge > rawEdge && pricingNo ? pricingNo : pricing;
+    const bestEnsembleProb =
+      inverseEdge > rawEdge ? 1 - ensembleProb : ensembleProb;
+    const bestPolymarketProb =
+      inverseEdge > rawEdge ? 1 - polymarketProb : polymarketProb;
+
+    return {
+      type: 'fixture',
+      match,
+      pricing: bestPricing,
+      pricingNo: inverseEdge > rawEdge ? undefined : pricingNo,
+      prediction: {
+        id: prediction.id,
+        homeWinProb: Number(prediction.homeWinProb),
+        drawProb: Number(prediction.drawProb),
+        awayWinProb: Number(prediction.awayWinProb),
+        predictedHomeGoals: Number(prediction.predictedHomeGoals),
+        predictedAwayGoals: Number(prediction.predictedAwayGoals),
+        confidence: prediction.confidence ?? 5,
+        keyFactors: (prediction.keyFactors as string[]) ?? [],
+        riskFactors: (prediction.riskFactors as string[]) ?? [],
+        valueBets: (prediction.valueBets as any[]) ?? [],
+        detailedAnalysis: prediction.detailedAnalysis ?? '',
+      },
+      ensembleProbability: bestEnsembleProb,
+      polymarketProbability: bestPolymarketProb,
+      rawEdge: bestEdge,
+    };
+  }
+
+  /**
+   * Map fixture prediction probabilities to the market's outcome.
+   * (Same logic as before — for "Will X beat Y?" markets)
+   */
+  private mapFixturePredictionToOutcome(
+    match: FixtureMarketMatch,
     prediction: any,
   ): { ensembleProb: number | null; outcomeDescription: string } {
     const question = match.market.question.toLowerCase();
@@ -318,7 +781,6 @@ export class PolymarketService {
     const homeTeamNorm = match.homeTeamName.toLowerCase();
     const awayTeamNorm = match.awayTeamName.toLowerCase();
 
-    // Check if the market is about the home team winning
     if (
       text.includes(homeTeamNorm) &&
       (text.includes('beat') || text.includes('win') || text.includes('defeat'))
@@ -327,7 +789,6 @@ export class PolymarketService {
         text.includes(awayTeamNorm) &&
         text.indexOf(homeTeamNorm) < text.indexOf(awayTeamNorm)
       ) {
-        // "Will [Home] beat [Away]?" → Yes = Home Win
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
@@ -335,7 +796,6 @@ export class PolymarketService {
       }
     }
 
-    // Check if the market is about the away team winning
     if (
       text.includes(awayTeamNorm) &&
       (text.includes('beat') || text.includes('win') || text.includes('defeat'))
@@ -344,7 +804,6 @@ export class PolymarketService {
         text.includes(homeTeamNorm) &&
         text.indexOf(awayTeamNorm) < text.indexOf(homeTeamNorm)
       ) {
-        // "Will [Away] beat [Home]?" → Yes = Away Win
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
@@ -352,11 +811,8 @@ export class PolymarketService {
       }
     }
 
-    // Generic: if event title contains both team names, try to match from outcomes
     const outcomes = match.market.outcomes.map((o) => o.toLowerCase());
     if (outcomes.includes('yes') && outcomes.includes('no')) {
-      // Binary market — need to figure out what "Yes" means from context
-      // Check if home team is the subject
       if (text.includes(homeTeamNorm) && !text.includes(awayTeamNorm)) {
         return {
           ensembleProb: Number(prediction.homeWinProb),
@@ -371,8 +827,6 @@ export class PolymarketService {
       }
     }
 
-    // Multi-outcome market (rare on Polymarket for soccer)
-    // Try to match outcome names to teams
     for (let i = 0; i < outcomes.length; i++) {
       if (outcomes[i].includes(homeTeamNorm)) {
         return {
@@ -388,7 +842,6 @@ export class PolymarketService {
       }
     }
 
-    // Couldn't determine mapping
     this.logger.warn(
       `Could not map prediction to market outcome: "${match.market.question}"`,
     );
@@ -398,7 +851,7 @@ export class PolymarketService {
   // ─── Trade execution ────────────────────────────────────────────────
 
   /**
-   * Execute a trade — either paper or live depending on config.
+   * Execute a trade — either paper or live.
    */
   private async executeTrade(
     candidate: TradingCandidate,
@@ -409,13 +862,11 @@ export class PolymarketService {
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
     const mode = isLive ? 'live' : 'paper';
 
-    // Find or create the market record
     const marketRecord = await this.getOrCreateMarketRecord(candidate.match);
 
     let orderId: string | null = null;
-    let orderStatus = 'filled'; // Paper trades are instantly "filled"
+    let orderStatus = 'filled';
 
-    // Place real order if live trading
     if (isLive) {
       const tokenId =
         candidate.match.market.clobTokenIds[decision.outcomeIndex];
@@ -443,13 +894,22 @@ export class PolymarketService {
       orderStatus = result.status;
     }
 
-    // Record the trade
     const tokenQuantity = decision.positionSizeUsd / decision.entryPrice;
 
-    await this.db.insert(schema.polymarketTrades).values({
+    // Determine ensemble probability based on candidate type
+    const ensembleProbability =
+      candidate.type === 'outright'
+        ? candidate.estimatedProbability
+        : candidate.ensembleProbability;
+    const polymarketProbability = candidate.polymarketProbability;
+
+    // Build trade record values
+    const tradeValues: any = {
       polymarketMarketId: marketRecord.id,
-      predictionId: candidate.prediction.id,
-      fixtureId: candidate.match.fixtureId,
+      fixtureId:
+        candidate.type === 'fixture' ? candidate.match.fixtureId : null,
+      leagueId: candidate.type === 'outright' ? candidate.match.leagueId : null,
+      teamId: candidate.type === 'outright' ? candidate.match.teamId : null,
       mode,
       side: 'buy',
       outcomeIndex: decision.outcomeIndex,
@@ -459,11 +919,14 @@ export class PolymarketService {
       spreadAtEntry: String(candidate.pricing.spread),
       positionSizeUsd: String(decision.positionSizeUsd),
       tokenQuantity: String(tokenQuantity),
-      ensembleProbability: String(candidate.ensembleProbability),
-      polymarketProbability: String(candidate.polymarketProbability),
+      ensembleProbability: String(ensembleProbability),
+      polymarketProbability: String(polymarketProbability),
       edgePercent: String(decision.edgePercent),
       kellyFraction: String(decision.kellyFraction),
-      confidenceAtEntry: candidate.prediction.confidence,
+      confidenceAtEntry:
+        candidate.type === 'fixture'
+          ? candidate.prediction.confidence
+          : decision.confidenceInEdge,
       agentReasoning: decision.reasoning,
       riskAssessment: decision.riskAssessment,
       bankrollAtEntry: String(Number(bankroll.currentBalance)),
@@ -472,10 +935,17 @@ export class PolymarketService {
       orderStatus,
       fillPrice: isLive ? null : String(decision.entryPrice),
       fillTimestamp: isLive ? null : new Date(),
-      status: isLive ? 'open' : 'open',
+      status: 'open',
       createdAt: new Date(),
       updatedAt: new Date(),
-    });
+    };
+
+    // Add predictionId only for fixture trades
+    if (candidate.type === 'fixture') {
+      tradeValues.predictionId = candidate.prediction.id;
+    }
+
+    await this.db.insert(schema.polymarketTrades).values(tradeValues);
 
     // Update bankroll
     const newBalance =
@@ -492,38 +962,71 @@ export class PolymarketService {
       })
       .where(eq(schema.polymarketBankroll.id, bankroll.id));
 
+    const label =
+      candidate.type === 'outright'
+        ? `${candidate.match.teamName} to win ${candidate.match.leagueName}`
+        : `${decision.outcomeName}`;
+
     this.logger.log(
-      `[${mode.toUpperCase()}] Trade placed: ${decision.outcomeName} ` +
+      `[${mode.toUpperCase()}] Trade placed: ${label} ` +
         `$${decision.positionSizeUsd.toFixed(2)} @ ${decision.entryPrice.toFixed(3)} ` +
         `(edge: ${decision.edgePercent.toFixed(1)}%, Kelly: ${decision.kellyFraction.toFixed(3)})`,
     );
   }
 
-  /**
-   * Log a trade that was evaluated but skipped.
-   * We don't persist skips to the DB — just log for observability.
-   */
   private async logSkippedTrade(
     candidate: TradingCandidate,
     decision: TradingDecision,
   ): Promise<void> {
+    const label =
+      candidate.type === 'outright'
+        ? `${candidate.match.teamName} in ${candidate.match.leagueName}`
+        : `${(candidate.match as FixtureMarketMatch).homeTeamName} vs ${(candidate.match as FixtureMarketMatch).awayTeamName}`;
+
     this.logger.debug(
-      `SKIP: ${candidate.match.homeTeamName} vs ${candidate.match.awayTeamName} ` +
-        `(edge: ${(candidate.rawEdge * 100).toFixed(1)}%) — ${decision.reasoning.substring(0, 200)}`,
+      `SKIP: ${label} (edge: ${(candidate.rawEdge * 100).toFixed(1)}%) — ${decision.reasoning.substring(0, 200)}`,
     );
   }
 
   // ─── Trade resolution ───────────────────────────────────────────────
 
   /**
-   * Resolve open trades for finished matches.
-   * Called after fixtures are synced and predictions resolved.
+   * Resolve open trades.
+   * - Fixture trades: Resolved when the match finishes
+   * - Outright trades: Resolved when the market closes on Polymarket
+   *   (we check the Gamma API for closed markets)
    */
   async resolveCompletedTrades(): Promise<{
     resolved: number;
     errors: string[];
   }> {
-    // Find open trades where the fixture is finished
+    let resolved = 0;
+    const errors: string[] = [];
+
+    // Resolve fixture-based trades (match finished)
+    const fixtureResult = await this.resolveFixtureTrades();
+    resolved += fixtureResult.resolved;
+    errors.push(...fixtureResult.errors);
+
+    // Resolve outright trades (market closed on Polymarket)
+    const outrightResult = await this.resolveOutrightTrades();
+    resolved += outrightResult.resolved;
+    errors.push(...outrightResult.errors);
+
+    if (resolved > 0) {
+      await this.updateBankrollSnapshot();
+    }
+
+    return { resolved, errors };
+  }
+
+  /**
+   * Resolve fixture-based trades where the match has finished.
+   */
+  private async resolveFixtureTrades(): Promise<{
+    resolved: number;
+    errors: string[];
+  }> {
     const openTrades = await this.db
       .select({
         trade: schema.polymarketTrades,
@@ -543,6 +1046,7 @@ export class PolymarketService {
         and(
           eq(schema.polymarketTrades.status, 'open'),
           eq(schema.fixtures.status, 'FT'),
+          sql`${schema.polymarketTrades.fixtureId} IS NOT NULL`,
         ),
       );
 
@@ -551,7 +1055,6 @@ export class PolymarketService {
 
     for (const { trade, fixture, prediction } of openTrades) {
       try {
-        // Determine actual result
         const homeGoals = fixture.goalsHome ?? 0;
         const awayGoals = fixture.goalsAway ?? 0;
         let actualResult: string;
@@ -559,32 +1062,13 @@ export class PolymarketService {
         else if (awayGoals > homeGoals) actualResult = 'away_win';
         else actualResult = 'draw';
 
-        // Determine if the trade's outcome won
-        const outcomeName = trade.outcomeName?.toLowerCase() ?? '';
-        let tradeWon = false;
+        const tradeWon = this.didFixtureTradeWin(
+          trade,
+          fixture,
+          prediction,
+          actualResult,
+        );
 
-        if (
-          outcomeName.includes('home') ||
-          outcomeName.includes((fixture.homeTeamId ? 'team' : '').toLowerCase())
-        ) {
-          tradeWon = actualResult === 'home_win';
-        } else if (
-          outcomeName.includes('away') ||
-          outcomeName.includes((fixture.awayTeamId ? 'team' : '').toLowerCase())
-        ) {
-          tradeWon = actualResult === 'away_win';
-        } else if (outcomeName.includes('draw')) {
-          tradeWon = actualResult === 'draw';
-        } else {
-          // Try to match using the prediction's actual result
-          if (prediction?.actualResult) {
-            // For "Yes/No" markets about a specific team winning
-            // If we bet Yes on "Will X beat Y" and X won
-            tradeWon = this.didTradeWin(trade, fixture, prediction);
-          }
-        }
-
-        // Calculate P&L
         const exitPrice = tradeWon ? 1.0 : 0.0;
         const entryPrice = Number(trade.entryPrice);
         const positionSize = Number(trade.positionSizeUsd);
@@ -592,7 +1076,7 @@ export class PolymarketService {
           Number(trade.tokenQuantity) || positionSize / entryPrice;
         const pnlUsd = tradeWon
           ? tokenQty * (exitPrice - entryPrice)
-          : -positionSize; // Lost the entire position
+          : -positionSize;
         const pnlPercent = positionSize > 0 ? pnlUsd / positionSize : 0;
 
         await this.db
@@ -609,70 +1093,154 @@ export class PolymarketService {
           .where(eq(schema.polymarketTrades.id, trade.id));
 
         resolved++;
-
         this.logger.log(
-          `Trade resolved: ${trade.outcomeName} — ${tradeWon ? 'WIN' : 'LOSS'} ` +
-            `P&L: $${pnlUsd.toFixed(2)} (${(pnlPercent * 100).toFixed(1)}%)`,
+          `Fixture trade resolved: ${trade.outcomeName} — ${tradeWon ? 'WIN' : 'LOSS'} P&L: $${pnlUsd.toFixed(2)}`,
         );
       } catch (error) {
         errors.push(`Failed to resolve trade ${trade.id}: ${error.message}`);
       }
     }
 
-    // Update bankroll after resolutions
-    if (resolved > 0) {
-      await this.updateBankrollSnapshot();
+    return { resolved, errors };
+  }
+
+  /**
+   * Resolve outright trades by checking if the Polymarket market has closed.
+   */
+  private async resolveOutrightTrades(): Promise<{
+    resolved: number;
+    errors: string[];
+  }> {
+    // Find open outright trades
+    const openTrades = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
+      .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
+      .where(
+        and(
+          eq(schema.polymarketTrades.status, 'open'),
+          sql`${schema.polymarketTrades.fixtureId} IS NULL`, // Outright trades have no fixture
+          sql`${schema.polymarketTrades.leagueId} IS NOT NULL`, // But they have a league
+        ),
+      );
+
+    let resolved = 0;
+    const errors: string[] = [];
+
+    for (const { trade, market } of openTrades) {
+      try {
+        // Check if the market has closed by re-fetching from Gamma
+        const freshEvent = await this.gammaService.fetchEventById(
+          market.eventId,
+        );
+        if (!freshEvent) continue;
+
+        // Find the specific market
+        const freshMarket = freshEvent.markets.find(
+          (m) => m.marketId === market.marketId,
+        );
+
+        // Market might have been removed from active markets list
+        // or the event itself is closed
+        if (!freshMarket || freshEvent.closed) {
+          // Check outcome prices — if one outcome is at $1 and other at $0, it's resolved
+          const prices =
+            freshMarket?.outcomePrices ??
+            (market.outcomePrices as string[])?.map(Number) ??
+            [];
+
+          let resolvedOutcome: number | null = null;
+          for (let i = 0; i < prices.length; i++) {
+            if (Number(prices[i]) >= 0.99) resolvedOutcome = i;
+          }
+
+          if (resolvedOutcome !== null) {
+            const tradeWon = trade.outcomeIndex === resolvedOutcome;
+            const exitPrice = tradeWon ? 1.0 : 0.0;
+            const entryPrice = Number(trade.entryPrice);
+            const positionSize = Number(trade.positionSizeUsd);
+            const tokenQty =
+              Number(trade.tokenQuantity) || positionSize / entryPrice;
+            const pnlUsd = tradeWon
+              ? tokenQty * (exitPrice - entryPrice)
+              : -positionSize;
+            const pnlPercent = positionSize > 0 ? pnlUsd / positionSize : 0;
+
+            await this.db
+              .update(schema.polymarketTrades)
+              .set({
+                exitPrice: String(exitPrice),
+                pnlUsd: String(pnlUsd),
+                pnlPercent: String(pnlPercent),
+                resolvedAt: new Date(),
+                resolutionOutcome: tradeWon ? 'win' : 'loss',
+                status: 'resolved',
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.polymarketTrades.id, trade.id));
+
+            resolved++;
+            this.logger.log(
+              `Outright trade resolved: ${trade.outcomeName} — ${tradeWon ? 'WIN' : 'LOSS'} P&L: $${pnlUsd.toFixed(2)}`,
+            );
+          }
+        }
+      } catch (error) {
+        errors.push(
+          `Failed to resolve outright trade ${trade.id}: ${error.message}`,
+        );
+      }
     }
 
     return { resolved, errors };
   }
 
-  /**
-   * Determine if a trade won based on fixture result.
-   * Handles binary Yes/No markets about specific team outcomes.
-   */
-  private didTradeWin(trade: any, fixture: any, prediction: any): boolean {
-    const actualResult = prediction.actualResult;
-    const outcomeName = (trade.outcomeName ?? '').toLowerCase();
+  private didFixtureTradeWin(
+    trade: any,
+    fixture: any,
+    prediction: any,
+    actualResult: string,
+  ): boolean {
+    const outcomeName = trade.outcomeName?.toLowerCase() ?? '';
     const outcomeIndex = trade.outcomeIndex ?? 0;
 
-    // If outcome name clearly indicates a team
-    if (outcomeName.includes('yes')) {
-      // "Yes" in a "Will X beat Y?" market — need to check what X is
-      // Use the edge direction: if ensemble > polymarket, we bet Yes believing X wins
-      const ensembleProb = Number(trade.ensembleProbability);
-      const homeWinProb = Number(prediction.homeWinProb);
+    if (outcomeName.includes('home')) return actualResult === 'home_win';
+    if (outcomeName.includes('away')) return actualResult === 'away_win';
+    if (outcomeName.includes('draw')) return actualResult === 'draw';
 
-      // If our ensemble probability is close to homeWinProb, we were betting on home win
-      if (Math.abs(ensembleProb - homeWinProb) < 0.1) {
+    if (outcomeName.includes('yes')) {
+      const ensembleProb = Number(trade.ensembleProbability);
+      const homeWinProb = Number(prediction?.homeWinProb ?? 0);
+      if (Math.abs(ensembleProb - homeWinProb) < 0.1)
         return actualResult === 'home_win';
-      }
-      const awayWinProb = Number(prediction.awayWinProb);
-      if (Math.abs(ensembleProb - awayWinProb) < 0.1) {
+      const awayWinProb = Number(prediction?.awayWinProb ?? 0);
+      if (Math.abs(ensembleProb - awayWinProb) < 0.1)
         return actualResult === 'away_win';
-      }
     }
 
     if (outcomeName.includes('no')) {
-      // Inverse — we bet against the market's proposition
       const ensembleProb = Number(trade.ensembleProbability);
-      const homeWinProb = Number(prediction.homeWinProb);
-      if (Math.abs(1 - ensembleProb - homeWinProb) < 0.1) {
+      const homeWinProb = Number(prediction?.homeWinProb ?? 0);
+      if (Math.abs(1 - ensembleProb - homeWinProb) < 0.1)
         return actualResult !== 'home_win';
-      }
     }
 
-    // Fallback: assume outcomeIndex 0 = Yes = the proposition holds
     return outcomeIndex === 0
-      ? prediction.wasCorrect === true
-      : prediction.wasCorrect === false;
+      ? prediction?.wasCorrect === true
+      : prediction?.wasCorrect === false;
   }
 
   // ─── Bankroll management ────────────────────────────────────────────
 
-  /**
-   * Get or create the bankroll record.
-   */
   async getOrCreateBankroll(): Promise<any> {
     const isLive =
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
@@ -687,7 +1255,6 @@ export class PolymarketService {
 
     if (existing.length > 0) return existing[0];
 
-    // Create initial bankroll
     const budget = this.config.get<number>('POLYMARKET_BUDGET') || 500;
 
     const [created] = await this.db
@@ -719,9 +1286,6 @@ export class PolymarketService {
     return created;
   }
 
-  /**
-   * Build a BankrollContext object for the trading agent.
-   */
   async buildBankrollContext(): Promise<BankrollContext> {
     const bankroll = await this.getOrCreateBankroll();
     const targetMultiplier =
@@ -742,15 +1306,11 @@ export class PolymarketService {
     };
   }
 
-  /**
-   * Update the bankroll snapshot after trades are placed or resolved.
-   */
   async updateBankrollSnapshot(): Promise<void> {
     const bankroll = await this.getOrCreateBankroll();
     const stopLossPct =
       this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
 
-    // Recalculate from all resolved trades
     const resolvedTrades = await this.db
       .select()
       .from(schema.polymarketTrades)
@@ -809,7 +1369,6 @@ export class PolymarketService {
       currentDrawdownPct,
     );
 
-    // Check stop-loss
     const balanceRatio = currentBalance / initialBudget;
     const isStopped = balanceRatio < stopLossPct;
     const stoppedReason = isStopped
@@ -845,40 +1404,54 @@ export class PolymarketService {
 
   // ─── Market persistence ─────────────────────────────────────────────
 
-  private async persistMarkets(matches: MarketFixtureMatch[]): Promise<void> {
+  private async persistMarkets(matches: MarketMatch[]): Promise<void> {
     for (const match of matches) {
       const market = match.market;
 
+      const values: any = {
+        eventId: match.event.eventId,
+        marketId: market.marketId,
+        conditionId: market.conditionId,
+        slug: market.slug,
+        eventTitle: match.event.title,
+        marketQuestion: market.question,
+        outcomes: market.outcomes,
+        clobTokenIds: market.clobTokenIds,
+        marketType: match.marketType,
+        tags: match.event.tags,
+        outcomePrices: market.outcomePrices.map(String),
+        liquidity: String(match.event.liquidity),
+        volume: String(match.event.volume),
+        volume24hr: String(match.event.volume24hr),
+        active: match.event.active,
+        closed: match.event.closed,
+        acceptingOrders: market.acceptingOrders,
+        startDate: match.event.startDate
+          ? new Date(match.event.startDate)
+          : null,
+        endDate: match.event.endDate ? new Date(match.event.endDate) : null,
+        matchScore: String(match.matchScore),
+        lastSyncedAt: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      // Set linking fields based on market type
+      if (match.marketType === 'match_outcome') {
+        const fixtureMatch = match as FixtureMarketMatch;
+        values.fixtureId = fixtureMatch.fixtureId;
+      } else {
+        const outrightMatch = match as OutrightMarketMatch;
+        values.leagueId = outrightMatch.leagueId;
+        values.leagueName = outrightMatch.leagueName;
+        values.teamId = outrightMatch.teamId;
+        values.teamName = outrightMatch.teamName;
+        values.season = outrightMatch.season;
+      }
+
       await this.db
         .insert(schema.polymarketMarkets)
-        .values({
-          eventId: match.event.eventId,
-          marketId: market.marketId,
-          conditionId: market.conditionId,
-          slug: market.slug,
-          eventTitle: match.event.title,
-          marketQuestion: market.question,
-          outcomes: market.outcomes,
-          clobTokenIds: market.clobTokenIds,
-          marketType: match.marketType,
-          tags: match.event.tags,
-          outcomePrices: market.outcomePrices.map(String),
-          liquidity: String(match.event.liquidity),
-          volume: String(match.event.volume),
-          volume24hr: String(match.event.volume24hr),
-          active: match.event.active,
-          closed: match.event.closed,
-          acceptingOrders: market.acceptingOrders,
-          startDate: match.event.startDate
-            ? new Date(match.event.startDate)
-            : null,
-          endDate: match.event.endDate ? new Date(match.event.endDate) : null,
-          fixtureId: match.fixtureId,
-          matchScore: String(match.matchScore),
-          lastSyncedAt: new Date(),
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
+        .values(values)
         .onConflictDoUpdate({
           target: schema.polymarketMarkets.marketId,
           set: {
@@ -889,18 +1462,25 @@ export class PolymarketService {
             active: match.event.active,
             closed: match.event.closed,
             acceptingOrders: market.acceptingOrders,
-            fixtureId: match.fixtureId,
             matchScore: String(match.matchScore),
             lastSyncedAt: new Date(),
             updatedAt: new Date(),
+            // Update linking fields too
+            ...(match.marketType === 'match_outcome'
+              ? { fixtureId: (match as FixtureMarketMatch).fixtureId }
+              : {
+                  leagueId: (match as OutrightMarketMatch).leagueId,
+                  leagueName: (match as OutrightMarketMatch).leagueName,
+                  teamId: (match as OutrightMarketMatch).teamId,
+                  teamName: (match as OutrightMarketMatch).teamName,
+                  season: (match as OutrightMarketMatch).season,
+                }),
           },
         });
     }
   }
 
-  private async getOrCreateMarketRecord(
-    match: MarketFixtureMatch,
-  ): Promise<any> {
+  private async getOrCreateMarketRecord(match: MarketMatch): Promise<any> {
     const existing = await this.db
       .select()
       .from(schema.polymarketMarkets)
@@ -909,7 +1489,6 @@ export class PolymarketService {
 
     if (existing.length > 0) return existing[0];
 
-    // Persist first, then return
     await this.persistMarkets([match]);
     const [created] = await this.db
       .select()
@@ -923,7 +1502,12 @@ export class PolymarketService {
   // ─── Query helpers ──────────────────────────────────────────────────
 
   async getOpenPositionsSummary(): Promise<
-    Array<{ outcomeName: string; fixtureId: number; positionSizeUsd: number }>
+    Array<{
+      outcomeName: string;
+      fixtureId?: number;
+      leagueId?: number;
+      positionSizeUsd: number;
+    }>
   > {
     const isLive =
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
@@ -933,6 +1517,7 @@ export class PolymarketService {
       .select({
         outcomeName: schema.polymarketTrades.outcomeName,
         fixtureId: schema.polymarketTrades.fixtureId,
+        leagueId: schema.polymarketTrades.leagueId,
         positionSizeUsd: schema.polymarketTrades.positionSizeUsd,
       })
       .from(schema.polymarketTrades)
@@ -945,14 +1530,12 @@ export class PolymarketService {
 
     return trades.map((t: any) => ({
       outcomeName: t.outcomeName,
-      fixtureId: t.fixtureId,
+      fixtureId: t.fixtureId ?? undefined,
+      leagueId: t.leagueId ?? undefined,
       positionSizeUsd: Number(t.positionSizeUsd),
     }));
   }
 
-  /**
-   * Get trading performance summary.
-   */
   async getPerformanceSummary(): Promise<any> {
     const bankroll = await this.getOrCreateBankroll();
 
@@ -1009,9 +1592,6 @@ export class PolymarketService {
     };
   }
 
-  /**
-   * Get all discovered Polymarket markets with fixture links.
-   */
   async getMarkets(filters?: {
     active?: boolean;
     matched?: boolean;
@@ -1024,10 +1604,13 @@ export class PolymarketService {
       conditions.push(eq(schema.polymarketMarkets.active, filters.active));
     }
     if (filters?.matched === true) {
-      conditions.push(sql`${schema.polymarketMarkets.fixtureId} IS NOT NULL`);
+      conditions.push(
+        sql`(${schema.polymarketMarkets.fixtureId} IS NOT NULL OR ${schema.polymarketMarkets.teamId} IS NOT NULL)`,
+      );
     }
     if (filters?.matched === false) {
       conditions.push(isNull(schema.polymarketMarkets.fixtureId));
+      conditions.push(isNull(schema.polymarketMarkets.teamId));
     }
 
     const where = conditions.length > 0 ? and(...conditions) : undefined;
