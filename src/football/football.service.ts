@@ -15,7 +15,7 @@ export const TRACKED_LEAGUES = [
   // Americas
   253, 262, 71, 128,
   // Domestic cups
-  45, 143, 81,
+  45, 143, 81, 66,
   // International tournaments
   1, 15, 4, 6, 9, 29, 5, 13,
   // World Cup qualifiers
