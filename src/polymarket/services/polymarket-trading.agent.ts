@@ -311,15 +311,17 @@ export class PolymarketTradingAgent {
       temperature: 0.1,
       system: systemPrompt,
       messages: [
-        { role: 'user', content: prompt },
-        // Prefill forces Claude to continue with JSON, not free text
-        { role: 'assistant', content: '{' },
+        {
+          role: 'user',
+          content:
+            prompt +
+            '\n\nIMPORTANT: Your ENTIRE response must be a single valid JSON object. Do NOT include any text, explanation, or markdown before or after the JSON. Start your response with { and end with }.',
+        },
       ],
     });
 
     const textBlock = response.content.find((b) => b.type === 'text');
-    // Re-attach the prefill "{" since it was the assistant turn
-    const rawText = '{' + (textBlock?.text ?? '');
+    const rawText = textBlock?.text ?? '';
 
     return this.parseDecision(rawText, candidate);
   }
