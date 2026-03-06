@@ -1169,41 +1169,139 @@ export class PolymarketService implements OnModuleInit {
    * Map fixture prediction probabilities to the market's outcome.
    * (Same logic as before — for "Will X beat Y?" markets)
    */
+  // ─── Team name normalization & matching ──────────────────────────────
+
+  /** Common suffixes to strip from team names for matching */
+  private static readonly TEAM_SUFFIXES =
+    /\b(fc|sc|afc|cf|jk|sk|fk|bk|if|ssc|as|us|rc|ac|cd|ud|rcd|sd|ca|se|fbc|club|saudi club|de la unam)\b/gi;
+
   /**
-   * Check if a team name matches a text snippet.
-   * Handles cases like "AZ" matching "AZ Alkmaar", "PSV" matching "PSV Eindhoven",
-   * and "Al Ahli Saudi Club" matching "Al-Ahli Jeddah".
+   * Known aliases: market name → our DB name (both lowercased, normalized).
+   * Only needed for cases where names are fundamentally different.
+   */
+  private static readonly TEAM_ALIASES: Record<string, string[]> = {
+    wolves: ['wolverhampton wanderers', 'wolverhampton'],
+    'wolverhampton wanderers': ['wolves'],
+    'paris saint germain': ['paris saint germain', 'psg'],
+    besiktas: ['beşiktaş', 'besiktas'],
+    beşiktaş: ['besiktas'],
+    'al ahli jeddah': ['al ahli saudi', 'al ahli'],
+    'al ahli saudi': ['al ahli jeddah', 'al ahli'],
+    'al ittihad': ['al ittihad saudi', 'al ittihad el iskandary'],
+    'al ittihad saudi': ['al ittihad'],
+    'al hilal saudi': ['al hilal saudi', 'al hilal'],
+    'al masry': ['el masry'],
+    'el masry': ['al masry'],
+    'celta vigo': ['celta de vigo', 'rc celta de vigo', 'rc celta'],
+    cadiz: ['cádiz'],
+    leon: ['club león', 'club leon'],
+    ajax: ['afc ajax'],
+    'afc ajax': ['ajax'],
+    'newcastle jets': ['newcastle united jets'],
+    'newcastle united jets': ['newcastle jets'],
+    'dc united': ['d.c. united'],
+    'd.c. united': ['dc united'],
+    famalicao: ['famalicão'],
+    'codm meknes': ['cod meknès', 'cod meknes', 'codm meknès'],
+    'ittihad tanger': ['ir tanger'],
+    'ir tanger': ['ittihad tanger'],
+    'fus rabat': ['fath union sport'],
+    'fath union sport': ['fus rabat'],
+    'u.n.a.m.   pumas': ['pumas de la unam', 'pumas unam'],
+    'pumas unam': ['u.n.a.m.   pumas', 'pumas de la unam'],
+    'sporting cp': ['sporting cp'],
+    monaco: ['as monaco'],
+    'as monaco': ['monaco'],
+    marseille: ['olympique de marseille', 'olympique marseille'],
+    'olympique de marseille': ['marseille'],
+    barcelona: ['fc barcelona'],
+    'fc barcelona': ['barcelona'],
+    nantes: ['fc nantes'],
+    'fc nantes': ['nantes'],
+    angers: ['angers sco', 'sco angers'],
+    'el gouna': ['el gouna'],
+  };
+
+  /**
+   * Normalize a team name for comparison:
+   * - Lowercase, strip diacritics, remove hyphens/dots/punctuation
+   * - Remove common suffixes (FC, SC, AFC, etc.)
+   * - Collapse whitespace
+   */
+  private normalizeTeamName(name: string): string {
+    return name
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // Strip diacritics (ş→s, é→e, á→a)
+      .replace(/[-.']/g, ' ') // Hyphens, dots, apostrophes → spaces
+      .replace(PolymarketService.TEAM_SUFFIXES, '') // Strip common suffixes
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /**
+   * Check if a team name matches a text snippet using normalized fuzzy matching.
    */
   private teamMatchesText(teamName: string, text: string): boolean {
-    const teamNorm = teamName.toLowerCase().replace(/-/g, ' ');
-    const textNorm = text.toLowerCase().replace(/-/g, ' ');
+    const teamNorm = this.normalizeTeamName(teamName);
+    const textNorm = text
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[-.']/g, ' ');
 
-    // Direct match
+    // Direct normalized match
     if (textNorm.includes(teamNorm)) return true;
 
-    // Extract the team name from "Will X win on YYYY-MM-DD?" pattern
+    // Extract the team from "Will X win on YYYY-MM-DD?" or "Will X win on YYYY MM DD?"
+    // (hyphens may have been stripped by normalization)
     const willWinMatch = textNorm.match(
-      /will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}/,
+      /will\s+(.+?)\s+win\s+on\s+\d{4}[\s-]\d{2}[\s-]\d{2}/,
     );
-    if (willWinMatch) {
-      const marketTeam = willWinMatch[1].trim();
-      // Check if market team is a prefix of our team (e.g., "psv" in "psv eindhoven")
-      if (teamNorm.startsWith(marketTeam + ' ') || teamNorm === marketTeam)
-        return true;
-      // Check if our team starts with the market team's first word(s)
-      const marketWords = marketTeam.split(/\s+/);
-      const teamWords = teamNorm.split(/\s+/);
+    const marketTeamRaw = willWinMatch?.[1]?.trim();
+    const marketTeamNorm = marketTeamRaw
+      ? this.normalizeTeamName(marketTeamRaw)
+      : null;
+
+    if (marketTeamNorm) {
+      // Exact normalized match
+      if (teamNorm === marketTeamNorm) return true;
+
+      // Prefix match (e.g., "psv" matches "psv eindhoven")
       if (
-        marketWords.length >= 1 &&
-        teamWords.length >= 1 &&
-        marketWords[0] === teamWords[0] &&
-        marketWords.length <= teamWords.length
-      ) {
-        // All market words must appear in order at the start of team words
-        const allMatch = marketWords.every(
-          (w: string, i: number) => teamWords[i] === w,
-        );
-        if (allMatch) return true;
+        teamNorm.startsWith(marketTeamNorm + ' ') ||
+        marketTeamNorm.startsWith(teamNorm + ' ')
+      )
+        return true;
+
+      // Token overlap: if >= 60% of significant tokens match
+      const teamTokens = teamNorm.split(/\s+/).filter((t) => t.length > 2);
+      const marketTokens = marketTeamNorm
+        .split(/\s+/)
+        .filter((t) => t.length > 2);
+      if (teamTokens.length > 0 && marketTokens.length > 0) {
+        const overlap = marketTokens.filter((mt) =>
+          teamTokens.some(
+            (tt) => tt === mt || tt.startsWith(mt) || mt.startsWith(tt),
+          ),
+        ).length;
+        const minLen = Math.min(teamTokens.length, marketTokens.length);
+        if (overlap >= minLen && overlap > 0) return true;
+      }
+
+      // Known aliases
+      const aliases =
+        PolymarketService.TEAM_ALIASES[teamNorm] ??
+        PolymarketService.TEAM_ALIASES[teamName.toLowerCase()] ??
+        [];
+      for (const alias of aliases) {
+        const aliasNorm = this.normalizeTeamName(alias);
+        if (
+          marketTeamNorm === aliasNorm ||
+          marketTeamNorm.includes(aliasNorm) ||
+          aliasNorm.includes(marketTeamNorm)
+        )
+          return true;
       }
     }
 
