@@ -1874,7 +1874,44 @@ export class PolymarketService {
       g.expectedValue = Number(g.expectedValue.toFixed(2));
     }
 
+    // Bankroll context
+    const bankroll = await this.getOrCreateBankroll();
+    const initialBudget = Number(bankroll.initialBudget);
+    const currentBalance = Number(bankroll.currentBalance);
+    const realizedPnl = Number(bankroll.realizedPnl);
+
     return {
+      budget: {
+        mode: bankroll.mode,
+        initialBudget,
+        currentBalance,
+        realizedPnl,
+        openPositionsCount: bankroll.openPositionsCount,
+        openPositionsValue: Number(bankroll.openPositionsValue),
+        availableBalance: currentBalance,
+        balanceIfAllWin: Number(
+          (currentBalance + totalProfitIfAllWin).toFixed(2),
+        ),
+        returnOnBudgetIfAllWin:
+          initialBudget > 0
+            ? Number(
+                (
+                  ((currentBalance + totalProfitIfAllWin - initialBudget) /
+                    initialBudget) *
+                  100
+                ).toFixed(2),
+              )
+            : 0,
+        multiplierIfAllWin:
+          initialBudget > 0
+            ? Number(
+                (
+                  (currentBalance + totalProfitIfAllWin) /
+                  initialBudget
+                ).toFixed(2),
+              )
+            : 0,
+      },
       trades,
       count: trades.length,
       summary: {
