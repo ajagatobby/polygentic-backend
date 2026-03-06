@@ -1387,6 +1387,58 @@ export class PolymarketService implements OnModuleInit {
     return created;
   }
 
+  /**
+   * Reset the stop-loss flag on the current bankroll so trading can resume.
+   * Optionally injects additional funds to bring the balance above the stop-loss threshold.
+   */
+  async resetStopLoss(additionalFunds?: number): Promise<any> {
+    const bankroll = await this.getOrCreateBankroll();
+
+    if (!bankroll.isStopped) {
+      return {
+        message: 'Bankroll is not stopped — no reset needed',
+        bankroll,
+      };
+    }
+
+    const updates: any = {
+      isStopped: false,
+      stoppedReason: null,
+      updatedAt: new Date(),
+    };
+
+    if (additionalFunds && additionalFunds > 0) {
+      const newBalance = Number(bankroll.currentBalance) + additionalFunds;
+      const newTotalDeposited =
+        Number(bankroll.totalDeposited ?? bankroll.initialBudget) +
+        additionalFunds;
+      const newInitialBudget = Number(bankroll.initialBudget) + additionalFunds;
+
+      updates.currentBalance = String(newBalance);
+      updates.totalDeposited = String(newTotalDeposited);
+      updates.initialBudget = String(newInitialBudget);
+      // Reset peak to new balance so drawdown recalculates from here
+      updates.peakBalance = String(
+        Math.max(newBalance, Number(bankroll.peakBalance ?? 0)),
+      );
+      updates.currentDrawdownPct = '0';
+
+      this.logger.log(
+        `Stop-loss reset with $${additionalFunds} additional funds. ` +
+          `New balance: $${newBalance.toFixed(2)}, new budget: $${newInitialBudget.toFixed(2)}`,
+      );
+    } else {
+      this.logger.log('Stop-loss reset without additional funds');
+    }
+
+    await this.db
+      .update(schema.polymarketBankroll)
+      .set(updates)
+      .where(eq(schema.polymarketBankroll.id, bankroll.id));
+
+    return this.getOrCreateBankroll();
+  }
+
   async buildBankrollContext(): Promise<BankrollContext> {
     const bankroll = await this.getOrCreateBankroll();
     const targetMultiplier =

@@ -70,6 +70,28 @@ export class PolymarketController {
     return this.polymarketService.getOrCreateBankroll();
   }
 
+  @Roles('admin')
+  @Post('bankroll/reset-stop-loss')
+  @ApiOperation({
+    summary:
+      '[Admin] Reset the stop-loss flag so trading can resume. Optionally inject additional funds.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        additionalFunds: {
+          type: 'number',
+          description:
+            'Optional amount to add to the bankroll (increases both balance and initial budget)',
+        },
+      },
+    },
+  })
+  async resetStopLoss(@Body() body: { additionalFunds?: number }) {
+    return this.polymarketService.resetStopLoss(body.additionalFunds);
+  }
+
   @Get('open-positions')
   @ApiOperation({ summary: 'Get current open positions' })
   async getOpenPositions() {
