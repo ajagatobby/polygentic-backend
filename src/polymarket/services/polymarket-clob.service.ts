@@ -69,6 +69,7 @@ export class PolymarketClobService implements OnModuleInit {
   /** Official SDK client for authenticated trading */
   private clobClient: ClobClient | null = null;
   private hasCredentials = false;
+  private initPromise: Promise<void> | null = null;
 
   private readonly host: string;
   private readonly chainId = 137; // Polygon mainnet
@@ -90,10 +91,23 @@ export class PolymarketClobService implements OnModuleInit {
   }
 
   /**
-   * Initialize the authenticated ClobClient using the official SDK.
-   * Called once on module init. If credentials are missing, falls back to read-only.
+   * Ensures the CLOB client is initialized before use.
+   * Handles the case where the service is constructed outside NestJS DI
+   * (e.g. Trigger.dev workers) where onModuleInit is never called.
    */
-  private async initializeClobClient(): Promise<void> {
+  private async ensureInitialized(): Promise<void> {
+    if (this.clobClient) return; // Already initialized
+    if (this.initPromise) return this.initPromise; // Init in progress
+    this.initPromise = this.initializeClobClient();
+    await this.initPromise;
+  }
+
+  /**
+   * Initialize the authenticated ClobClient using the official SDK.
+   * Called once on NestJS module init, and must be called manually
+   * when constructing the service outside NestJS DI (e.g. Trigger.dev workers).
+   */
+  async initializeClobClient(): Promise<void> {
     const privateKey = this.config.get<string>('POLYMARKET_PRIVATE_KEY');
     const apiKey = this.config.get<string>('POLYMARKET_API_KEY');
     const apiSecret = this.config.get<string>('POLYMARKET_API_SECRET');
@@ -378,6 +392,9 @@ export class PolymarketClobService implements OnModuleInit {
     conditionId?: string; // Needed to look up tick size + negRisk
     negRisk?: boolean;
   }): Promise<{ orderId: string; status: string } | null> {
+    // Lazy-initialize if running outside NestJS DI (e.g. Trigger.dev worker)
+    await this.ensureInitialized();
+
     if (!this.clobClient || !this.hasCredentials) {
       this.logger.warn(
         'Cannot place order — CLOB client not initialized (missing POLYMARKET_PRIVATE_KEY)',
@@ -450,6 +467,7 @@ export class PolymarketClobService implements OnModuleInit {
    * Cancel an existing order.
    */
   async cancelOrder(orderId: string): Promise<boolean> {
+    await this.ensureInitialized();
     if (!this.clobClient || !this.hasCredentials) return false;
 
     try {
@@ -466,6 +484,7 @@ export class PolymarketClobService implements OnModuleInit {
    * Get open orders for the authenticated user.
    */
   async getOpenOrders(): Promise<any[]> {
+    await this.ensureInitialized();
     if (!this.clobClient || !this.hasCredentials) return [];
 
     try {

@@ -166,22 +166,30 @@ export class PolymarketService implements OnModuleInit {
           );
 
           if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
-            await this.executeTrade(candidate, decision, bankroll);
-            tradesPlaced++;
+            const placed = await this.executeTrade(
+              candidate,
+              decision,
+              bankroll,
+            );
+            if (placed) {
+              tradesPlaced++;
 
-            // Update open positions for next evaluation
-            openPositions.push({
-              outcomeName: decision.outcomeName,
-              fixtureId:
-                candidate.type === 'fixture'
-                  ? candidate.match.fixtureId
-                  : undefined,
-              leagueId:
-                candidate.type === 'outright'
-                  ? candidate.match.leagueId
-                  : undefined,
-              positionSizeUsd: decision.positionSizeUsd,
-            });
+              // Update open positions for next evaluation
+              openPositions.push({
+                outcomeName: decision.outcomeName,
+                fixtureId:
+                  candidate.type === 'fixture'
+                    ? candidate.match.fixtureId
+                    : undefined,
+                leagueId:
+                  candidate.type === 'outright'
+                    ? candidate.match.leagueId
+                    : undefined,
+                positionSizeUsd: decision.positionSizeUsd,
+              });
+            } else {
+              tradesSkipped++;
+            }
           } else {
             await this.logSkippedTrade(candidate, decision);
             tradesSkipped++;
@@ -546,14 +554,22 @@ export class PolymarketService implements OnModuleInit {
           );
 
           if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
-            await this.executeTrade(candidate, decision, bankroll);
-            tradesPlaced++;
+            const placed = await this.executeTrade(
+              candidate,
+              decision,
+              bankroll,
+            );
+            if (placed) {
+              tradesPlaced++;
 
-            openPositions.push({
-              outcomeName: decision.outcomeName,
-              fixtureId: candidate.match.fixtureId,
-              positionSizeUsd: decision.positionSizeUsd,
-            });
+              openPositions.push({
+                outcomeName: decision.outcomeName,
+                fixtureId: candidate.match.fixtureId,
+                positionSizeUsd: decision.positionSizeUsd,
+              });
+            } else {
+              tradesSkipped++;
+            }
           } else {
             await this.logSkippedTrade(candidate, decision);
             tradesSkipped++;
@@ -1258,12 +1274,13 @@ export class PolymarketService implements OnModuleInit {
 
   /**
    * Execute a trade — either paper or live.
+   * Returns true if the trade was actually placed and persisted, false otherwise.
    */
   private async executeTrade(
     candidate: TradingCandidate,
     decision: TradingDecision,
     bankroll: any,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const isLive =
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
     const mode = isLive ? 'live' : 'paper';
@@ -1279,7 +1296,7 @@ export class PolymarketService implements OnModuleInit {
       this.logger.warn(
         `Budget exhausted ($${currentBalance.toFixed(2)} remaining) — skipping trade`,
       );
-      return;
+      return false;
     }
 
     // Cap position size to: min(agent suggestion, max position %, remaining balance)
@@ -1293,7 +1310,7 @@ export class PolymarketService implements OnModuleInit {
       this.logger.warn(
         `Position size $${positionSizeUsd.toFixed(2)} below minimum $${minTradeSize} — skipping trade`,
       );
-      return;
+      return false;
     }
 
     if (positionSizeUsd < decision.positionSizeUsd) {
@@ -1318,7 +1335,7 @@ export class PolymarketService implements OnModuleInit {
         this.logger.error(
           'No token ID for outcome index — skipping live trade',
         );
-        return;
+        return false;
       }
 
       const tokensToReceive = decision.positionSizeUsd / decision.entryPrice;
@@ -1332,8 +1349,8 @@ export class PolymarketService implements OnModuleInit {
       });
 
       if (!result) {
-        this.logger.error('Live order placement failed');
-        return;
+        this.logger.error('Live order placement failed — CLOB returned null');
+        return false;
       }
 
       orderId = result.orderId;
@@ -1408,7 +1425,7 @@ export class PolymarketService implements OnModuleInit {
       this.logger.warn(
         `Duplicate guard: open trade #${existingOpen[0].id} already exists for market ${marketRecord.id} outcome ${decision.outcomeIndex} — skipping`,
       );
-      return;
+      return false;
     }
 
     await this.db.insert(schema.polymarketTrades).values(tradeValues);
@@ -1438,6 +1455,8 @@ export class PolymarketService implements OnModuleInit {
         `$${decision.positionSizeUsd.toFixed(2)} @ ${decision.entryPrice.toFixed(3)} ` +
         `(edge: ${decision.edgePercent.toFixed(1)}%, Kelly: ${decision.kellyFraction.toFixed(3)})`,
     );
+
+    return true;
   }
 
   /**
