@@ -2615,6 +2615,182 @@ export class PolymarketService {
     return { converted, failed, skipped, results };
   }
 
+  // ─── Switch trade mode (paper ↔ live) ────────────────────────────────
+
+  /**
+   * Switch open trades between paper and live mode (or vice versa).
+   *
+   * This is a lightweight mode flip — it does NOT place or cancel CLOB orders.
+   * Use `goLiveTrades` if you want to actually place real orders on the CLOB.
+   *
+   * Moves position value between the source and target bankrolls:
+   * - paper→live: deducts from live bankroll, frees paper bankroll
+   * - live→paper: deducts from paper bankroll, frees live bankroll
+   */
+  async switchTradeMode(params: {
+    tradeIds?: number[];
+    month?: number;
+    year?: number;
+    all?: boolean;
+    to: 'paper' | 'live'; // Target mode
+  }): Promise<{
+    switched: number;
+    skipped: number;
+    results: Array<{
+      tradeId: number;
+      outcomeName: string;
+      status: 'switched' | 'skipped';
+      from: string;
+      to: string;
+      positionSizeUsd: number;
+      reason?: string;
+    }>;
+  }> {
+    const targetMode = params.to;
+    const sourceMode = targetMode === 'live' ? 'paper' : 'live';
+
+    // Build conditions — only select trades currently in the source mode
+    const conditions: any[] = [
+      eq(schema.polymarketTrades.status, 'open'),
+      eq(schema.polymarketTrades.mode, sourceMode),
+    ];
+
+    if (params.tradeIds && params.tradeIds.length > 0) {
+      conditions.push(inArray(schema.polymarketTrades.id, params.tradeIds));
+    } else if (params.month && params.year) {
+      const startDate = new Date(params.year, params.month - 1, 1);
+      const endDate = new Date(params.year, params.month, 1);
+      conditions.push(gte(schema.polymarketTrades.createdAt, startDate));
+      conditions.push(lte(schema.polymarketTrades.createdAt, endDate));
+    } else if (!params.all) {
+      throw new Error(
+        'Must provide tradeIds, month+year, or all=true to specify which trades to switch.',
+      );
+    }
+
+    const trades = await this.db
+      .select()
+      .from(schema.polymarketTrades)
+      .where(and(...conditions))
+      .orderBy(desc(schema.polymarketTrades.createdAt));
+
+    if (trades.length === 0) {
+      return { switched: 0, skipped: 0, results: [] };
+    }
+
+    // Get both bankrolls
+    const sourceBankroll = await this.getBankrollByMode(sourceMode);
+    const targetBankroll = await this.getBankrollByMode(targetMode);
+
+    let switched = 0;
+    let skipped = 0;
+    let totalMoved = 0;
+    const results: Array<{
+      tradeId: number;
+      outcomeName: string;
+      status: 'switched' | 'skipped';
+      from: string;
+      to: string;
+      positionSizeUsd: number;
+      reason?: string;
+    }> = [];
+
+    for (const trade of trades) {
+      const positionSize = Number(trade.positionSizeUsd);
+
+      // Check target bankroll has enough balance
+      const targetBalance = Number(targetBankroll.currentBalance) - totalMoved;
+      if (positionSize > targetBalance && targetMode === 'live') {
+        skipped++;
+        results.push({
+          tradeId: trade.id,
+          outcomeName: trade.outcomeName,
+          status: 'skipped',
+          from: sourceMode,
+          to: targetMode,
+          positionSizeUsd: positionSize,
+          reason: `Insufficient ${targetMode} bankroll: $${targetBalance.toFixed(2)} available, $${positionSize.toFixed(2)} needed`,
+        });
+        continue;
+      }
+
+      // Switch the mode
+      await this.db
+        .update(schema.polymarketTrades)
+        .set({
+          mode: targetMode,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.polymarketTrades.id, trade.id));
+
+      totalMoved += positionSize;
+      switched++;
+
+      results.push({
+        tradeId: trade.id,
+        outcomeName: trade.outcomeName,
+        status: 'switched',
+        from: sourceMode,
+        to: targetMode,
+        positionSizeUsd: positionSize,
+      });
+
+      this.logger.log(
+        `Switched trade #${trade.id} (${trade.outcomeName}): ${sourceMode} → ${targetMode} ($${positionSize.toFixed(2)})`,
+      );
+    }
+
+    // Update both bankrolls: move position value from source to target
+    if (totalMoved > 0) {
+      // Source bankroll: free up the position value
+      await this.db
+        .update(schema.polymarketBankroll)
+        .set({
+          currentBalance: String(
+            Number(sourceBankroll.currentBalance) + totalMoved,
+          ),
+          openPositionsCount: Math.max(
+            0,
+            sourceBankroll.openPositionsCount - switched,
+          ),
+          openPositionsValue: String(
+            Math.max(0, Number(sourceBankroll.openPositionsValue) - totalMoved),
+          ),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.polymarketBankroll.id, sourceBankroll.id));
+
+      // Target bankroll: absorb the position value
+      await this.db
+        .update(schema.polymarketBankroll)
+        .set({
+          currentBalance: String(
+            Number(targetBankroll.currentBalance) - totalMoved,
+          ),
+          openPositionsCount: targetBankroll.openPositionsCount + switched,
+          openPositionsValue: String(
+            Number(targetBankroll.openPositionsValue) + totalMoved,
+          ),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.polymarketBankroll.id, targetBankroll.id));
+    }
+
+    this.logger.log(
+      `Mode switch complete: ${switched} trades ${sourceMode}→${targetMode}, ${skipped} skipped, $${totalMoved.toFixed(2)} moved`,
+    );
+
+    return { switched, skipped, results };
+  }
+
+  /**
+   * Get bankroll by mode, creating it if it doesn't exist.
+   */
+  private async getBankrollByMode(mode: string): Promise<any> {
+    if (mode === 'live') return this.getOrCreateLiveBankroll();
+    return this.getOrCreateBankroll();
+  }
+
   /**
    * Get or create a live-mode bankroll record (separate from paper bankroll).
    */

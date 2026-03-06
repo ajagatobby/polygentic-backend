@@ -278,6 +278,68 @@ export class PolymarketController {
   }
 
   @Roles('admin')
+  @Post('trades/switch-mode')
+  @ApiOperation({
+    summary:
+      '[Admin] Switch open trades between paper and live mode (lightweight — no CLOB orders placed)',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['to'],
+      properties: {
+        tradeIds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Specific trade IDs to switch',
+        },
+        month: {
+          type: 'number',
+          description: 'Switch all matching trades from this month (1-12)',
+        },
+        year: {
+          type: 'number',
+          description: 'Year for month filter',
+        },
+        all: {
+          type: 'boolean',
+          description: 'Switch all open trades in the source mode',
+        },
+        to: {
+          type: 'string',
+          enum: ['paper', 'live'],
+          description:
+            'Target mode — trades currently in the opposite mode will be switched',
+        },
+      },
+    },
+  })
+  async switchTradeMode(
+    @Body()
+    body: {
+      tradeIds?: number[];
+      month?: number;
+      year?: number;
+      all?: boolean;
+      to: 'paper' | 'live';
+    },
+  ) {
+    if (!body.to || !['paper', 'live'].includes(body.to)) {
+      return { error: '"to" must be "paper" or "live"' };
+    }
+
+    this.logger.log(`Switch mode request: ${JSON.stringify(body)}`);
+
+    const result = await this.polymarketService.switchTradeMode(body);
+    const sourceMode = body.to === 'live' ? 'paper' : 'live';
+
+    return {
+      message: `Switched ${result.switched} trades from ${sourceMode} → ${body.to} (${result.skipped} skipped)`,
+      ...result,
+    };
+  }
+
+  @Roles('admin')
   @Post('trades/go-live')
   @ApiOperation({
     summary:
