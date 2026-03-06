@@ -1122,24 +1122,107 @@ export class PolymarketMatcherService {
 
   // ─── Fuzzy matching ─────────────────────────────────────────────────
 
+  /** Words that are too generic to count as meaningful matches on their own */
+  private static readonly GENERIC_WORDS = new Set([
+    'city',
+    'united',
+    'real',
+    'sporting',
+    'athletic',
+    'atletico',
+    'dynamo',
+    'racing',
+    'inter',
+    'olympic',
+    'olympique',
+    'royal',
+    'club',
+    'sport',
+    'young',
+    'boys',
+    'stars',
+    'wanderers',
+    'rovers',
+    'rangers',
+    'town',
+    'county',
+    'albion',
+    'villa',
+    'forest',
+    'palace',
+    'hotspur',
+    'orient',
+    'north',
+    'south',
+    'east',
+    'west',
+  ]);
+
+  /** Common suffixes to strip from team names for matching */
+  private static readonly TEAM_SUFFIXES =
+    /\b(fc|sc|afc|cf|jk|sk|fk|bk|if|ssc|as|us|rc|ac|cd|ud|rcd|sd|ca|se|fbc|club|saudi club|de la unam)\b/gi;
+
   private teamNameSimilarity(a: string, b: string): number {
     const normA = this.normalizeTeamName(a);
     const normB = this.normalizeTeamName(b);
 
     if (normA === normB) return 1.0;
-    if (normA.includes(normB) || normB.includes(normA)) return 0.85;
 
-    const wordsA = normA.split(' ');
-    const wordsB = normB.split(' ');
+    // Substring match — but only if the shorter string has at least one
+    // "significant" (non-generic) word. This prevents "city" from matching
+    // "new york city", or "united" from matching "atlanta united".
+    if (normA.includes(normB) || normB.includes(normA)) {
+      const shorter = normA.length <= normB.length ? normA : normB;
+      const shorterWords = shorter.split(' ').filter((w) => w.length > 1);
+      const significantWords = shorterWords.filter(
+        (w) => !PolymarketMatcherService.GENERIC_WORDS.has(w),
+      );
+      // Only allow substring match if at least one significant word exists
+      // and the shorter string has at least 2 total words OR 1 significant word
+      // that is specific enough (>= 4 chars and not generic)
+      if (significantWords.length >= 1 && shorterWords.length >= 2) {
+        return 0.85;
+      }
+      if (significantWords.length >= 1 && significantWords[0].length >= 4) {
+        return 0.85;
+      }
+      // Pure generic word match (e.g., "city" alone) — very low confidence
+      if (significantWords.length === 0) {
+        return 0.2;
+      }
+    }
+
+    // Token-based matching with significance awareness
+    const wordsA = normA.split(' ').filter((w) => w.length > 1);
+    const wordsB = normB.split(' ').filter((w) => w.length > 1);
+    if (wordsA.length === 0 || wordsB.length === 0) return 0;
+
     const shorter = wordsA.length <= wordsB.length ? wordsA : wordsB;
     const longer = wordsA.length > wordsB.length ? wordsA : wordsB;
-    const longerStr = longer.join(' ');
 
-    const matchingWords = shorter.filter((w) => longerStr.includes(w));
-    const wordOverlap = matchingWords.length / shorter.length;
+    // Count matching tokens (including prefix matching for abbreviations)
+    let matchCount = 0;
+    let significantMatchCount = 0;
+    for (const sw of shorter) {
+      const matched = longer.some(
+        (lw) => lw === sw || lw.startsWith(sw) || sw.startsWith(lw),
+      );
+      if (matched) {
+        matchCount++;
+        if (!PolymarketMatcherService.GENERIC_WORDS.has(sw)) {
+          significantMatchCount++;
+        }
+      }
+    }
 
-    if (wordOverlap >= 0.8) return 0.75;
-    if (wordOverlap >= 0.5) return 0.5;
+    const overlapRatio = matchCount / shorter.length;
+
+    // Require at least one significant word to match for high confidence
+    if (overlapRatio >= 0.8 && significantMatchCount >= 1) return 0.75;
+    if (overlapRatio >= 0.5 && significantMatchCount >= 1) return 0.55;
+
+    // All matches are generic words — low confidence
+    if (overlapRatio >= 0.8 && significantMatchCount === 0) return 0.3;
 
     const lev = this.levenshteinDistance(normA, normB);
     const maxLen = Math.max(normA.length, normB.length);
@@ -1149,8 +1232,10 @@ export class PolymarketMatcherService {
   private normalizeTeamName(name: string): string {
     return name
       .toLowerCase()
-      .replace(/\b(fc|cf|sc|afc|ac|as|ss|us|rc|cd|ud|rcd|sd|ca|se)\b/g, '')
-      .replace(/[^a-z0-9\s]/g, ' ')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // Strip diacritics (ş→s, é→e, á→a)
+      .replace(/[-.']/g, ' ') // Hyphens, dots, apostrophes → spaces
+      .replace(PolymarketMatcherService.TEAM_SUFFIXES, '') // Strip common suffixes
       .replace(/\s+/g, ' ')
       .trim();
   }

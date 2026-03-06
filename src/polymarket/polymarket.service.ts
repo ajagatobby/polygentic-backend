@@ -2297,6 +2297,7 @@ export class PolymarketService implements OnModuleInit {
         marketId: market.marketId,
         conditionId: market.conditionId,
         slug: market.slug,
+        eventSlug: match.event.slug,
         eventTitle: match.event.title,
         marketQuestion: market.question,
         outcomes: market.outcomes,
@@ -2339,6 +2340,7 @@ export class PolymarketService implements OnModuleInit {
         .onConflictDoUpdate({
           target: schema.polymarketMarkets.marketId,
           set: {
+            eventSlug: match.event.slug,
             outcomePrices: market.outcomePrices.map(String),
             liquidity: String(match.event.liquidity),
             volume: String(match.event.volume),
@@ -2391,6 +2393,7 @@ export class PolymarketService implements OnModuleInit {
       fixtureId?: number;
       leagueId?: number;
       positionSizeUsd: number;
+      polymarketUrl?: string;
     }>
   > {
     const isLive =
@@ -2403,8 +2406,16 @@ export class PolymarketService implements OnModuleInit {
         fixtureId: schema.polymarketTrades.fixtureId,
         leagueId: schema.polymarketTrades.leagueId,
         positionSizeUsd: schema.polymarketTrades.positionSizeUsd,
+        eventSlug: schema.polymarketMarkets.eventSlug,
       })
       .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
       .where(
         and(
           eq(schema.polymarketTrades.mode, mode),
@@ -2417,6 +2428,9 @@ export class PolymarketService implements OnModuleInit {
       fixtureId: t.fixtureId ?? undefined,
       leagueId: t.leagueId ?? undefined,
       positionSizeUsd: Number(t.positionSizeUsd),
+      polymarketUrl: t.eventSlug
+        ? `https://polymarket.com/event/${t.eventSlug}`
+        : undefined,
     }));
   }
 

@@ -27,7 +27,8 @@ export const polymarketMarkets = pgTable(
     eventId: varchar('event_id', { length: 255 }).notNull(), // Gamma event ID
     marketId: varchar('market_id', { length: 255 }).notNull(), // Gamma market ID
     conditionId: varchar('condition_id', { length: 255 }), // CTF condition ID
-    slug: varchar('slug', { length: 500 }),
+    slug: varchar('slug', { length: 500 }), // Market-level slug
+    eventSlug: varchar('event_slug', { length: 500 }), // Event-level slug (used for Polymarket URLs)
 
     // Market metadata
     eventTitle: text('event_title').notNull(),
