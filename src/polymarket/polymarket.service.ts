@@ -94,23 +94,7 @@ export class PolymarketService implements OnModuleInit {
 
     this.logger.log('Starting Polymarket scan cycle');
 
-    // Check if trading is stopped
-    let bankroll = await this.getOrCreateBankroll();
-    if (bankroll.isStopped) {
-      this.logger.warn(
-        `Trading is STOPPED: ${bankroll.stoppedReason}. Skipping scan.`,
-      );
-      return {
-        marketsFound: 0,
-        marketsMatched: 0,
-        candidatesEvaluated: 0,
-        tradesPlaced: 0,
-        tradesSkipped: 0,
-        errors: [`Trading stopped: ${bankroll.stoppedReason}`],
-      };
-    }
-
-    // Step 1: Fetch soccer markets (client-side filtered)
+    // Step 1: Fetch soccer markets from Polymarket
     let events;
     try {
       events = await this.gammaService.fetchSoccerEvents();
@@ -131,7 +115,7 @@ export class PolymarketService implements OnModuleInit {
     // Step 2: Match to internal data (leagues/teams for outrights, fixtures for match outcomes)
     const matches = await this.matcherService.matchEvents(events);
 
-    // Step 3: Persist markets to DB
+    // Step 3: Persist markets to DB (always runs regardless of bankroll state)
     await this.persistMarkets(matches);
 
     // Step 4: Build trading candidates with pricing + edge
@@ -143,60 +127,75 @@ export class PolymarketService implements OnModuleInit {
     );
 
     // Step 5: Evaluate each candidate with the trading agent
+    // Only place trades if the bankroll is not stopped — but the scan/discovery
+    // above always runs regardless so we maintain market visibility.
     let tradesPlaced = 0;
     let tradesSkipped = 0;
 
-    let bankrollContext = await this.buildBankrollContext();
-    const openPositions = await this.getOpenPositionsSummary();
+    let bankroll = await this.getOrCreateBankroll();
+    const tradingBlocked = bankroll.isStopped;
 
-    for (const candidate of candidates) {
-      try {
-        // Re-fetch bankroll for accurate balance after each trade
-        bankroll = await this.getOrCreateBankroll();
-        bankrollContext = await this.buildBankrollContext();
+    if (tradingBlocked) {
+      this.logger.warn(
+        `Trading is STOPPED: ${bankroll.stoppedReason}. ` +
+          `Market scan completed (${events.length} events, ${matches.length} matched), but no trades will be placed.`,
+      );
+      errors.push(`Trading stopped (no new trades): ${bankroll.stoppedReason}`);
+    }
 
-        // Stop placing trades if budget is exhausted
-        if (Number(bankroll.currentBalance) <= 0) {
-          this.logger.warn('Budget exhausted — stopping scan cycle');
-          break;
+    if (!tradingBlocked && candidates.length > 0) {
+      let bankrollContext = await this.buildBankrollContext();
+      const openPositions = await this.getOpenPositionsSummary();
+
+      for (const candidate of candidates) {
+        try {
+          // Re-fetch bankroll for accurate balance after each trade
+          bankroll = await this.getOrCreateBankroll();
+          bankrollContext = await this.buildBankrollContext();
+
+          // Stop placing trades if budget is exhausted
+          if (Number(bankroll.currentBalance) <= 0) {
+            this.logger.warn('Budget exhausted — stopping trade placement');
+            break;
+          }
+
+          const decision = await this.tradingAgent.evaluate(
+            candidate,
+            bankrollContext,
+            openPositions,
+          );
+
+          if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
+            await this.executeTrade(candidate, decision, bankroll);
+            tradesPlaced++;
+
+            // Update open positions for next evaluation
+            openPositions.push({
+              outcomeName: decision.outcomeName,
+              fixtureId:
+                candidate.type === 'fixture'
+                  ? candidate.match.fixtureId
+                  : undefined,
+              leagueId:
+                candidate.type === 'outright'
+                  ? candidate.match.leagueId
+                  : undefined,
+              positionSizeUsd: decision.positionSizeUsd,
+            });
+          } else {
+            await this.logSkippedTrade(candidate, decision);
+            tradesSkipped++;
+          }
+        } catch (error) {
+          const label =
+            candidate.type === 'outright'
+              ? `${candidate.match.teamName} in ${candidate.match.leagueName}`
+              : `fixture ${(candidate.match as FixtureMarketMatch).fixtureId}`;
+          this.logger.error(
+            `Failed to evaluate candidate (${label}): ${error.message}`,
+          );
+          errors.push(error.message);
         }
-
-        const decision = await this.tradingAgent.evaluate(
-          candidate,
-          bankrollContext,
-          openPositions,
-        );
-
-        if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
-          await this.executeTrade(candidate, decision, bankroll);
-          tradesPlaced++;
-
-          // Update open positions for next evaluation
-          openPositions.push({
-            outcomeName: decision.outcomeName,
-            fixtureId:
-              candidate.type === 'fixture'
-                ? candidate.match.fixtureId
-                : undefined,
-            leagueId:
-              candidate.type === 'outright'
-                ? candidate.match.leagueId
-                : undefined,
-            positionSizeUsd: decision.positionSizeUsd,
-          });
-        } else {
-          await this.logSkippedTrade(candidate, decision);
-          tradesSkipped++;
-        }
-      } catch (error) {
-        const label =
-          candidate.type === 'outright'
-            ? `${candidate.match.teamName} in ${candidate.match.leagueName}`
-            : `fixture ${(candidate.match as FixtureMarketMatch).fixtureId}`;
-        this.logger.error(
-          `Failed to evaluate candidate (${label}): ${error.message}`,
-        );
-        errors.push(error.message);
       }
     }
 
