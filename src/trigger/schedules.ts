@@ -11,6 +11,7 @@ import {
   syncStandingsTask,
   syncOddsTask,
 } from './sync-data';
+import { polymarketScanTask } from './polymarket-scan';
 
 /**
  * ┌──────────────────────────────────────────────────────────────────┐
@@ -144,5 +145,21 @@ export const oddsSyncSchedule = schedules.task({
     logger.info('Scheduled: odds sync');
     const handle = await syncOddsTask.trigger(undefined as void);
     logger.info('Triggered odds sync task', { runId: handle.id });
+  },
+});
+
+// ─── Polymarket trading agent ───────────────────────────────────────
+
+/**
+ * Every 30 minutes: Scan Polymarket for soccer markets, evaluate
+ * trading opportunities, and place paper/live trades.
+ */
+export const polymarketScanSchedule = schedules.task({
+  id: 'scheduled-polymarket-scan',
+  cron: '*/30 * * * *',
+  run: async () => {
+    logger.info('Scheduled: Polymarket trading agent scan');
+    const handle = await polymarketScanTask.trigger(undefined as void);
+    logger.info('Triggered Polymarket scan task', { runId: handle.id });
   },
 });

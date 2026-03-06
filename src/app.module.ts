@@ -11,6 +11,7 @@ import { SyncModule } from './sync/sync.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
 import { UserThrottlerGuard } from './auth/user-throttler.guard';
+import { PolymarketModule } from './polymarket/polymarket.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { UserThrottlerGuard } from './auth/user-throttler.guard';
     AgentsModule,
     SyncModule,
     HealthModule,
+    PolymarketModule,
   ],
   providers: [
     // Apply per-user rate limiting globally

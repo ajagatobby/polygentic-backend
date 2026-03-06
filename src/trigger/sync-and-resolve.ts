@@ -24,7 +24,7 @@ export const syncCompletedFixturesAndResolveTask = task({
     factor: 2,
   },
   run: async () => {
-    const { syncService, agentsService } = initServices();
+    const { syncService, agentsService, polymarketService } = initServices();
 
     // Step 1: Sync completed fixtures
     logger.info('Step 1: Syncing completed fixtures...');
@@ -42,7 +42,7 @@ export const syncCompletedFixturesAndResolveTask = task({
     logger.info('Step 2: Resolving predictions for finished matches...');
     const resolveResult = await agentsService.resolvePredictions();
 
-    logger.info('Sync and resolve workflow complete', {
+    logger.info('Prediction resolution complete', {
       resolved: resolveResult.resolved,
       errors: resolveResult.errors.length,
     });
@@ -51,10 +51,28 @@ export const syncCompletedFixturesAndResolveTask = task({
       logger.warn('Resolution errors', { errors: resolveResult.errors });
     }
 
+    // Step 3: Resolve Polymarket trades
+    logger.info('Step 3: Resolving Polymarket trades...');
+    let polymarketResolved = { resolved: 0, errors: [] as string[] };
+    try {
+      polymarketResolved = await polymarketService.resolveCompletedTrades();
+      if (polymarketResolved.resolved > 0) {
+        logger.info('Polymarket trade resolution complete', {
+          resolved: polymarketResolved.resolved,
+        });
+      }
+    } catch (error) {
+      logger.warn('Polymarket trade resolution failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     return {
       fixturesSynced,
       predictionsResolved: resolveResult.resolved,
       resolveErrors: resolveResult.errors,
+      polymarketTradesResolved: polymarketResolved.resolved,
+      polymarketResolveErrors: polymarketResolved.errors,
     };
   },
 });
