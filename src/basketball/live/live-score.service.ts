@@ -87,10 +87,13 @@ export class BasketballLiveScoreService
       'BASKETBALL_LIVE_OT_POLLING_MS',
       15_000,
     );
-    this.liveMonitoringEnabled = this.config.get<boolean>(
+    // ConfigService returns strings from env vars, so "false" is truthy.
+    // Explicitly check for the string "true" to enable.
+    const rawEnabled = this.config.get<string>(
       'BASKETBALL_LIVE_MONITORING_ENABLED',
-      false,
+      'false',
     );
+    this.liveMonitoringEnabled = String(rawEnabled) === 'true';
   }
 
   onModuleInit(): void {

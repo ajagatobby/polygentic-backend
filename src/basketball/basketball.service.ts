@@ -819,15 +819,53 @@ export class BasketballService {
 
   /**
    * Fetch currently live basketball games from API-Basketball.
+   *
+   * API-Basketball does not have a `live=all` parameter like API-Football.
+   * Instead, we fetch today's games and filter by in-progress statuses.
    */
   async fetchLiveGames(): Promise<any[]> {
     this.logger.debug('Fetching live basketball games');
 
-    const data = await this.apiRequest<any>('/games', {
-      live: 'all',
-    });
+    const today = new Date().toISOString().split('T')[0];
+    const season = BasketballService.getCurrentSeason();
 
-    return data.response ?? [];
+    // Fetch all of today's games across tracked leagues
+    const allGames: any[] = [];
+    for (const leagueId of TRACKED_BASKETBALL_LEAGUES) {
+      try {
+        const remaining = this.getRemainingRequests().remaining;
+        if (remaining <= 0) {
+          this.logger.warn(
+            'Daily API limit reached, cannot fetch more live games.',
+          );
+          break;
+        }
+
+        const data = await this.apiRequest<any>('/games', {
+          league: String(leagueId),
+          season: String(season),
+          date: today,
+          timezone: 'UTC',
+        });
+
+        if (data.response?.length) {
+          allGames.push(...data.response);
+        }
+      } catch (error) {
+        if ((error as Error).message?.includes('daily limit exhausted')) {
+          break;
+        }
+        this.logger.warn(
+          `Failed to fetch live games for league ${leagueId}: ${(error as Error).message}`,
+        );
+      }
+    }
+
+    // Filter to only in-progress games
+    const liveStatuses = new Set(['Q1', 'Q2', 'Q3', 'Q4', 'OT', 'BT', 'HT']);
+    return allGames.filter(
+      (g: any) => g.status?.short && liveStatuses.has(g.status.short),
+    );
   }
 
   /**
