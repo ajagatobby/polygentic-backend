@@ -2003,15 +2003,45 @@ export class PolymarketService {
   }): Promise<{
     adjusted: number;
     skipped: number;
-    totalDelta: number; // Net change in deployed capital (positive = more spent)
+    totalDelta: number;
     results: Array<{
       tradeId: number;
+      outcomeName: string;
       status: 'adjusted' | 'skipped';
       oldSize: number;
       newSize: number;
       delta: number;
+      entryPrice: number;
+      tokenQuantity: number;
+      payoutIfWin: number;
+      profitIfWin: number;
+      roiIfWin: number;
+      lossIfLoss: number;
+      ensembleProbability: number;
+      expectedValue: number;
       reason?: string;
+      market?: {
+        eventTitle: string;
+        marketQuestion: string;
+        marketType: string;
+        leagueName: string | null;
+        teamName: string | null;
+      };
     }>;
+    projection: {
+      totalCost: number;
+      totalPayoutIfAllWin: number;
+      totalProfitIfAllWin: number;
+      totalRoiIfAllWin: number;
+      totalExpectedValue: number;
+    };
+    budget: {
+      mode: string;
+      initialBudget: number;
+      currentBalance: number;
+      balanceIfAllWin: number;
+      multiplierIfAllWin: number;
+    };
   }> {
     if (params.amount === undefined && params.multiplier === undefined) {
       throw new Error('Must provide either amount or multiplier.');
@@ -2042,18 +2072,47 @@ export class PolymarketService {
       );
     }
 
-    const trades = await this.db
-      .select()
+    const tradeRows = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
       .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
       .where(and(...conditions))
       .orderBy(desc(schema.polymarketTrades.createdAt));
 
-    if (trades.length === 0) {
-      return { adjusted: 0, skipped: 0, totalDelta: 0, results: [] };
+    if (tradeRows.length === 0) {
+      return {
+        adjusted: 0,
+        skipped: 0,
+        totalDelta: 0,
+        results: [],
+        projection: {
+          totalCost: 0,
+          totalPayoutIfAllWin: 0,
+          totalProfitIfAllWin: 0,
+          totalRoiIfAllWin: 0,
+          totalExpectedValue: 0,
+        },
+        budget: {
+          mode: 'paper',
+          initialBudget: 0,
+          currentBalance: 0,
+          balanceIfAllWin: 0,
+          multiplierIfAllWin: 0,
+        },
+      };
     }
 
     // Get bankroll for the mode of the first trade (paper or live)
-    const mode = trades[0].mode;
+    const mode = tradeRows[0].trade.mode;
     const bankroll = await this.db
       .select()
       .from(schema.polymarketBankroll)
@@ -2071,8 +2130,8 @@ export class PolymarketService {
     // For `amount`: distribute the total budget proportionally by current weight
     // For `multiplier`: scale each trade individually
 
-    const currentTotalSize = trades.reduce(
-      (sum: number, t: any) => sum + Number(t.positionSizeUsd),
+    const currentTotalSize = tradeRows.reduce(
+      (sum: number, row: any) => sum + Number(row.trade.positionSizeUsd),
       0,
     );
 
@@ -2095,24 +2154,43 @@ export class PolymarketService {
     let adjusted = 0;
     let skipped = 0;
     let totalDelta = 0;
-    const results: Array<{
-      tradeId: number;
-      status: 'adjusted' | 'skipped';
-      oldSize: number;
-      newSize: number;
-      delta: number;
-      reason?: string;
-    }> = [];
+    const results: Array<any> = [];
 
-    for (const trade of trades) {
+    // Helper to compute projection for a trade
+    const computeProjection = (
+      size: number,
+      entry: number,
+      ensembleProb: number,
+    ) => {
+      const tokenQty = entry > 0 ? size / entry : 0;
+      const payoutIfWin = tokenQty * 1.0;
+      const profitIfWin = payoutIfWin - size;
+      const roiIfWin = size > 0 ? (profitIfWin / size) * 100 : 0;
+      const lossIfLoss = -size;
+      const expectedValue =
+        ensembleProb * profitIfWin + (1 - ensembleProb) * lossIfLoss;
+      return {
+        tokenQuantity: Number(tokenQty.toFixed(4)),
+        payoutIfWin: Number(payoutIfWin.toFixed(2)),
+        profitIfWin: Number(profitIfWin.toFixed(2)),
+        roiIfWin: Number(roiIfWin.toFixed(2)),
+        lossIfLoss: Number(lossIfLoss.toFixed(2)),
+        expectedValue: Number(expectedValue.toFixed(2)),
+      };
+    };
+
+    for (const { trade, market } of tradeRows) {
       const oldSize = Number(trade.positionSizeUsd);
       const entryPrice = Number(trade.entryPrice);
+      const ensembleProb = Number(trade.ensembleProbability);
       let newSize: number;
 
       if (targetBudget !== undefined) {
         // Distribute proportionally by current weight
         const weight =
-          currentTotalSize > 0 ? oldSize / currentTotalSize : 1 / trades.length;
+          currentTotalSize > 0
+            ? oldSize / currentTotalSize
+            : 1 / tradeRows.length;
         newSize = targetBudget * weight;
       } else {
         newSize = oldSize * params.multiplier!;
@@ -2123,16 +2201,30 @@ export class PolymarketService {
 
       const delta = newSize - oldSize;
 
+      const marketInfo = {
+        eventTitle: market.eventTitle,
+        marketQuestion: market.marketQuestion,
+        marketType: market.marketType,
+        leagueName: market.leagueName,
+        teamName: market.teamName,
+      };
+
       // Skip if no meaningful change
       if (Math.abs(delta) < 0.01) {
+        const proj = computeProjection(oldSize, entryPrice, ensembleProb);
         skipped++;
         results.push({
           tradeId: trade.id,
+          outcomeName: trade.outcomeName,
           status: 'skipped',
           oldSize,
           newSize: oldSize,
           delta: 0,
+          entryPrice,
+          ensembleProbability: ensembleProb,
+          ...proj,
           reason: 'No change needed',
+          market: marketInfo,
         });
         continue;
       }
@@ -2142,14 +2234,20 @@ export class PolymarketService {
         if (delta > availableBalance) {
           const cappedNew = oldSize + availableBalance;
           if (cappedNew - oldSize < 0.01) {
+            const proj = computeProjection(oldSize, entryPrice, ensembleProb);
             skipped++;
             results.push({
               tradeId: trade.id,
+              outcomeName: trade.outcomeName,
               status: 'skipped',
               oldSize,
               newSize: oldSize,
               delta: 0,
+              entryPrice,
+              ensembleProbability: ensembleProb,
+              ...proj,
               reason: `Insufficient balance: $${availableBalance.toFixed(2)} available, $${delta.toFixed(2)} needed`,
+              market: marketInfo,
             });
             continue;
           }
@@ -2175,12 +2273,18 @@ export class PolymarketService {
       totalDelta += actualDelta;
       adjusted++;
 
+      const proj = computeProjection(newSize, entryPrice, ensembleProb);
       results.push({
         tradeId: trade.id,
+        outcomeName: trade.outcomeName,
         status: 'adjusted',
         oldSize,
         newSize,
         delta: Number(actualDelta.toFixed(2)),
+        entryPrice,
+        ensembleProbability: ensembleProb,
+        ...proj,
+        market: marketInfo,
       });
 
       this.logger.log(
@@ -2206,6 +2310,30 @@ export class PolymarketService {
         .where(eq(schema.polymarketBankroll.id, bankroll[0].id));
     }
 
+    // Compute projection totals
+    const totalCost = results.reduce(
+      (s: number, r: any) =>
+        s + (r.status === 'adjusted' ? r.newSize : r.oldSize),
+      0,
+    );
+    const totalPayoutIfAllWin = results.reduce(
+      (s: number, r: any) => s + r.payoutIfWin,
+      0,
+    );
+    const totalProfitIfAllWin = results.reduce(
+      (s: number, r: any) => s + r.profitIfWin,
+      0,
+    );
+    const totalExpectedValue = results.reduce(
+      (s: number, r: any) => s + r.expectedValue,
+      0,
+    );
+
+    // Budget context (re-fetch after updates)
+    const updatedBankroll = await this.getOrCreateBankroll();
+    const initialBudget = Number(updatedBankroll.initialBudget);
+    const currentBalance = Number(updatedBankroll.currentBalance);
+
     this.logger.log(
       `Budget adjustment complete: ${adjusted} adjusted, ${skipped} skipped, net delta: ${totalDelta >= 0 ? '+' : ''}$${totalDelta.toFixed(2)}`,
     );
@@ -2215,6 +2343,33 @@ export class PolymarketService {
       skipped,
       totalDelta: Number(totalDelta.toFixed(2)),
       results,
+      projection: {
+        totalCost: Number(totalCost.toFixed(2)),
+        totalPayoutIfAllWin: Number(totalPayoutIfAllWin.toFixed(2)),
+        totalProfitIfAllWin: Number(totalProfitIfAllWin.toFixed(2)),
+        totalRoiIfAllWin:
+          totalCost > 0
+            ? Number(((totalProfitIfAllWin / totalCost) * 100).toFixed(2))
+            : 0,
+        totalExpectedValue: Number(totalExpectedValue.toFixed(2)),
+      },
+      budget: {
+        mode: updatedBankroll.mode,
+        initialBudget,
+        currentBalance,
+        balanceIfAllWin: Number(
+          (currentBalance + totalProfitIfAllWin).toFixed(2),
+        ),
+        multiplierIfAllWin:
+          initialBudget > 0
+            ? Number(
+                (
+                  (currentBalance + totalProfitIfAllWin) /
+                  initialBudget
+                ).toFixed(2),
+              )
+            : 0,
+      },
     };
   }
 
