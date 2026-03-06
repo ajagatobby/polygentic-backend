@@ -1353,25 +1353,31 @@ export class FootballService {
   }): Promise<any[]> {
     const conditions: any[] = [];
 
+    // Helper: parse a date string safely, returning null for invalid values
+    const safeDate = (str: string | undefined, suffix: string): Date | null => {
+      if (!str || !/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+      const d = new Date(`${str}${suffix}`);
+      return isNaN(d.getTime()) ? null : d;
+    };
+
     // Date range: from/to take priority over single date
-    if (filters?.from || filters?.to) {
-      if (filters.from) {
-        conditions.push(
-          gte(schema.fixtures.date, new Date(`${filters.from}T00:00:00Z`)),
-        );
+    const fromDate = safeDate(filters?.from, 'T00:00:00Z');
+    const toDate = safeDate(filters?.to, 'T23:59:59Z');
+
+    if (fromDate || toDate) {
+      if (fromDate) {
+        conditions.push(gte(schema.fixtures.date, fromDate));
       }
-      if (filters.to) {
-        conditions.push(
-          lte(schema.fixtures.date, new Date(`${filters.to}T23:59:59Z`)),
-        );
+      if (toDate) {
+        conditions.push(lte(schema.fixtures.date, toDate));
       }
     } else {
       // Single date, default to today
       const dateStr = filters?.date ?? new Date().toISOString().split('T')[0];
-      const startOfDay = new Date(`${dateStr}T00:00:00Z`);
-      const endOfDay = new Date(`${dateStr}T23:59:59Z`);
-      conditions.push(gte(schema.fixtures.date, startOfDay));
-      conditions.push(lte(schema.fixtures.date, endOfDay));
+      const startOfDay = safeDate(dateStr, 'T00:00:00Z');
+      const endOfDay = safeDate(dateStr, 'T23:59:59Z');
+      if (startOfDay) conditions.push(gte(schema.fixtures.date, startOfDay));
+      if (endOfDay) conditions.push(lte(schema.fixtures.date, endOfDay));
     }
 
     if (filters?.leagueId) {
