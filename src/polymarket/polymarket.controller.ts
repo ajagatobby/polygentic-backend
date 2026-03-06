@@ -218,6 +218,66 @@ export class PolymarketController {
   }
 
   @Roles('admin')
+  @Post('trades/adjust-budget')
+  @ApiOperation({
+    summary: '[Admin] Increase or decrease the position size of open trades',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        tradeIds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Specific trade IDs to adjust',
+        },
+        month: {
+          type: 'number',
+          description: 'Adjust all open trades from this month (1-12)',
+        },
+        year: {
+          type: 'number',
+          description: 'Year for month filter',
+        },
+        all: {
+          type: 'boolean',
+          description: 'Adjust all open trades',
+        },
+        amount: {
+          type: 'number',
+          description:
+            'Set absolute position size in USD (e.g. 25 = set each trade to $25)',
+        },
+        multiplier: {
+          type: 'number',
+          description:
+            'Scale factor relative to current size (e.g. 2 = double, 0.5 = halve)',
+        },
+      },
+    },
+  })
+  async adjustTradeBudgets(
+    @Body()
+    body: {
+      tradeIds?: number[];
+      month?: number;
+      year?: number;
+      all?: boolean;
+      amount?: number;
+      multiplier?: number;
+    },
+  ) {
+    this.logger.log(`Adjust budget request: ${JSON.stringify(body)}`);
+
+    const result = await this.polymarketService.adjustTradeBudgets(body);
+
+    return {
+      message: `Adjusted ${result.adjusted} trades (${result.skipped} skipped), net change: ${result.totalDelta >= 0 ? '+' : ''}$${result.totalDelta.toFixed(2)}`,
+      ...result,
+    };
+  }
+
+  @Roles('admin')
   @Post('trades/go-live')
   @ApiOperation({
     summary:

@@ -1977,6 +1977,219 @@ export class PolymarketService {
     };
   }
 
+  // ─── Adjust trade budgets ────────────────────────────────────────────
+
+  /**
+   * Adjust the position size of open trades — scale up or down.
+   *
+   * Modes:
+   * - { tradeIds: [1,2,3], amount: 10 }    — set each trade to $10
+   * - { tradeIds: [1,2,3], multiplier: 2 }  — double each trade's position
+   * - { month: 5, year: 2026, amount: 15 }  — set all open trades from May 2026 to $15
+   * - { all: true, multiplier: 0.5 }        — halve all open trades
+   *
+   * `amount` sets an absolute position size. `multiplier` scales relative to current size.
+   * When scaling UP, the increase is capped by the available bankroll balance.
+   * When scaling DOWN, freed funds are returned to the bankroll.
+   */
+  async adjustTradeBudgets(params: {
+    tradeIds?: number[];
+    month?: number;
+    year?: number;
+    all?: boolean;
+    amount?: number; // Absolute position size in USD
+    multiplier?: number; // Relative scale factor (e.g. 2 = double, 0.5 = halve)
+  }): Promise<{
+    adjusted: number;
+    skipped: number;
+    totalDelta: number; // Net change in deployed capital (positive = more spent)
+    results: Array<{
+      tradeId: number;
+      status: 'adjusted' | 'skipped';
+      oldSize: number;
+      newSize: number;
+      delta: number;
+      reason?: string;
+    }>;
+  }> {
+    if (!params.amount && !params.multiplier) {
+      throw new Error('Must provide either amount or multiplier.');
+    }
+    if (params.amount && params.multiplier) {
+      throw new Error('Provide either amount or multiplier, not both.');
+    }
+    if (params.amount !== undefined && params.amount < 0) {
+      throw new Error('Amount must be >= 0.');
+    }
+    if (params.multiplier !== undefined && params.multiplier < 0) {
+      throw new Error('Multiplier must be >= 0.');
+    }
+
+    // Build conditions to find target trades
+    const conditions: any[] = [eq(schema.polymarketTrades.status, 'open')];
+
+    if (params.tradeIds && params.tradeIds.length > 0) {
+      conditions.push(inArray(schema.polymarketTrades.id, params.tradeIds));
+    } else if (params.month && params.year) {
+      const startDate = new Date(params.year, params.month - 1, 1);
+      const endDate = new Date(params.year, params.month, 1);
+      conditions.push(gte(schema.polymarketTrades.createdAt, startDate));
+      conditions.push(lte(schema.polymarketTrades.createdAt, endDate));
+    } else if (!params.all) {
+      throw new Error(
+        'Must provide tradeIds, month+year, or all=true to specify which trades to adjust.',
+      );
+    }
+
+    const trades = await this.db
+      .select()
+      .from(schema.polymarketTrades)
+      .where(and(...conditions))
+      .orderBy(desc(schema.polymarketTrades.createdAt));
+
+    if (trades.length === 0) {
+      return { adjusted: 0, skipped: 0, totalDelta: 0, results: [] };
+    }
+
+    // Get bankroll for the mode of the first trade (paper or live)
+    const mode = trades[0].mode;
+    const bankroll = await this.db
+      .select()
+      .from(schema.polymarketBankroll)
+      .where(eq(schema.polymarketBankroll.mode, mode))
+      .orderBy(desc(schema.polymarketBankroll.updatedAt))
+      .limit(1);
+
+    if (bankroll.length === 0) {
+      throw new Error(`No bankroll found for mode: ${mode}`);
+    }
+
+    let availableBalance = Number(bankroll[0].currentBalance);
+    const initialBudget = Number(bankroll[0].initialBudget);
+    let adjusted = 0;
+    let skipped = 0;
+    let totalDelta = 0;
+    const results: Array<{
+      tradeId: number;
+      status: 'adjusted' | 'skipped';
+      oldSize: number;
+      newSize: number;
+      delta: number;
+      reason?: string;
+    }> = [];
+
+    for (const trade of trades) {
+      const oldSize = Number(trade.positionSizeUsd);
+      const entryPrice = Number(trade.entryPrice);
+      let newSize: number;
+
+      if (params.amount !== undefined) {
+        newSize = params.amount;
+      } else {
+        newSize = oldSize * params.multiplier!;
+      }
+
+      // Round to 2 decimal places
+      newSize = Number(newSize.toFixed(2));
+
+      const delta = newSize - oldSize; // positive = increase, negative = decrease
+
+      // Skip if no change
+      if (Math.abs(delta) < 0.01) {
+        skipped++;
+        results.push({
+          tradeId: trade.id,
+          status: 'skipped',
+          oldSize,
+          newSize: oldSize,
+          delta: 0,
+          reason: 'No change needed',
+        });
+        continue;
+      }
+
+      // If scaling up, check available balance
+      if (delta > 0) {
+        if (delta > availableBalance) {
+          // Cap the increase to what's available
+          const cappedNew = oldSize + availableBalance;
+          if (cappedNew - oldSize < 0.01) {
+            skipped++;
+            results.push({
+              tradeId: trade.id,
+              status: 'skipped',
+              oldSize,
+              newSize: oldSize,
+              delta: 0,
+              reason: `Insufficient balance: $${availableBalance.toFixed(2)} available, $${delta.toFixed(2)} needed`,
+            });
+            continue;
+          }
+          newSize = Number(cappedNew.toFixed(2));
+        }
+      }
+
+      const actualDelta = newSize - oldSize;
+      const newTokenQuantity = entryPrice > 0 ? newSize / entryPrice : 0;
+
+      // Update the trade
+      await this.db
+        .update(schema.polymarketTrades)
+        .set({
+          positionSizeUsd: String(newSize),
+          tokenQuantity: String(newTokenQuantity),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.polymarketTrades.id, trade.id));
+
+      // Update available balance (increase uses balance, decrease frees it)
+      availableBalance -= actualDelta;
+      totalDelta += actualDelta;
+      adjusted++;
+
+      results.push({
+        tradeId: trade.id,
+        status: 'adjusted',
+        oldSize,
+        newSize,
+        delta: Number(actualDelta.toFixed(2)),
+      });
+
+      this.logger.log(
+        `Adjusted trade #${trade.id} (${trade.outcomeName}): $${oldSize.toFixed(2)} → $${newSize.toFixed(2)} (${actualDelta >= 0 ? '+' : ''}$${actualDelta.toFixed(2)})`,
+      );
+    }
+
+    // Update bankroll with net change
+    if (Math.abs(totalDelta) >= 0.01) {
+      const newBalance = Number(bankroll[0].currentBalance) - totalDelta;
+      const currentOpenValue =
+        Number(bankroll[0].openPositionsValue) + totalDelta;
+
+      await this.db
+        .update(schema.polymarketBankroll)
+        .set({
+          currentBalance: String(Number(newBalance.toFixed(2))),
+          openPositionsValue: String(
+            Number(Math.max(0, currentOpenValue).toFixed(2)),
+          ),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.polymarketBankroll.id, bankroll[0].id));
+    }
+
+    this.logger.log(
+      `Budget adjustment complete: ${adjusted} adjusted, ${skipped} skipped, net delta: ${totalDelta >= 0 ? '+' : ''}$${totalDelta.toFixed(2)}`,
+    );
+
+    return {
+      adjusted,
+      skipped,
+      totalDelta: Number(totalDelta.toFixed(2)),
+      results,
+    };
+  }
+
   // ─── Go-live: convert paper trades to live trades ───────────────────
 
   /**
