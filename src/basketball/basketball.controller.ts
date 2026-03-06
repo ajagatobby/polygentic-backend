@@ -419,11 +419,11 @@ export class BasketballController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: '[Admin] Trigger a manual basketball fixture sync' })
   @ApiResponse({ status: 200, description: 'Sync result with counts' })
-  async syncFixtures(@Body() body: BasketballSyncFixturesDto) {
+  async syncFixtures(@Body() body?: BasketballSyncFixturesDto) {
     this.logger.log('Manual basketball fixture sync triggered');
 
     try {
-      const leagueIds = body.leagueIds?.length
+      const leagueIds = body?.leagueIds?.length
         ? body.leagueIds
         : [...TRACKED_BASKETBALL_LEAGUES];
 
