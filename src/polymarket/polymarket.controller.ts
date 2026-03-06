@@ -42,6 +42,37 @@ export class PolymarketController {
     description: 'Filter by matched/unmatched to fixtures',
   })
   @ApiQuery({
+    name: 'month',
+    required: false,
+    type: Number,
+    description: 'Filter by market start date month (1-12)',
+  })
+  @ApiQuery({
+    name: 'year',
+    required: false,
+    type: Number,
+    description: 'Filter by market start date year (e.g. 2026)',
+  })
+  @ApiQuery({
+    name: 'hasTradeOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only return markets that have at least one trade placed',
+  })
+  @ApiQuery({
+    name: 'marketType',
+    required: false,
+    type: String,
+    description:
+      'Filter by market type: match_outcome, league_winner, tournament_winner, qualification, top_4',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by API-Football league ID',
+  })
+  @ApiQuery({
     name: 'limit',
     required: false,
     type: Number,
@@ -50,11 +81,21 @@ export class PolymarketController {
   async getMarkets(
     @Query('active') active?: string,
     @Query('matched') matched?: string,
+    @Query('month') month?: string,
+    @Query('year') year?: string,
+    @Query('hasTradeOnly') hasTradeOnly?: string,
+    @Query('marketType') marketType?: string,
+    @Query('leagueId') leagueId?: string,
     @Query('limit') limit?: string,
   ) {
     const markets = await this.polymarketService.getMarkets({
       active: active !== undefined ? active === 'true' : undefined,
       matched: matched !== undefined ? matched === 'true' : undefined,
+      month: month ? Number(month) : undefined,
+      year: year ? Number(year) : undefined,
+      hasTradeOnly: hasTradeOnly === 'true' || undefined,
+      marketType: marketType || undefined,
+      leagueId: leagueId ? Number(leagueId) : undefined,
       limit: limit ? Number(limit) : undefined,
     });
 

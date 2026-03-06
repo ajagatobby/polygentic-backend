@@ -1747,6 +1747,11 @@ export class PolymarketService implements OnModuleInit {
   async getMarkets(filters?: {
     active?: boolean;
     matched?: boolean;
+    month?: number;
+    year?: number;
+    hasTradeOnly?: boolean;
+    marketType?: string;
+    leagueId?: number;
     limit?: number;
   }): Promise<any[]> {
     const limit = filters?.limit ?? 50;
@@ -1765,7 +1770,56 @@ export class PolymarketService implements OnModuleInit {
       conditions.push(isNull(schema.polymarketMarkets.teamId));
     }
 
+    // Month/year filter on market start date
+    if (filters?.month && filters?.year) {
+      const monthStart = new Date(filters.year, filters.month - 1, 1);
+      const monthEnd = new Date(filters.year, filters.month, 1);
+      conditions.push(gte(schema.polymarketMarkets.startDate, monthStart));
+      conditions.push(lte(schema.polymarketMarkets.startDate, monthEnd));
+    } else if (filters?.year) {
+      const yearStart = new Date(filters.year, 0, 1);
+      const yearEnd = new Date(filters.year + 1, 0, 1);
+      conditions.push(gte(schema.polymarketMarkets.startDate, yearStart));
+      conditions.push(lte(schema.polymarketMarkets.startDate, yearEnd));
+    }
+
+    // Market type filter
+    if (filters?.marketType) {
+      conditions.push(
+        eq(schema.polymarketMarkets.marketType, filters.marketType),
+      );
+    }
+
+    // League filter
+    if (filters?.leagueId) {
+      conditions.push(eq(schema.polymarketMarkets.leagueId, filters.leagueId));
+    }
+
     const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // If hasTradeOnly, join with trades table to only return markets with trades
+    if (filters?.hasTradeOnly) {
+      const rows = await this.db
+        .selectDistinctOn([schema.polymarketMarkets.id], {
+          market: schema.polymarketMarkets,
+        })
+        .from(schema.polymarketMarkets)
+        .innerJoin(
+          schema.polymarketTrades,
+          eq(
+            schema.polymarketTrades.polymarketMarketId,
+            schema.polymarketMarkets.id,
+          ),
+        )
+        .where(where)
+        .orderBy(
+          schema.polymarketMarkets.id,
+          desc(schema.polymarketMarkets.lastSyncedAt),
+        )
+        .limit(limit);
+
+      return rows.map((r: any) => r.market);
+    }
 
     return this.db
       .select()
