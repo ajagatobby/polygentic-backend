@@ -29,6 +29,7 @@ export class PolymarketController {
 
   @Get('markets')
   @ApiOperation({ summary: 'Get discovered Polymarket soccer markets' })
+  // ── State filters ───────────────────────────────────────────────
   @ApiQuery({
     name: 'active',
     required: false,
@@ -36,11 +37,74 @@ export class PolymarketController {
     description: 'Filter by active markets',
   })
   @ApiQuery({
+    name: 'closed',
+    required: false,
+    type: Boolean,
+    description: 'Filter by closed/open markets',
+  })
+  @ApiQuery({
+    name: 'acceptingOrders',
+    required: false,
+    type: Boolean,
+    description: 'Filter by markets currently accepting orders',
+  })
+  @ApiQuery({
     name: 'matched',
     required: false,
     type: Boolean,
-    description: 'Filter by matched/unmatched to fixtures',
+    description: 'Filter by matched/unmatched to internal data',
   })
+  @ApiQuery({
+    name: 'hasTradeOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only return markets that have at least one trade placed',
+  })
+  // ── Classification filters ──────────────────────────────────────
+  @ApiQuery({
+    name: 'marketType',
+    required: false,
+    type: String,
+    description:
+      'Market type: match_outcome, league_winner, tournament_winner, qualification, top_4, player_prop, other',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by API-Football league ID (e.g. 39 = Premier League)',
+  })
+  @ApiQuery({
+    name: 'leagueName',
+    required: false,
+    type: String,
+    description: 'Filter by league name (partial match, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'teamId',
+    required: false,
+    type: Number,
+    description: 'Filter by internal team ID',
+  })
+  @ApiQuery({
+    name: 'teamName',
+    required: false,
+    type: String,
+    description: 'Filter by team name (partial match, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'season',
+    required: false,
+    type: Number,
+    description: 'Filter by season year (e.g. 2025)',
+  })
+  @ApiQuery({
+    name: 'fixtureId',
+    required: false,
+    type: Number,
+    description: 'Filter by linked fixture ID',
+  })
+  // ── Date filters ────────────────────────────────────────────────
   @ApiQuery({
     name: 'month',
     required: false,
@@ -54,23 +118,63 @@ export class PolymarketController {
     description: 'Filter by market start date year (e.g. 2026)',
   })
   @ApiQuery({
-    name: 'hasTradeOnly',
+    name: 'startFrom',
     required: false,
-    type: Boolean,
-    description: 'Only return markets that have at least one trade placed',
+    type: String,
+    description: 'Markets starting from this date (ISO 8601, e.g. 2026-03-01)',
   })
   @ApiQuery({
-    name: 'marketType',
+    name: 'startTo',
     required: false,
     type: String,
     description:
-      'Filter by market type: match_outcome, league_winner, tournament_winner, qualification, top_4',
+      'Markets starting before this date (ISO 8601, e.g. 2026-03-31)',
   })
+  // ── Liquidity / volume filters ──────────────────────────────────
   @ApiQuery({
-    name: 'leagueId',
+    name: 'minLiquidity',
     required: false,
     type: Number,
-    description: 'Filter by API-Football league ID',
+    description: 'Minimum liquidity in USD',
+  })
+  @ApiQuery({
+    name: 'minVolume',
+    required: false,
+    type: Number,
+    description: 'Minimum total volume in USD',
+  })
+  // ── Text search ─────────────────────────────────────────────────
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    type: String,
+    description: 'Search event title and market question (case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'eventId',
+    required: false,
+    type: String,
+    description: 'Filter by Polymarket event ID',
+  })
+  @ApiQuery({
+    name: 'slug',
+    required: false,
+    type: String,
+    description: 'Filter by market slug (partial match)',
+  })
+  // ── Sorting & pagination ────────────────────────────────────────
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    type: String,
+    description:
+      'Sort field: lastSyncedAt (default), volume, liquidity, volume24hr, startDate, createdAt, matchScore',
+  })
+  @ApiQuery({
+    name: 'sortOrder',
+    required: false,
+    type: String,
+    description: 'Sort direction: desc (default) or asc',
   })
   @ApiQuery({
     name: 'limit',
@@ -78,25 +182,78 @@ export class PolymarketController {
     type: Number,
     description: 'Max markets to return (default: 50)',
   })
+  @ApiQuery({
+    name: 'offset',
+    required: false,
+    type: Number,
+    description: 'Offset for pagination (default: 0)',
+  })
   async getMarkets(
+    // State
     @Query('active') active?: string,
+    @Query('closed') closed?: string,
+    @Query('acceptingOrders') acceptingOrders?: string,
     @Query('matched') matched?: string,
-    @Query('month') month?: string,
-    @Query('year') year?: string,
     @Query('hasTradeOnly') hasTradeOnly?: string,
+    // Classification
     @Query('marketType') marketType?: string,
     @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('teamId') teamId?: string,
+    @Query('teamName') teamName?: string,
+    @Query('season') season?: string,
+    @Query('fixtureId') fixtureId?: string,
+    // Dates
+    @Query('month') month?: string,
+    @Query('year') year?: string,
+    @Query('startFrom') startFrom?: string,
+    @Query('startTo') startTo?: string,
+    // Liquidity / volume
+    @Query('minLiquidity') minLiquidity?: string,
+    @Query('minVolume') minVolume?: string,
+    // Text search
+    @Query('search') search?: string,
+    @Query('eventId') eventId?: string,
+    @Query('slug') slug?: string,
+    // Sorting & pagination
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: string,
     @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
   ) {
     const markets = await this.polymarketService.getMarkets({
+      // State
       active: active !== undefined ? active === 'true' : undefined,
+      closed: closed !== undefined ? closed === 'true' : undefined,
+      acceptingOrders:
+        acceptingOrders !== undefined ? acceptingOrders === 'true' : undefined,
       matched: matched !== undefined ? matched === 'true' : undefined,
-      month: month ? Number(month) : undefined,
-      year: year ? Number(year) : undefined,
       hasTradeOnly: hasTradeOnly === 'true' || undefined,
+      // Classification
       marketType: marketType || undefined,
       leagueId: leagueId ? Number(leagueId) : undefined,
+      leagueName: leagueName || undefined,
+      teamId: teamId ? Number(teamId) : undefined,
+      teamName: teamName || undefined,
+      season: season ? Number(season) : undefined,
+      fixtureId: fixtureId ? Number(fixtureId) : undefined,
+      // Dates
+      month: month ? Number(month) : undefined,
+      year: year ? Number(year) : undefined,
+      startFrom: startFrom || undefined,
+      startTo: startTo || undefined,
+      // Liquidity / volume
+      minLiquidity: minLiquidity ? Number(minLiquidity) : undefined,
+      minVolume: minVolume ? Number(minVolume) : undefined,
+      // Text search
+      search: search || undefined,
+      eventId: eventId || undefined,
+      slug: slug || undefined,
+      // Sorting & pagination
+      sortBy: sortBy || undefined,
+      sortOrder: (sortOrder as 'asc' | 'desc') || undefined,
       limit: limit ? Number(limit) : undefined,
+      offset: offset ? Number(offset) : undefined,
     });
 
     return {

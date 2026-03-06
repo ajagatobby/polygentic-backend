@@ -1745,20 +1745,53 @@ export class PolymarketService implements OnModuleInit {
   }
 
   async getMarkets(filters?: {
+    // State
     active?: boolean;
+    closed?: boolean;
+    acceptingOrders?: boolean;
     matched?: boolean;
-    month?: number;
-    year?: number;
     hasTradeOnly?: boolean;
+    // Classification
     marketType?: string;
     leagueId?: number;
+    leagueName?: string;
+    teamId?: number;
+    teamName?: string;
+    season?: number;
+    fixtureId?: number;
+    // Dates
+    month?: number;
+    year?: number;
+    startFrom?: string;
+    startTo?: string;
+    // Liquidity / volume
+    minLiquidity?: number;
+    minVolume?: number;
+    // Text search
+    search?: string;
+    eventId?: string;
+    slug?: string;
+    // Sorting & pagination
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
     limit?: number;
+    offset?: number;
   }): Promise<any[]> {
     const limit = filters?.limit ?? 50;
+    const offset = filters?.offset ?? 0;
     const conditions: any[] = [];
 
+    // ── State filters ─────────────────────────────────────────────
     if (filters?.active !== undefined) {
       conditions.push(eq(schema.polymarketMarkets.active, filters.active));
+    }
+    if (filters?.closed !== undefined) {
+      conditions.push(eq(schema.polymarketMarkets.closed, filters.closed));
+    }
+    if (filters?.acceptingOrders !== undefined) {
+      conditions.push(
+        eq(schema.polymarketMarkets.acceptingOrders, filters.acceptingOrders),
+      );
     }
     if (filters?.matched === true) {
       conditions.push(
@@ -1770,7 +1803,38 @@ export class PolymarketService implements OnModuleInit {
       conditions.push(isNull(schema.polymarketMarkets.teamId));
     }
 
-    // Month/year filter on market start date
+    // ── Classification filters ────────────────────────────────────
+    if (filters?.marketType) {
+      conditions.push(
+        eq(schema.polymarketMarkets.marketType, filters.marketType),
+      );
+    }
+    if (filters?.leagueId) {
+      conditions.push(eq(schema.polymarketMarkets.leagueId, filters.leagueId));
+    }
+    if (filters?.leagueName) {
+      conditions.push(
+        sql`LOWER(${schema.polymarketMarkets.leagueName}) LIKE ${`%${filters.leagueName.toLowerCase()}%`}`,
+      );
+    }
+    if (filters?.teamId) {
+      conditions.push(eq(schema.polymarketMarkets.teamId, filters.teamId));
+    }
+    if (filters?.teamName) {
+      conditions.push(
+        sql`LOWER(${schema.polymarketMarkets.teamName}) LIKE ${`%${filters.teamName.toLowerCase()}%`}`,
+      );
+    }
+    if (filters?.season) {
+      conditions.push(eq(schema.polymarketMarkets.season, filters.season));
+    }
+    if (filters?.fixtureId) {
+      conditions.push(
+        eq(schema.polymarketMarkets.fixtureId, filters.fixtureId),
+      );
+    }
+
+    // ── Date filters ──────────────────────────────────────────────
     if (filters?.month && filters?.year) {
       const monthStart = new Date(filters.year, filters.month - 1, 1);
       const monthEnd = new Date(filters.year, filters.month, 1);
@@ -1782,22 +1846,65 @@ export class PolymarketService implements OnModuleInit {
       conditions.push(gte(schema.polymarketMarkets.startDate, yearStart));
       conditions.push(lte(schema.polymarketMarkets.startDate, yearEnd));
     }
-
-    // Market type filter
-    if (filters?.marketType) {
+    if (filters?.startFrom) {
       conditions.push(
-        eq(schema.polymarketMarkets.marketType, filters.marketType),
+        gte(schema.polymarketMarkets.startDate, new Date(filters.startFrom)),
+      );
+    }
+    if (filters?.startTo) {
+      conditions.push(
+        lte(schema.polymarketMarkets.startDate, new Date(filters.startTo)),
       );
     }
 
-    // League filter
-    if (filters?.leagueId) {
-      conditions.push(eq(schema.polymarketMarkets.leagueId, filters.leagueId));
+    // ── Liquidity / volume filters ────────────────────────────────
+    if (filters?.minLiquidity) {
+      conditions.push(
+        gte(schema.polymarketMarkets.liquidity, String(filters.minLiquidity)),
+      );
+    }
+    if (filters?.minVolume) {
+      conditions.push(
+        gte(schema.polymarketMarkets.volume, String(filters.minVolume)),
+      );
     }
 
+    // ── Text search ───────────────────────────────────────────────
+    if (filters?.search) {
+      const term = `%${filters.search.toLowerCase()}%`;
+      conditions.push(
+        sql`(LOWER(${schema.polymarketMarkets.eventTitle}) LIKE ${term} OR LOWER(${schema.polymarketMarkets.marketQuestion}) LIKE ${term})`,
+      );
+    }
+    if (filters?.eventId) {
+      conditions.push(eq(schema.polymarketMarkets.eventId, filters.eventId));
+    }
+    if (filters?.slug) {
+      conditions.push(
+        sql`LOWER(${schema.polymarketMarkets.slug}) LIKE ${`%${filters.slug.toLowerCase()}%`}`,
+      );
+    }
+
+    // ── Build WHERE clause ────────────────────────────────────────
     const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-    // If hasTradeOnly, join with trades table to only return markets with trades
+    // ── Sorting ───────────────────────────────────────────────────
+    const sortDirection = filters?.sortOrder === 'asc' ? asc : desc;
+    const sortColumnMap: Record<string, any> = {
+      lastSyncedAt: schema.polymarketMarkets.lastSyncedAt,
+      volume: schema.polymarketMarkets.volume,
+      liquidity: schema.polymarketMarkets.liquidity,
+      volume24hr: schema.polymarketMarkets.volume24hr,
+      startDate: schema.polymarketMarkets.startDate,
+      createdAt: schema.polymarketMarkets.createdAt,
+      matchScore: schema.polymarketMarkets.matchScore,
+    };
+    const sortColumn =
+      sortColumnMap[filters?.sortBy ?? ''] ??
+      schema.polymarketMarkets.lastSyncedAt;
+    const orderBy = sortDirection(sortColumn);
+
+    // ── If hasTradeOnly, join with trades table ───────────────────
     if (filters?.hasTradeOnly) {
       const rows = await this.db
         .selectDistinctOn([schema.polymarketMarkets.id], {
@@ -1812,11 +1919,9 @@ export class PolymarketService implements OnModuleInit {
           ),
         )
         .where(where)
-        .orderBy(
-          schema.polymarketMarkets.id,
-          desc(schema.polymarketMarkets.lastSyncedAt),
-        )
-        .limit(limit);
+        .orderBy(schema.polymarketMarkets.id, orderBy)
+        .limit(limit)
+        .offset(offset);
 
       return rows.map((r: any) => r.market);
     }
@@ -1825,8 +1930,9 @@ export class PolymarketService implements OnModuleInit {
       .select()
       .from(schema.polymarketMarkets)
       .where(where)
-      .orderBy(desc(schema.polymarketMarkets.lastSyncedAt))
-      .limit(limit);
+      .orderBy(orderBy)
+      .limit(limit)
+      .offset(offset);
   }
 
   // ─── Trades by month ────────────────────────────────────────────────
