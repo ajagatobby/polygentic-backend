@@ -8,7 +8,10 @@ import {
 } from '@nestjs/swagger';
 import { Roles } from '../auth/roles.decorator';
 import { PolymarketService } from './polymarket.service';
-import { polymarketScanTask } from '../trigger/polymarket-scan';
+import {
+  polymarketScanTask,
+  polymarketTradeTask,
+} from '../trigger/polymarket-scan';
 
 @ApiTags('Polymarket Trading Agent')
 @ApiBearerAuth('firebase-auth')
@@ -314,6 +317,22 @@ export class PolymarketController {
 
     return {
       message: 'Polymarket scan cycle triggered',
+      taskRunId: handle.id,
+    };
+  }
+
+  @Post('trade')
+  @ApiOperation({
+    summary:
+      '[Admin] Trigger a Polymarket trading cycle — generate predictions for soonest fixtures and place trades',
+  })
+  async triggerTrade() {
+    this.logger.log('Triggering Polymarket trading cycle via API');
+
+    const handle = await polymarketTradeTask.trigger(undefined as void);
+
+    return {
+      message: 'Polymarket trading cycle triggered (soonest fixtures first)',
       taskRunId: handle.id,
     };
   }

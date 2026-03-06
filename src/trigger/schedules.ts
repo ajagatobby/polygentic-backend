@@ -11,7 +11,7 @@ import {
   syncStandingsTask,
   syncOddsTask,
 } from './sync-data';
-import { polymarketScanTask } from './polymarket-scan';
+import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
 
 /**
  * ┌──────────────────────────────────────────────────────────────────┐
@@ -25,6 +25,10 @@ import { polymarketScanTask } from './polymarket-scan';
  * │  - Pre-match predictions    — every 15 min                       │
  * │  - Lineup predictions       — every 5 min                        │
  * │  - Sync + resolve           — every hour                         │
+ * │                                                                  │
+ * │  Polymarket:                                                      │
+ * │  - Market scan (Gamma API)  — every 30 min                       │
+ * │  - Trading cycle            — every 2 hours                      │
  * │                                                                  │
  * │  Data sync:                                                      │
  * │  - Fixtures (upcoming)      — every 30 min                       │
@@ -161,5 +165,19 @@ export const polymarketScanSchedule = schedules.task({
     logger.info('Scheduled: Polymarket trading agent scan');
     const handle = await polymarketScanTask.trigger(undefined as void);
     logger.info('Triggered Polymarket scan task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 2 hours: Evaluate persisted Polymarket markets, generate predictions
+ * for fixtures that need them (soonest-first), and place trades.
+ */
+export const polymarketTradeSchedule = schedules.task({
+  id: 'scheduled-polymarket-trade',
+  cron: '15 */2 * * *',
+  run: async () => {
+    logger.info('Scheduled: Polymarket trading cycle');
+    const handle = await polymarketTradeTask.trigger(undefined as void);
+    logger.info('Triggered Polymarket trade task', { runId: handle.id });
   },
 });

@@ -218,6 +218,375 @@ export class PolymarketService implements OnModuleInit {
     };
   }
 
+  // ─── Trading cycle (works from persisted markets, generates predictions on-the-fly) ──
+
+  /**
+   * Run a dedicated trading cycle that reads already-persisted markets from DB,
+   * generates predictions for fixtures that lack one, and places trades.
+   *
+   * Unlike runScanCycle() which re-discovers markets from the Gamma API,
+   * this operates purely on markets already in polymarket_markets.
+   *
+   * Fixtures are processed **soonest-first** so near-term opportunities
+   * are traded before distant ones.
+   *
+   * @param agentsService — injected by the Trigger.dev task (not part of DI)
+   * @param maxPredictions — cap on how many predictions to generate per cycle (controls Claude costs)
+   */
+  async runTradingCycle(
+    agentsService: {
+      generatePrediction: (
+        fixtureId: number,
+        predictionType: string,
+      ) => Promise<any>;
+    },
+    maxPredictions = 10,
+  ): Promise<{
+    fixturesEvaluated: number;
+    predictionsGenerated: number;
+    candidatesFound: number;
+    tradesPlaced: number;
+    tradesSkipped: number;
+    errors: string[];
+  }> {
+    const startTime = Date.now();
+    const errors: string[] = [];
+    let predictionsGenerated = 0;
+    let tradesPlaced = 0;
+    let tradesSkipped = 0;
+
+    const minEdge = this.config.get<number>('POLYMARKET_MIN_EDGE') || 0.05;
+    const minLiquidity =
+      this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') || 1000;
+    const minConfidence =
+      this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
+
+    this.logger.log(
+      'Starting Polymarket trading cycle (from persisted markets)',
+    );
+
+    // ── Step 1: Get unique fixture IDs from open match_outcome markets ──
+    // Ordered by soonest start date first, filtered to:
+    //   - active, not closed, accepting orders
+    //   - fixture matched (fixture_id IS NOT NULL)
+    //   - liquidity >= threshold
+    //   - fixture status = NS (not started)
+    //   - no existing open trade on any market for this fixture
+    const fixtureRows = await this.db.execute(sql`
+      SELECT DISTINCT ON (pm.fixture_id)
+        pm.fixture_id,
+        f.date AS fixture_date,
+        f.home_team_id,
+        f.away_team_id,
+        f.status AS fixture_status
+      FROM polymarket_markets pm
+      INNER JOIN fixtures f ON f.id = pm.fixture_id
+      LEFT JOIN polymarket_trades pt
+        ON pt.fixture_id = pm.fixture_id AND pt.status = 'open'
+      WHERE pm.fixture_id IS NOT NULL
+        AND pm.active = true
+        AND pm.closed = false
+        AND pm.accepting_orders = true
+        AND CAST(pm.liquidity AS numeric) >= ${minLiquidity}
+        AND f.status = 'NS'
+        AND f.date > NOW()
+        AND pt.id IS NULL
+      ORDER BY pm.fixture_id, f.date ASC
+    `);
+
+    // Sort by fixture date ascending (soonest first)
+    const fixtureList = (fixtureRows as any[]).sort(
+      (a: any, b: any) =>
+        new Date(a.fixture_date).getTime() - new Date(b.fixture_date).getTime(),
+    );
+
+    this.logger.log(
+      `Trading cycle: ${fixtureList.length} tradeable fixtures (soonest-first, no open trades, liq >= $${minLiquidity})`,
+    );
+
+    if (fixtureList.length === 0) {
+      return {
+        fixturesEvaluated: 0,
+        predictionsGenerated: 0,
+        candidatesFound: 0,
+        tradesPlaced: 0,
+        tradesSkipped: 0,
+        errors,
+      };
+    }
+
+    // ── Step 2: Check bankroll ──
+    let bankroll = await this.getOrCreateBankroll();
+    if (bankroll.isStopped) {
+      this.logger.warn(
+        `Trading is STOPPED: ${bankroll.stoppedReason}. Skipping trading cycle.`,
+      );
+      return {
+        fixturesEvaluated: fixtureList.length,
+        predictionsGenerated: 0,
+        candidatesFound: 0,
+        tradesPlaced: 0,
+        tradesSkipped: 0,
+        errors: [`Trading stopped: ${bankroll.stoppedReason}`],
+      };
+    }
+
+    if (Number(bankroll.currentBalance) <= 0) {
+      this.logger.warn('Budget exhausted — skipping trading cycle');
+      return {
+        fixturesEvaluated: fixtureList.length,
+        predictionsGenerated: 0,
+        candidatesFound: 0,
+        tradesPlaced: 0,
+        tradesSkipped: 0,
+        errors: ['Budget exhausted'],
+      };
+    }
+
+    // ── Step 3: For each fixture (soonest first), ensure prediction exists ──
+    const candidates: FixtureTradingCandidate[] = [];
+
+    for (const row of fixtureList) {
+      const fixtureId = row.fixture_id;
+
+      try {
+        // Check if prediction exists
+        const [existing] = await this.db
+          .select({ id: schema.predictions.id })
+          .from(schema.predictions)
+          .where(
+            and(
+              eq(schema.predictions.fixtureId, fixtureId),
+              isNull(schema.predictions.resolvedAt),
+            ),
+          )
+          .limit(1);
+
+        if (!existing && predictionsGenerated < maxPredictions) {
+          // Generate prediction on-the-fly
+          this.logger.log(
+            `Generating prediction for fixture ${fixtureId} (${new Date(row.fixture_date).toISOString()})`,
+          );
+          try {
+            await agentsService.generatePrediction(fixtureId, 'daily');
+            predictionsGenerated++;
+          } catch (err: any) {
+            this.logger.warn(
+              `Failed to generate prediction for fixture ${fixtureId}: ${err.message}`,
+            );
+            errors.push(`Prediction failed for ${fixtureId}: ${err.message}`);
+            continue;
+          }
+        } else if (!existing) {
+          // Hit the prediction cap — skip remaining fixtures without predictions
+          this.logger.debug(
+            `Prediction cap reached (${maxPredictions}), skipping fixture ${fixtureId}`,
+          );
+          continue;
+        }
+
+        // Now build a candidate from all match_outcome markets for this fixture
+        const markets = await this.db
+          .select()
+          .from(schema.polymarketMarkets)
+          .where(
+            and(
+              eq(schema.polymarketMarkets.fixtureId, fixtureId),
+              eq(schema.polymarketMarkets.active, true),
+              eq(schema.polymarketMarkets.closed, false),
+              eq(schema.polymarketMarkets.acceptingOrders, true),
+              gte(schema.polymarketMarkets.liquidity, String(minLiquidity)),
+            ),
+          );
+
+        // Rebuild the FixtureMarketMatch from the DB record for each market
+        const [fixture] = await this.db
+          .select()
+          .from(schema.fixtures)
+          .where(eq(schema.fixtures.id, fixtureId))
+          .limit(1);
+
+        if (!fixture) continue;
+
+        const [homeTeam] = await this.db
+          .select()
+          .from(schema.teams)
+          .where(eq(schema.teams.id, fixture.homeTeamId))
+          .limit(1);
+        const [awayTeam] = await this.db
+          .select()
+          .from(schema.teams)
+          .where(eq(schema.teams.id, fixture.awayTeamId))
+          .limit(1);
+
+        if (!homeTeam || !awayTeam) continue;
+
+        for (const mkt of markets) {
+          // Skip if there's already an open trade on this specific market
+          const [openTrade] = await this.db
+            .select({ id: schema.polymarketTrades.id })
+            .from(schema.polymarketTrades)
+            .where(
+              and(
+                eq(schema.polymarketTrades.polymarketMarketId, mkt.id),
+                eq(schema.polymarketTrades.status, 'open'),
+              ),
+            )
+            .limit(1);
+          if (openTrade) continue;
+
+          // Reconstruct the FixtureMarketMatch shape from DB data
+          const liq = Number(mkt.liquidity ?? 0);
+          const vol = Number(mkt.volume ?? 0);
+          const vol24 = Number(mkt.volume24hr ?? 0);
+          const prices = (mkt.outcomePrices ?? []).map(Number);
+
+          const parsedMarket = {
+            marketId: mkt.marketId,
+            question: mkt.marketQuestion,
+            conditionId: mkt.conditionId ?? '',
+            slug: mkt.slug ?? '',
+            outcomes: mkt.outcomes ?? [],
+            outcomePrices: prices,
+            clobTokenIds: mkt.clobTokenIds ?? [],
+            volume: vol,
+            volume24hr: vol24,
+            liquidity: liq,
+            active: mkt.active ?? true,
+            closed: mkt.closed ?? false,
+            acceptingOrders: mkt.acceptingOrders ?? true,
+          };
+
+          const match: FixtureMarketMatch = {
+            event: {
+              eventId: mkt.eventId,
+              title: mkt.eventTitle,
+              slug: mkt.slug ?? '',
+              description: '',
+              startDate: mkt.startDate?.toISOString() ?? null,
+              endDate: mkt.endDate?.toISOString() ?? null,
+              active: mkt.active ?? true,
+              closed: mkt.closed ?? false,
+              liquidity: liq,
+              volume: vol,
+              volume24hr: vol24,
+              markets: [parsedMarket],
+              negRisk: false,
+              seriesSlug: '',
+              polymarketTagSlug: undefined,
+              tags:
+                (mkt.tags as Array<{
+                  id: string;
+                  slug: string;
+                  label: string;
+                }>) ?? [],
+            },
+            market: parsedMarket,
+            marketType: 'match_outcome',
+            matchScore: Number(mkt.matchScore ?? 0),
+            fixtureId,
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+            homeTeamName: homeTeam.name,
+            awayTeamName: awayTeam.name,
+          };
+
+          const candidate = await this.buildFixtureCandidate(match, minEdge);
+          if (candidate) candidates.push(candidate);
+        }
+      } catch (err: any) {
+        this.logger.error(
+          `Error processing fixture ${fixtureId}: ${err.message}`,
+        );
+        errors.push(`Fixture ${fixtureId}: ${err.message}`);
+      }
+    }
+
+    // Sort by fixture date soonest first, then by edge descending within same date
+    candidates.sort((a, b) => {
+      const dateA = new Date(a.match.event.startDate || '').getTime() || 0;
+      const dateB = new Date(b.match.event.startDate || '').getTime() || 0;
+      // Group by same day, then sort by edge within day
+      const dayA = Math.floor(dateA / 86_400_000);
+      const dayB = Math.floor(dateB / 86_400_000);
+      if (dayA !== dayB) return dayA - dayB; // Soonest day first
+      return b.rawEdge - a.rawEdge; // Highest edge first within same day
+    });
+
+    this.logger.log(
+      `Trading cycle: ${candidates.length} candidates from ${fixtureList.length} fixtures ` +
+        `(${predictionsGenerated} new predictions generated)`,
+    );
+
+    // ── Step 4: Evaluate candidates with trading agent ──
+    if (candidates.length > 0) {
+      let bankrollContext = await this.buildBankrollContext();
+      const openPositions = await this.getOpenPositionsSummary();
+
+      for (const candidate of candidates) {
+        try {
+          // Re-fetch bankroll for accurate balance
+          bankroll = await this.getOrCreateBankroll();
+          bankrollContext = await this.buildBankrollContext();
+
+          if (Number(bankroll.currentBalance) <= 0) {
+            this.logger.warn('Budget exhausted — stopping trade placement');
+            break;
+          }
+
+          if (bankroll.isStopped) {
+            this.logger.warn('Stop-loss triggered — stopping trade placement');
+            break;
+          }
+
+          const decision = await this.tradingAgent.evaluate(
+            candidate,
+            bankrollContext,
+            openPositions,
+          );
+
+          if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
+            await this.executeTrade(candidate, decision, bankroll);
+            tradesPlaced++;
+
+            openPositions.push({
+              outcomeName: decision.outcomeName,
+              fixtureId: candidate.match.fixtureId,
+              positionSizeUsd: decision.positionSizeUsd,
+            });
+          } else {
+            await this.logSkippedTrade(candidate, decision);
+            tradesSkipped++;
+          }
+        } catch (err: any) {
+          this.logger.error(
+            `Failed to evaluate candidate for fixture ${candidate.match.fixtureId}: ${err.message}`,
+          );
+          errors.push(err.message);
+        }
+      }
+    }
+
+    // ── Step 5: Update bankroll ──
+    await this.updateBankrollSnapshot();
+
+    const duration = Date.now() - startTime;
+    this.logger.log(
+      `Polymarket trading cycle complete in ${duration}ms: ` +
+        `${fixtureList.length} fixtures evaluated, ${predictionsGenerated} predictions generated, ` +
+        `${candidates.length} candidates, ${tradesPlaced} trades placed, ${tradesSkipped} skipped`,
+    );
+
+    return {
+      fixturesEvaluated: fixtureList.length,
+      predictionsGenerated,
+      candidatesFound: candidates.length,
+      tradesPlaced,
+      tradesSkipped,
+      errors,
+    };
+  }
+
   // ─── Candidate building ─────────────────────────────────────────────
 
   /**
