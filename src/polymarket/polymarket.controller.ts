@@ -324,16 +324,31 @@ export class PolymarketController {
   @Post('trade')
   @ApiOperation({
     summary:
-      '[Admin] Trigger a Polymarket trading cycle — generate predictions for soonest fixtures and place trades',
+      '[Admin] Trigger a Polymarket trading cycle — prediction-first, runs in-process',
   })
-  async triggerTrade() {
+  @ApiQuery({
+    name: 'async',
+    required: false,
+    description:
+      'If true, dispatches to Trigger.dev worker and returns immediately. Default: false (runs in-process).',
+  })
+  async triggerTrade(@Query('async') async?: string) {
     this.logger.log('Triggering Polymarket trading cycle via API');
 
-    const handle = await polymarketTradeTask.trigger(undefined as void);
+    if (async === 'true') {
+      const handle = await polymarketTradeTask.trigger(undefined as void);
+      return {
+        message: 'Polymarket trading cycle dispatched to Trigger.dev (async)',
+        taskRunId: handle.id,
+      };
+    }
+
+    // Run in-process for immediate feedback
+    const result = await this.polymarketService.runTradingCycle();
 
     return {
-      message: 'Polymarket trading cycle triggered (soonest fixtures first)',
-      taskRunId: handle.id,
+      message: 'Polymarket trading cycle complete',
+      ...result,
     };
   }
 
