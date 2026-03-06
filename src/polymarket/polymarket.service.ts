@@ -1169,6 +1169,47 @@ export class PolymarketService implements OnModuleInit {
    * Map fixture prediction probabilities to the market's outcome.
    * (Same logic as before — for "Will X beat Y?" markets)
    */
+  /**
+   * Check if a team name matches a text snippet.
+   * Handles cases like "AZ" matching "AZ Alkmaar", "PSV" matching "PSV Eindhoven",
+   * and "Al Ahli Saudi Club" matching "Al-Ahli Jeddah".
+   */
+  private teamMatchesText(teamName: string, text: string): boolean {
+    const teamNorm = teamName.toLowerCase().replace(/-/g, ' ');
+    const textNorm = text.toLowerCase().replace(/-/g, ' ');
+
+    // Direct match
+    if (textNorm.includes(teamNorm)) return true;
+
+    // Extract the team name from "Will X win on YYYY-MM-DD?" pattern
+    const willWinMatch = textNorm.match(
+      /will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}/,
+    );
+    if (willWinMatch) {
+      const marketTeam = willWinMatch[1].trim();
+      // Check if market team is a prefix of our team (e.g., "psv" in "psv eindhoven")
+      if (teamNorm.startsWith(marketTeam + ' ') || teamNorm === marketTeam)
+        return true;
+      // Check if our team starts with the market team's first word(s)
+      const marketWords = marketTeam.split(/\s+/);
+      const teamWords = teamNorm.split(/\s+/);
+      if (
+        marketWords.length >= 1 &&
+        teamWords.length >= 1 &&
+        marketWords[0] === teamWords[0] &&
+        marketWords.length <= teamWords.length
+      ) {
+        // All market words must appear in order at the start of team words
+        const allMatch = marketWords.every(
+          (w: string, i: number) => teamWords[i] === w,
+        );
+        if (allMatch) return true;
+      }
+    }
+
+    return false;
+  }
+
   private mapFixturePredictionToOutcome(
     match: FixtureMarketMatch,
     prediction: any,
@@ -1177,17 +1218,26 @@ export class PolymarketService implements OnModuleInit {
     const title = match.event.title.toLowerCase();
     const text = `${question} ${title}`;
 
-    const homeTeamNorm = match.homeTeamName.toLowerCase();
-    const awayTeamNorm = match.awayTeamName.toLowerCase();
+    const homeMatches = this.teamMatchesText(match.homeTeamName, text);
+    const awayMatches = this.teamMatchesText(match.awayTeamName, text);
 
+    // "Will X beat Y?" or "Will X win?" style
     if (
-      text.includes(homeTeamNorm) &&
+      homeMatches &&
       (text.includes('beat') || text.includes('win') || text.includes('defeat'))
     ) {
-      if (
-        text.includes(awayTeamNorm) &&
-        text.indexOf(homeTeamNorm) < text.indexOf(awayTeamNorm)
-      ) {
+      if (awayMatches) {
+        // Both teams mentioned — the first one is the subject
+        const homeIdx = text.indexOf(match.homeTeamName.toLowerCase());
+        const awayIdx = text.indexOf(match.awayTeamName.toLowerCase());
+        if (homeIdx >= 0 && awayIdx >= 0 && homeIdx < awayIdx) {
+          return {
+            ensembleProb: Number(prediction.homeWinProb),
+            outcomeDescription: `${match.homeTeamName} Win`,
+          };
+        }
+      } else {
+        // Only home team mentioned
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
@@ -1196,13 +1246,10 @@ export class PolymarketService implements OnModuleInit {
     }
 
     if (
-      text.includes(awayTeamNorm) &&
+      awayMatches &&
       (text.includes('beat') || text.includes('win') || text.includes('defeat'))
     ) {
-      if (
-        text.includes(homeTeamNorm) &&
-        text.indexOf(awayTeamNorm) < text.indexOf(homeTeamNorm)
-      ) {
+      if (!homeMatches) {
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
@@ -1210,15 +1257,16 @@ export class PolymarketService implements OnModuleInit {
       }
     }
 
+    // Yes/No outcomes — single team mentioned
     const outcomes = match.market.outcomes.map((o) => o.toLowerCase());
     if (outcomes.includes('yes') && outcomes.includes('no')) {
-      if (text.includes(homeTeamNorm) && !text.includes(awayTeamNorm)) {
+      if (homeMatches && !awayMatches) {
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
         };
       }
-      if (text.includes(awayTeamNorm) && !text.includes(homeTeamNorm)) {
+      if (awayMatches && !homeMatches) {
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
@@ -1226,14 +1274,15 @@ export class PolymarketService implements OnModuleInit {
       }
     }
 
+    // Check outcome names for team references
     for (let i = 0; i < outcomes.length; i++) {
-      if (outcomes[i].includes(homeTeamNorm)) {
+      if (this.teamMatchesText(match.homeTeamName, outcomes[i])) {
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
         };
       }
-      if (outcomes[i].includes(awayTeamNorm)) {
+      if (this.teamMatchesText(match.awayTeamName, outcomes[i])) {
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
