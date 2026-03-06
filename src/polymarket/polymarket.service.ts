@@ -1706,6 +1706,192 @@ export class PolymarketService {
     }));
   }
 
+  // ─── Potential profit projection ─────────────────────────────────────
+
+  /**
+   * Calculate potential profit for open trades if outcomes are predicted correctly.
+   *
+   * Binary outcome tokens pay $1 on a win. So:
+   *   tokenQuantity = positionSizeUsd / entryPrice
+   *   payout = tokenQuantity * $1
+   *   profit = payout - positionSizeUsd
+   *   ROI = profit / positionSizeUsd
+   *
+   * Groups trades by market type and league for aggregated projections.
+   */
+  async getPotentialProfit(filters?: {
+    month?: number;
+    year?: number;
+    status?: string;
+  }): Promise<any> {
+    const conditions: any[] = [];
+
+    if (filters?.month && filters?.year) {
+      const startDate = new Date(filters.year, filters.month - 1, 1);
+      const endDate = new Date(filters.year, filters.month, 1);
+      conditions.push(gte(schema.polymarketTrades.createdAt, startDate));
+      conditions.push(lte(schema.polymarketTrades.createdAt, endDate));
+    }
+
+    if (filters?.status) {
+      conditions.push(eq(schema.polymarketTrades.status, filters.status));
+    } else {
+      // Default to open trades
+      conditions.push(eq(schema.polymarketTrades.status, 'open'));
+    }
+
+    const rows = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
+      .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(schema.polymarketTrades.createdAt));
+
+    // Per-trade projections
+    const trades = rows.map(({ trade, market }: any) => {
+      const entryPrice = Number(trade.entryPrice);
+      const positionSizeUsd = Number(trade.positionSizeUsd);
+      const tokenQuantity =
+        Number(trade.tokenQuantity) || positionSizeUsd / entryPrice;
+
+      // If win: each token pays $1
+      const payoutIfWin = tokenQuantity * 1.0;
+      const profitIfWin = payoutIfWin - positionSizeUsd;
+      const roiIfWin = positionSizeUsd > 0 ? profitIfWin / positionSizeUsd : 0;
+
+      // If loss: tokens worth $0
+      const lossIfLoss = -positionSizeUsd;
+
+      // Expected value based on our ensemble probability
+      const ensembleProb = Number(trade.ensembleProbability);
+      const expectedValue =
+        ensembleProb * profitIfWin + (1 - ensembleProb) * lossIfLoss;
+
+      return {
+        id: trade.id,
+        mode: trade.mode,
+        outcomeName: trade.outcomeName,
+        status: trade.status,
+        entryPrice,
+        positionSizeUsd,
+        tokenQuantity: Number(tokenQuantity.toFixed(4)),
+        ensembleProbability: ensembleProb,
+        polymarketProbability: Number(trade.polymarketProbability),
+        edgePercent: Number(trade.edgePercent),
+        // Projections
+        payoutIfWin: Number(payoutIfWin.toFixed(2)),
+        profitIfWin: Number(profitIfWin.toFixed(2)),
+        roiIfWin: Number((roiIfWin * 100).toFixed(2)), // as percentage
+        lossIfLoss: Number(lossIfLoss.toFixed(2)),
+        expectedValue: Number(expectedValue.toFixed(2)),
+        createdAt: trade.createdAt,
+        // Market context
+        market: {
+          eventTitle: market.eventTitle,
+          marketQuestion: market.marketQuestion,
+          marketType: market.marketType,
+          leagueName: market.leagueName,
+          teamName: market.teamName,
+          endDate: market.endDate,
+        },
+      };
+    });
+
+    // Aggregates
+    const totalCost = trades.reduce((s, t) => s + t.positionSizeUsd, 0);
+    const totalPayoutIfAllWin = trades.reduce((s, t) => s + t.payoutIfWin, 0);
+    const totalProfitIfAllWin = trades.reduce((s, t) => s + t.profitIfWin, 0);
+    const totalExpectedValue = trades.reduce((s, t) => s + t.expectedValue, 0);
+
+    // Group by market type
+    const byMarketType: Record<
+      string,
+      {
+        count: number;
+        totalCost: number;
+        profitIfAllWin: number;
+        expectedValue: number;
+      }
+    > = {};
+    for (const t of trades) {
+      const type = t.market.marketType;
+      if (!byMarketType[type]) {
+        byMarketType[type] = {
+          count: 0,
+          totalCost: 0,
+          profitIfAllWin: 0,
+          expectedValue: 0,
+        };
+      }
+      byMarketType[type].count++;
+      byMarketType[type].totalCost += t.positionSizeUsd;
+      byMarketType[type].profitIfAllWin += t.profitIfWin;
+      byMarketType[type].expectedValue += t.expectedValue;
+    }
+
+    // Group by league
+    const byLeague: Record<
+      string,
+      {
+        count: number;
+        totalCost: number;
+        profitIfAllWin: number;
+        expectedValue: number;
+      }
+    > = {};
+    for (const t of trades) {
+      const league = t.market.leagueName || 'Unknown';
+      if (!byLeague[league]) {
+        byLeague[league] = {
+          count: 0,
+          totalCost: 0,
+          profitIfAllWin: 0,
+          expectedValue: 0,
+        };
+      }
+      byLeague[league].count++;
+      byLeague[league].totalCost += t.positionSizeUsd;
+      byLeague[league].profitIfAllWin += t.profitIfWin;
+      byLeague[league].expectedValue += t.expectedValue;
+    }
+
+    // Round group values
+    for (const g of [
+      ...Object.values(byMarketType),
+      ...Object.values(byLeague),
+    ]) {
+      g.totalCost = Number(g.totalCost.toFixed(2));
+      g.profitIfAllWin = Number(g.profitIfAllWin.toFixed(2));
+      g.expectedValue = Number(g.expectedValue.toFixed(2));
+    }
+
+    return {
+      trades,
+      count: trades.length,
+      summary: {
+        totalCost: Number(totalCost.toFixed(2)),
+        totalPayoutIfAllWin: Number(totalPayoutIfAllWin.toFixed(2)),
+        totalProfitIfAllWin: Number(totalProfitIfAllWin.toFixed(2)),
+        totalRoiIfAllWin:
+          totalCost > 0
+            ? Number(((totalProfitIfAllWin / totalCost) * 100).toFixed(2))
+            : 0,
+        totalExpectedValue: Number(totalExpectedValue.toFixed(2)),
+      },
+      byMarketType,
+      byLeague,
+    };
+  }
+
   // ─── Go-live: convert paper trades to live trades ───────────────────
 
   /**

@@ -170,6 +170,53 @@ export class PolymarketController {
     };
   }
 
+  @Get('trades/projections')
+  @ApiOperation({
+    summary:
+      'Show potential profit per trade and grouped by market type / league if outcomes are correctly predicted',
+  })
+  @ApiQuery({
+    name: 'month',
+    required: false,
+    type: Number,
+    description: 'Filter by month (1-12)',
+  })
+  @ApiQuery({
+    name: 'year',
+    required: false,
+    type: Number,
+    description: 'Filter by year',
+  })
+  @ApiQuery({
+    name: 'status',
+    required: false,
+    type: String,
+    description:
+      'Trade status filter (default: open). Use "all" for all statuses.',
+  })
+  async getTradeProjections(
+    @Query('month') month?: string,
+    @Query('year') year?: string,
+    @Query('status') status?: string,
+  ) {
+    const filters: { month?: number; year?: number; status?: string } = {};
+
+    if (month && year) {
+      const m = Number(month);
+      const y = Number(year);
+      if (m >= 1 && m <= 12) filters.month = m;
+      if (y >= 2020 && y <= 2100) filters.year = y;
+    }
+
+    if (status && status !== 'all') {
+      filters.status = status;
+    } else if (status === 'all') {
+      filters.status = undefined; // Remove default 'open' filter
+    }
+
+    return this.polymarketService.getPotentialProfit(filters);
+  }
+
   @Roles('admin')
   @Post('trades/go-live')
   @ApiOperation({
