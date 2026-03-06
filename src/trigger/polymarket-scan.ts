@@ -66,13 +66,12 @@ export const polymarketTradeTask = task({
   run: async () => {
     logger.info('Starting Polymarket trading cycle');
 
-    const { polymarketService, agentsService } = initServices();
+    const { polymarketService } = initServices();
 
-    const result = await polymarketService.runTradingCycle(agentsService);
+    const result = await polymarketService.runTradingCycle();
 
     logger.info('Polymarket trading cycle complete', {
-      fixturesEvaluated: result.fixturesEvaluated,
-      predictionsGenerated: result.predictionsGenerated,
+      predictionsChecked: result.predictionsChecked,
       candidatesFound: result.candidatesFound,
       tradesPlaced: result.tradesPlaced,
       tradesSkipped: result.tradesSkipped,

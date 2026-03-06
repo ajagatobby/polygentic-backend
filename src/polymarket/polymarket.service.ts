@@ -226,32 +226,26 @@ export class PolymarketService implements OnModuleInit {
     };
   }
 
-  // ─── Trading cycle (works from persisted markets, generates predictions on-the-fly) ──
+  // ─── Trading cycle (prediction-first: fast, no scanning) ─────────────
 
   /**
-   * Run a dedicated trading cycle that reads already-persisted markets from DB,
-   * generates predictions for fixtures that lack one, and places trades.
+   * Prediction-first trading cycle.
    *
-   * Unlike runScanCycle() which re-discovers markets from the Gamma API,
-   * this operates purely on markets already in polymarket_markets.
+   * Instead of scanning thousands of markets and generating predictions,
+   * this starts from **existing predictions**, finds their Polymarket
+   * markets, calculates edge, and places trades immediately.
    *
-   * Fixtures are processed **soonest-first** so near-term opportunities
-   * are traded before distant ones.
+   * Flow:
+   *   1. Query high-confidence predictions (soonest fixture first)
+   *   2. For each, find the matching Polymarket market in our DB
+   *   3. Get live CLOB pricing, calculate edge
+   *   4. If edge is good enough, evaluate with trading agent
+   *   5. Place trade **immediately** and persist to DB right away
    *
-   * @param agentsService — injected by the Trigger.dev task (not part of DI)
-   * @param maxPredictions — cap on how many predictions to generate per cycle (controls Claude costs)
+   * Typically completes in seconds, not hours.
    */
-  async runTradingCycle(
-    agentsService: {
-      generatePrediction: (
-        fixtureId: number,
-        predictionType: string,
-      ) => Promise<any>;
-    },
-    maxPredictions = 10,
-  ): Promise<{
-    fixturesEvaluated: number;
-    predictionsGenerated: number;
+  async runTradingCycle(): Promise<{
+    predictionsChecked: number;
     candidatesFound: number;
     tradesPlaced: number;
     tradesSkipped: number;
@@ -259,7 +253,6 @@ export class PolymarketService implements OnModuleInit {
   }> {
     const startTime = Date.now();
     const errors: string[] = [];
-    let predictionsGenerated = 0;
     let tradesPlaced = 0;
     let tradesSkipped = 0;
 
@@ -269,81 +262,24 @@ export class PolymarketService implements OnModuleInit {
     const minConfidence =
       this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
 
-    this.logger.log(
-      'Starting Polymarket trading cycle (from persisted markets)',
-    );
+    this.logger.log('Starting Polymarket trading cycle (prediction-first)');
 
-    // ── Step 1: Get unique fixture IDs from open match_outcome markets ──
-    // Ordered by soonest start date first, filtered to:
-    //   - active, not closed, accepting orders
-    //   - fixture matched (fixture_id IS NOT NULL)
-    //   - liquidity >= threshold
-    //   - fixture status = NS (not started)
-    //   - no existing open trade on any market for this fixture
-    const fixtureRows = await this.db.execute(sql`
-      SELECT DISTINCT ON (pm.fixture_id)
-        pm.fixture_id,
-        f.date AS fixture_date,
-        f.home_team_id,
-        f.away_team_id,
-        f.status AS fixture_status
-      FROM polymarket_markets pm
-      INNER JOIN fixtures f ON f.id = pm.fixture_id
-      LEFT JOIN polymarket_trades pt
-        ON pt.fixture_id = pm.fixture_id AND pt.status = 'open'
-      WHERE pm.fixture_id IS NOT NULL
-        AND pm.active = true
-        AND pm.closed = false
-        AND pm.accepting_orders = true
-        AND CAST(pm.liquidity AS numeric) >= ${minLiquidity}
-        AND f.status = 'NS'
-        AND f.date > NOW()
-        AND pt.id IS NULL
-      ORDER BY pm.fixture_id, f.date ASC
-    `);
-
-    // Sort by fixture date ascending (soonest first)
-    const fixtureList = (fixtureRows as any[]).sort(
-      (a: any, b: any) =>
-        new Date(a.fixture_date).getTime() - new Date(b.fixture_date).getTime(),
-    );
-
-    this.logger.log(
-      `Trading cycle: ${fixtureList.length} tradeable fixtures (soonest-first, no open trades, liq >= $${minLiquidity})`,
-    );
-
-    if (fixtureList.length === 0) {
-      return {
-        fixturesEvaluated: 0,
-        predictionsGenerated: 0,
-        candidatesFound: 0,
-        tradesPlaced: 0,
-        tradesSkipped: 0,
-        errors,
-      };
-    }
-
-    // ── Step 2: Check bankroll ──
+    // ── Step 1: Check bankroll ──
     let bankroll = await this.getOrCreateBankroll();
     if (bankroll.isStopped) {
-      this.logger.warn(
-        `Trading is STOPPED: ${bankroll.stoppedReason}. Skipping trading cycle.`,
-      );
+      this.logger.warn(`Trading STOPPED: ${bankroll.stoppedReason}`);
       return {
-        fixturesEvaluated: fixtureList.length,
-        predictionsGenerated: 0,
+        predictionsChecked: 0,
         candidatesFound: 0,
         tradesPlaced: 0,
         tradesSkipped: 0,
         errors: [`Trading stopped: ${bankroll.stoppedReason}`],
       };
     }
-
     if (Number(bankroll.currentBalance) <= 0) {
-      this.logger.warn('Budget exhausted — skipping trading cycle');
+      this.logger.warn('Budget exhausted');
       return {
-        fixturesEvaluated: fixtureList.length,
-        predictionsGenerated: 0,
+        predictionsChecked: 0,
         candidatesFound: 0,
         tradesPlaced: 0,
         tradesSkipped: 0,
@@ -351,251 +287,285 @@ export class PolymarketService implements OnModuleInit {
       };
     }
 
-    // ── Step 3: For each fixture (soonest first), ensure prediction exists ──
-    const candidates: FixtureTradingCandidate[] = [];
+    // ── Step 2: Get high-confidence predictions with Polymarket markets ──
+    // One query: predictions + fixtures + teams + polymarket markets
+    // Ordered soonest fixture first, highest confidence first within same day
+    const rows = await this.db.execute(sql`
+      SELECT
+        p.id            AS prediction_id,
+        p.fixture_id,
+        p.confidence,
+        p.home_win_prob,
+        p.draw_prob,
+        p.away_win_prob,
+        p.predicted_home_goals,
+        p.predicted_away_goals,
+        p.key_factors,
+        p.risk_factors,
+        p.value_bets,
+        p.detailed_analysis,
+        f.date           AS fixture_date,
+        f.home_team_id,
+        f.away_team_id,
+        ht.name          AS home_team_name,
+        at.name          AS away_team_name,
+        pm.id            AS market_db_id,
+        pm.event_id,
+        pm.market_id,
+        pm.condition_id,
+        pm.slug,
+        pm.event_title,
+        pm.market_question,
+        pm.outcomes,
+        pm.clob_token_ids,
+        pm.outcome_prices,
+        pm.liquidity,
+        pm.volume,
+        pm.volume_24hr,
+        pm.active        AS market_active,
+        pm.closed        AS market_closed,
+        pm.accepting_orders,
+        pm.start_date    AS market_start_date,
+        pm.end_date      AS market_end_date,
+        pm.match_score,
+        pm.tags
+      FROM predictions p
+      INNER JOIN fixtures f        ON f.id = p.fixture_id
+      INNER JOIN teams ht          ON ht.id = f.home_team_id
+      INNER JOIN teams at          ON at.id = f.away_team_id
+      INNER JOIN polymarket_markets pm ON pm.fixture_id = p.fixture_id
+      LEFT  JOIN polymarket_trades pt
+        ON pt.polymarket_market_id = pm.id AND pt.status = 'open'
+      WHERE p.resolved_at IS NULL
+        AND p.confidence >= ${minConfidence}
+        AND f.status = 'NS'
+        AND f.date > NOW()
+        AND pm.active = true
+        AND pm.closed = false
+        AND pm.accepting_orders = true
+        AND CAST(pm.liquidity AS numeric) >= ${minLiquidity}
+        AND pt.id IS NULL
+      ORDER BY f.date ASC, p.confidence DESC
+    `);
 
-    for (const row of fixtureList) {
-      const fixtureId = row.fixture_id;
+    const candidates: Array<{
+      row: any;
+      candidate: FixtureTradingCandidate;
+    }> = [];
 
+    this.logger.log(
+      `Found ${(rows as any[]).length} prediction-market pairs to evaluate`,
+    );
+
+    // ── Step 3: For each row, get CLOB pricing + calculate edge ──
+    for (const row of rows as any[]) {
       try {
-        // Check if prediction exists
-        const [existing] = await this.db
-          .select({ id: schema.predictions.id })
-          .from(schema.predictions)
-          .where(
-            and(
-              eq(schema.predictions.fixtureId, fixtureId),
-              isNull(schema.predictions.resolvedAt),
-            ),
-          )
-          .limit(1);
+        const clobTokenIds = row.clob_token_ids ?? [];
+        const primaryTokenId = clobTokenIds[0];
+        if (!primaryTokenId) continue;
 
-        if (!existing && predictionsGenerated < maxPredictions) {
-          // Generate prediction on-the-fly
-          this.logger.log(
-            `Generating prediction for fixture ${fixtureId} (${new Date(row.fixture_date).toISOString()})`,
-          );
-          try {
-            await agentsService.generatePrediction(fixtureId, 'daily');
-            predictionsGenerated++;
-          } catch (err: any) {
-            this.logger.warn(
-              `Failed to generate prediction for fixture ${fixtureId}: ${err.message}`,
-            );
-            errors.push(`Prediction failed for ${fixtureId}: ${err.message}`);
-            continue;
-          }
-        } else if (!existing) {
-          // Hit the prediction cap — skip remaining fixtures without predictions
-          this.logger.debug(
-            `Prediction cap reached (${maxPredictions}), skipping fixture ${fixtureId}`,
-          );
-          continue;
-        }
+        const pricing =
+          await this.clobService.getMarketPricingSnapshot(primaryTokenId);
+        if (!pricing) continue;
 
-        // Now build a candidate from all match_outcome markets for this fixture
-        const markets = await this.db
-          .select()
-          .from(schema.polymarketMarkets)
-          .where(
-            and(
-              eq(schema.polymarketMarkets.fixtureId, fixtureId),
-              eq(schema.polymarketMarkets.active, true),
-              eq(schema.polymarketMarkets.closed, false),
-              eq(schema.polymarketMarkets.acceptingOrders, true),
-              gte(schema.polymarketMarkets.liquidity, String(minLiquidity)),
-            ),
-          );
+        // Build a lightweight FixtureMarketMatch for the mapper
+        const liq = Number(row.liquidity ?? 0);
+        const vol = Number(row.volume ?? 0);
+        const vol24 = Number(row.volume_24hr ?? 0);
+        const prices = (row.outcome_prices ?? []).map(Number);
 
-        // Rebuild the FixtureMarketMatch from the DB record for each market
-        const [fixture] = await this.db
-          .select()
-          .from(schema.fixtures)
-          .where(eq(schema.fixtures.id, fixtureId))
-          .limit(1);
+        const parsedMarket = {
+          marketId: row.market_id,
+          question: row.market_question,
+          conditionId: row.condition_id ?? '',
+          slug: row.slug ?? '',
+          outcomes: row.outcomes ?? [],
+          outcomePrices: prices,
+          clobTokenIds: clobTokenIds,
+          volume: vol,
+          volume24hr: vol24,
+          liquidity: liq,
+          active: row.market_active ?? true,
+          closed: row.market_closed ?? false,
+          acceptingOrders: row.accepting_orders ?? true,
+        };
 
-        if (!fixture) continue;
-
-        const [homeTeam] = await this.db
-          .select()
-          .from(schema.teams)
-          .where(eq(schema.teams.id, fixture.homeTeamId))
-          .limit(1);
-        const [awayTeam] = await this.db
-          .select()
-          .from(schema.teams)
-          .where(eq(schema.teams.id, fixture.awayTeamId))
-          .limit(1);
-
-        if (!homeTeam || !awayTeam) continue;
-
-        for (const mkt of markets) {
-          // Skip if there's already an open trade on this specific market
-          const [openTrade] = await this.db
-            .select({ id: schema.polymarketTrades.id })
-            .from(schema.polymarketTrades)
-            .where(
-              and(
-                eq(schema.polymarketTrades.polymarketMarketId, mkt.id),
-                eq(schema.polymarketTrades.status, 'open'),
-              ),
-            )
-            .limit(1);
-          if (openTrade) continue;
-
-          // Reconstruct the FixtureMarketMatch shape from DB data
-          const liq = Number(mkt.liquidity ?? 0);
-          const vol = Number(mkt.volume ?? 0);
-          const vol24 = Number(mkt.volume24hr ?? 0);
-          const prices = (mkt.outcomePrices ?? []).map(Number);
-
-          const parsedMarket = {
-            marketId: mkt.marketId,
-            question: mkt.marketQuestion,
-            conditionId: mkt.conditionId ?? '',
-            slug: mkt.slug ?? '',
-            outcomes: mkt.outcomes ?? [],
-            outcomePrices: prices,
-            clobTokenIds: mkt.clobTokenIds ?? [],
+        const match: FixtureMarketMatch = {
+          event: {
+            eventId: row.event_id,
+            title: row.event_title,
+            slug: row.slug ?? '',
+            description: '',
+            startDate: row.market_start_date?.toISOString?.() ?? null,
+            endDate: row.market_end_date?.toISOString?.() ?? null,
+            active: row.market_active ?? true,
+            closed: row.market_closed ?? false,
+            liquidity: liq,
             volume: vol,
             volume24hr: vol24,
-            liquidity: liq,
-            active: mkt.active ?? true,
-            closed: mkt.closed ?? false,
-            acceptingOrders: mkt.acceptingOrders ?? true,
-          };
+            markets: [parsedMarket],
+            negRisk: false,
+            seriesSlug: '',
+            polymarketTagSlug: undefined,
+            tags: (row.tags ?? []) as Array<{
+              id: string;
+              slug: string;
+              label: string;
+            }>,
+          },
+          market: parsedMarket,
+          marketType: 'match_outcome',
+          matchScore: Number(row.match_score ?? 0),
+          fixtureId: row.fixture_id,
+          homeTeamId: row.home_team_id,
+          awayTeamId: row.away_team_id,
+          homeTeamName: row.home_team_name,
+          awayTeamName: row.away_team_name,
+        };
 
-          const match: FixtureMarketMatch = {
-            event: {
-              eventId: mkt.eventId,
-              title: mkt.eventTitle,
-              slug: mkt.slug ?? '',
-              description: '',
-              startDate: mkt.startDate?.toISOString() ?? null,
-              endDate: mkt.endDate?.toISOString() ?? null,
-              active: mkt.active ?? true,
-              closed: mkt.closed ?? false,
-              liquidity: liq,
-              volume: vol,
-              volume24hr: vol24,
-              markets: [parsedMarket],
-              negRisk: false,
-              seriesSlug: '',
-              polymarketTagSlug: undefined,
-              tags:
-                (mkt.tags as Array<{
-                  id: string;
-                  slug: string;
-                  label: string;
-                }>) ?? [],
-            },
-            market: parsedMarket,
-            marketType: 'match_outcome',
-            matchScore: Number(mkt.matchScore ?? 0),
-            fixtureId,
-            homeTeamId: fixture.homeTeamId,
-            awayTeamId: fixture.awayTeamId,
-            homeTeamName: homeTeam.name,
-            awayTeamName: awayTeam.name,
-          };
+        // Map prediction to market outcome and calculate edge
+        const prediction = {
+          homeWinProb: row.home_win_prob,
+          drawProb: row.draw_prob,
+          awayWinProb: row.away_win_prob,
+        };
 
-          const candidate = await this.buildFixtureCandidate(match, minEdge);
-          if (candidate) candidates.push(candidate);
+        const { ensembleProb } = this.mapFixturePredictionToOutcome(
+          match,
+          prediction,
+        );
+        if (ensembleProb == null) continue;
+
+        const polymarketProb = pricing.midpoint;
+        const rawEdge = ensembleProb - polymarketProb;
+        const inverseEdge = 1 - ensembleProb - (1 - polymarketProb);
+
+        if (rawEdge < minEdge && inverseEdge < minEdge) continue;
+
+        // Check inverse pricing if betting No
+        let pricingNo: MarketPricingSnapshot | undefined;
+        const secondTokenId = clobTokenIds[1];
+        if (inverseEdge > rawEdge && secondTokenId) {
+          const noSnapshot =
+            await this.clobService.getMarketPricingSnapshot(secondTokenId);
+          if (noSnapshot) pricingNo = noSnapshot;
+        }
+
+        const bestEdge = Math.max(rawEdge, inverseEdge);
+        const bestPricing =
+          inverseEdge > rawEdge && pricingNo ? pricingNo : pricing;
+        const bestEnsembleProb =
+          inverseEdge > rawEdge ? 1 - ensembleProb : ensembleProb;
+        const bestPolymarketProb =
+          inverseEdge > rawEdge ? 1 - polymarketProb : polymarketProb;
+
+        const fixtureCandidate: FixtureTradingCandidate = {
+          type: 'fixture',
+          match,
+          pricing: bestPricing,
+          pricingNo: inverseEdge > rawEdge ? undefined : pricingNo,
+          prediction: {
+            id: row.prediction_id,
+            homeWinProb: Number(row.home_win_prob),
+            drawProb: Number(row.draw_prob),
+            awayWinProb: Number(row.away_win_prob),
+            predictedHomeGoals: Number(row.predicted_home_goals ?? 0),
+            predictedAwayGoals: Number(row.predicted_away_goals ?? 0),
+            confidence: row.confidence ?? 5,
+            keyFactors: (row.key_factors as string[]) ?? [],
+            riskFactors: (row.risk_factors as string[]) ?? [],
+            valueBets: (row.value_bets as any[]) ?? [],
+            detailedAnalysis: row.detailed_analysis ?? '',
+          },
+          ensembleProbability: bestEnsembleProb,
+          polymarketProbability: bestPolymarketProb,
+          rawEdge: bestEdge,
+        };
+
+        candidates.push({ row, candidate: fixtureCandidate });
+
+        this.logger.log(
+          `Candidate: ${row.home_team_name} vs ${row.away_team_name} ` +
+            `(${new Date(row.fixture_date).toISOString().split('T')[0]}) ` +
+            `edge=${(bestEdge * 100).toFixed(1)}% conf=${row.confidence}`,
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `Error evaluating prediction #${row.prediction_id}: ${err.message}`,
+        );
+        errors.push(err.message);
+      }
+    }
+
+    this.logger.log(
+      `${candidates.length} candidates with edge >= ${(minEdge * 100).toFixed(0)}% from ${(rows as any[]).length} prediction-market pairs`,
+    );
+
+    // ── Step 4: Evaluate each candidate and place trades IMMEDIATELY ──
+    const openPositions = await this.getOpenPositionsSummary();
+
+    for (const { candidate } of candidates) {
+      try {
+        // Re-fetch bankroll for accurate balance before each trade
+        bankroll = await this.getOrCreateBankroll();
+
+        if (Number(bankroll.currentBalance) <= 0) {
+          this.logger.warn('Budget exhausted — stopping');
+          break;
+        }
+        if (bankroll.isStopped) {
+          this.logger.warn('Stop-loss triggered — stopping');
+          break;
+        }
+
+        const bankrollContext = await this.buildBankrollContext();
+        const decision = await this.tradingAgent.evaluate(
+          candidate,
+          bankrollContext,
+          openPositions,
+        );
+
+        if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
+          // Place and persist to DB right away — not batched
+          const placed = await this.executeTrade(candidate, decision, bankroll);
+          if (placed) {
+            tradesPlaced++;
+            openPositions.push({
+              outcomeName: decision.outcomeName,
+              fixtureId: candidate.match.fixtureId,
+              positionSizeUsd: decision.positionSizeUsd,
+            });
+            this.logger.log(
+              `TRADE PLACED: ${candidate.match.homeTeamName} vs ${candidate.match.awayTeamName} — ` +
+                `${decision.outcomeName} $${decision.positionSizeUsd.toFixed(2)} @ ${decision.entryPrice.toFixed(3)}`,
+            );
+          } else {
+            tradesSkipped++;
+          }
+        } else {
+          await this.logSkippedTrade(candidate, decision);
+          tradesSkipped++;
         }
       } catch (err: any) {
         this.logger.error(
-          `Error processing fixture ${fixtureId}: ${err.message}`,
+          `Failed to trade on fixture ${candidate.match.fixtureId}: ${err.message}`,
         );
-        errors.push(`Fixture ${fixtureId}: ${err.message}`);
+        errors.push(err.message);
       }
     }
 
-    // Sort by fixture date soonest first, then by edge descending within same date
-    candidates.sort((a, b) => {
-      const dateA = new Date(a.match.event.startDate || '').getTime() || 0;
-      const dateB = new Date(b.match.event.startDate || '').getTime() || 0;
-      // Group by same day, then sort by edge within day
-      const dayA = Math.floor(dateA / 86_400_000);
-      const dayB = Math.floor(dateB / 86_400_000);
-      if (dayA !== dayB) return dayA - dayB; // Soonest day first
-      return b.rawEdge - a.rawEdge; // Highest edge first within same day
-    });
-
-    this.logger.log(
-      `Trading cycle: ${candidates.length} candidates from ${fixtureList.length} fixtures ` +
-        `(${predictionsGenerated} new predictions generated)`,
-    );
-
-    // ── Step 4: Evaluate candidates with trading agent ──
-    if (candidates.length > 0) {
-      let bankrollContext = await this.buildBankrollContext();
-      const openPositions = await this.getOpenPositionsSummary();
-
-      for (const candidate of candidates) {
-        try {
-          // Re-fetch bankroll for accurate balance
-          bankroll = await this.getOrCreateBankroll();
-          bankrollContext = await this.buildBankrollContext();
-
-          if (Number(bankroll.currentBalance) <= 0) {
-            this.logger.warn('Budget exhausted — stopping trade placement');
-            break;
-          }
-
-          if (bankroll.isStopped) {
-            this.logger.warn('Stop-loss triggered — stopping trade placement');
-            break;
-          }
-
-          const decision = await this.tradingAgent.evaluate(
-            candidate,
-            bankrollContext,
-            openPositions,
-          );
-
-          if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
-            const placed = await this.executeTrade(
-              candidate,
-              decision,
-              bankroll,
-            );
-            if (placed) {
-              tradesPlaced++;
-
-              openPositions.push({
-                outcomeName: decision.outcomeName,
-                fixtureId: candidate.match.fixtureId,
-                positionSizeUsd: decision.positionSizeUsd,
-              });
-            } else {
-              tradesSkipped++;
-            }
-          } else {
-            await this.logSkippedTrade(candidate, decision);
-            tradesSkipped++;
-          }
-        } catch (err: any) {
-          this.logger.error(
-            `Failed to evaluate candidate for fixture ${candidate.match.fixtureId}: ${err.message}`,
-          );
-          errors.push(err.message);
-        }
-      }
-    }
-
-    // ── Step 5: Update bankroll ──
+    // ── Step 5: Update bankroll snapshot ──
     await this.updateBankrollSnapshot();
 
     const duration = Date.now() - startTime;
     this.logger.log(
-      `Polymarket trading cycle complete in ${duration}ms: ` +
-        `${fixtureList.length} fixtures evaluated, ${predictionsGenerated} predictions generated, ` +
-        `${candidates.length} candidates, ${tradesPlaced} trades placed, ${tradesSkipped} skipped`,
+      `Trading cycle complete in ${duration}ms: ` +
+        `${(rows as any[]).length} checked, ${candidates.length} candidates, ` +
+        `${tradesPlaced} placed, ${tradesSkipped} skipped`,
     );
 
     return {
-      fixturesEvaluated: fixtureList.length,
-      predictionsGenerated,
+      predictionsChecked: (rows as any[]).length,
       candidatesFound: candidates.length,
       tradesPlaced,
       tradesSkipped,
