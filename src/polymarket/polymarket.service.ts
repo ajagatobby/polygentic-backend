@@ -345,6 +345,13 @@ export class PolymarketService implements OnModuleInit {
         AND pm.accepting_orders = true
         AND CAST(pm.liquidity AS numeric) >= ${minLiquidity}
         AND pt.id IS NULL
+        -- Only moneyline markets — exclude types our model can't map
+        AND pm.market_question NOT LIKE '%Exact Score%'
+        AND pm.market_question NOT LIKE '%O/U%'
+        AND pm.market_question NOT LIKE '%Both Teams to Score%'
+        AND pm.market_question NOT LIKE '%Spread%'
+        AND pm.market_question NOT LIKE '%end in a draw%'
+        AND pm.market_question NOT LIKE '%halftime%'
       ORDER BY f.date ASC, p.confidence DESC
     `);
 
