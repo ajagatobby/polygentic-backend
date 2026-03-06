@@ -335,6 +335,64 @@ export class PolymarketController {
   }
 
   @Roles('admin')
+  @Post('trades/manual')
+  @ApiOperation({
+    summary:
+      '[Admin] Manually place a trade on a Polymarket market — bypasses AI agent and all gates',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['marketId', 'outcomeIndex', 'outcomeName', 'positionSizeUsd'],
+      properties: {
+        marketId: {
+          type: 'number',
+          description:
+            'Our internal polymarket_markets.id (NOT the Polymarket market ID string)',
+        },
+        outcomeIndex: {
+          type: 'number',
+          description: 'Outcome index (0 or 1 for binary, 0-2 for moneyline)',
+        },
+        outcomeName: {
+          type: 'string',
+          description:
+            'Outcome name (e.g. "Yes", "No", "Arsenal", "Draw", "SC Braga")',
+        },
+        positionSizeUsd: {
+          type: 'number',
+          description: 'Position size in USD',
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Optional: your reasoning for this trade',
+        },
+      },
+    },
+  })
+  async placeManualTrade(
+    @Body()
+    body: {
+      marketId: number;
+      outcomeIndex: number;
+      outcomeName: string;
+      positionSizeUsd: number;
+      reasoning?: string;
+    },
+  ) {
+    this.logger.log(
+      `Manual trade: market=${body.marketId} outcome=${body.outcomeName} $${body.positionSizeUsd}`,
+    );
+
+    const result = await this.polymarketService.placeManualTrade(body);
+
+    return {
+      message: `Trade placed: ${body.outcomeName} $${body.positionSizeUsd}`,
+      ...result,
+    };
+  }
+
+  @Roles('admin')
   @Post('trades/deduplicate')
   @ApiOperation({
     summary:

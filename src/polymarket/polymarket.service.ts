@@ -1069,6 +1069,191 @@ export class PolymarketService implements OnModuleInit {
     );
   }
 
+  /**
+   * Manually place a trade on a Polymarket market — bypasses the AI agent,
+   * edge calculation, and all automated gates. Used for admin overrides.
+   */
+  async placeManualTrade(params: {
+    marketId: number;
+    outcomeIndex: number;
+    outcomeName: string;
+    positionSizeUsd: number;
+    reasoning?: string;
+  }): Promise<any> {
+    // 1. Look up the market record
+    const [market] = await this.db
+      .select()
+      .from(schema.polymarketMarkets)
+      .where(eq(schema.polymarketMarkets.id, params.marketId))
+      .limit(1);
+
+    if (!market) {
+      throw new Error(`Market with id=${params.marketId} not found`);
+    }
+
+    // 2. Get bankroll
+    const bankroll = await this.getOrCreateBankroll();
+    const currentBalance = Number(bankroll.currentBalance);
+
+    if (currentBalance <= 0) {
+      throw new Error(
+        `Bankroll balance is $${currentBalance.toFixed(2)} — cannot place trade`,
+      );
+    }
+
+    const positionSizeUsd = Math.min(params.positionSizeUsd, currentBalance);
+    if (positionSizeUsd < 1) {
+      throw new Error(
+        `Position size $${positionSizeUsd.toFixed(2)} below $1 minimum`,
+      );
+    }
+
+    // 3. Get current pricing from CLOB
+    const tokenIds: string[] = market.clobTokenIds ?? [];
+    const tokenId = tokenIds[params.outcomeIndex];
+    let entryPrice = 0.5; // fallback
+
+    if (tokenId) {
+      try {
+        const pricing =
+          await this.clobService.getMarketPricingSnapshot(tokenId);
+        if (pricing) {
+          entryPrice = pricing.midpoint || pricing.buyPrice || 0.5;
+        }
+      } catch {
+        // Use outcome price from last sync as fallback
+        const prices: string[] = market.outcomePrices ?? [];
+        if (prices[params.outcomeIndex]) {
+          entryPrice = Number(prices[params.outcomeIndex]);
+        }
+      }
+    } else {
+      const prices: string[] = market.outcomePrices ?? [];
+      if (prices[params.outcomeIndex]) {
+        entryPrice = Number(prices[params.outcomeIndex]);
+      }
+    }
+
+    if (entryPrice <= 0 || entryPrice >= 1) {
+      entryPrice = 0.5; // safety fallback
+    }
+
+    // 4. Check for duplicates
+    const existingOpen = await this.db
+      .select({ id: schema.polymarketTrades.id })
+      .from(schema.polymarketTrades)
+      .where(
+        and(
+          eq(schema.polymarketTrades.polymarketMarketId, params.marketId),
+          eq(schema.polymarketTrades.outcomeIndex, params.outcomeIndex),
+          eq(schema.polymarketTrades.status, 'open'),
+        ),
+      )
+      .limit(1);
+
+    if (existingOpen.length > 0) {
+      throw new Error(
+        `Open trade #${existingOpen[0].id} already exists for this market+outcome`,
+      );
+    }
+
+    // 5. Determine mode
+    const isLive =
+      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const mode = isLive ? 'live' : 'paper';
+
+    // 6. Place live order if applicable
+    let orderId: string | null = null;
+    let orderStatus = 'filled';
+
+    if (isLive && tokenId) {
+      const tokensToReceive = positionSizeUsd / entryPrice;
+      const result = await this.clobService.placeLimitOrder({
+        tokenId,
+        side: 'BUY',
+        price: entryPrice,
+        size: tokensToReceive,
+      });
+
+      if (!result) {
+        throw new Error('Live order placement failed');
+      }
+
+      orderId = result.orderId;
+      orderStatus = result.status;
+    }
+
+    // 7. Insert trade
+    const tokenQuantity = positionSizeUsd / entryPrice;
+
+    const [trade] = await this.db
+      .insert(schema.polymarketTrades)
+      .values({
+        polymarketMarketId: params.marketId,
+        fixtureId: market.fixtureId,
+        leagueId: market.leagueId,
+        teamId: market.teamId,
+        mode,
+        side: 'buy',
+        outcomeIndex: params.outcomeIndex,
+        outcomeName: params.outcomeName,
+        entryPrice: String(entryPrice),
+        positionSizeUsd: String(positionSizeUsd),
+        tokenQuantity: String(tokenQuantity),
+        ensembleProbability: '0', // manual — no model probability
+        polymarketProbability: String(entryPrice), // price ≈ implied probability
+        edgePercent: '0', // manual — no edge calculation
+        kellyFraction: '0',
+        confidenceAtEntry: 0,
+        agentReasoning: params.reasoning || 'Manual trade placed by admin',
+        riskAssessment: 'Manual override — no automated risk assessment',
+        bankrollAtEntry: String(currentBalance),
+        openPositionsCount: bankroll.openPositionsCount,
+        orderId,
+        orderStatus,
+        fillPrice: isLive ? null : String(entryPrice),
+        fillTimestamp: isLive ? null : new Date(),
+        status: 'open',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    // 8. Update bankroll
+    const newBalance = currentBalance - positionSizeUsd;
+    await this.db
+      .update(schema.polymarketBankroll)
+      .set({
+        currentBalance: String(newBalance),
+        openPositionsCount: bankroll.openPositionsCount + 1,
+        openPositionsValue: String(
+          Number(bankroll.openPositionsValue) + positionSizeUsd,
+        ),
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.polymarketBankroll.id, bankroll.id));
+
+    this.logger.log(
+      `[${mode.toUpperCase()}] Manual trade placed: ${params.outcomeName} ` +
+        `$${positionSizeUsd.toFixed(2)} @ ${entryPrice.toFixed(3)} on "${market.eventTitle}"`,
+    );
+
+    return {
+      trade,
+      market: {
+        id: market.id,
+        eventTitle: market.eventTitle,
+        marketQuestion: market.marketQuestion,
+        outcomes: market.outcomes,
+      },
+      entryPrice,
+      positionSizeUsd,
+      tokenQuantity,
+      mode,
+      newBalance,
+    };
+  }
+
   private async logSkippedTrade(
     candidate: TradingCandidate,
     decision: TradingDecision,
