@@ -246,7 +246,7 @@ export class PolymarketController {
         amount: {
           type: 'number',
           description:
-            'Set absolute position size in USD (e.g. 25 = set each trade to $25)',
+            'Total budget to distribute across targeted trades proportionally (e.g. 200 = spread $200 across all targeted trades weighted by current size)',
         },
         multiplier: {
           type: 'number',

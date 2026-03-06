@@ -1982,14 +1982,15 @@ export class PolymarketService {
   /**
    * Adjust the position size of open trades — scale up or down.
    *
-   * Modes:
-   * - { tradeIds: [1,2,3], amount: 10 }    — set each trade to $10
-   * - { tradeIds: [1,2,3], multiplier: 2 }  — double each trade's position
-   * - { month: 5, year: 2026, amount: 15 }  — set all open trades from May 2026 to $15
-   * - { all: true, multiplier: 0.5 }        — halve all open trades
+   * Sizing modes:
+   * - `amount`: Total budget to distribute across all targeted trades
+   *   proportionally (weighted by current position size).
+   *   e.g. { all: true, amount: 200 } — redistribute $200 across all open
+   *   trades, each getting a share proportional to its current weight.
+   * - `multiplier`: Scale each trade's position by a factor.
+   *   e.g. { multiplier: 2 } — double, { multiplier: 0.5 } — halve
    *
-   * `amount` sets an absolute position size. `multiplier` scales relative to current size.
-   * When scaling UP, the increase is capped by the available bankroll balance.
+   * When scaling UP, the total increase is capped by available bankroll balance.
    * When scaling DOWN, freed funds are returned to the bankroll.
    */
   async adjustTradeBudgets(params: {
@@ -1997,7 +1998,7 @@ export class PolymarketService {
     month?: number;
     year?: number;
     all?: boolean;
-    amount?: number; // Absolute position size in USD
+    amount?: number; // Total budget to distribute across targeted trades
     multiplier?: number; // Relative scale factor (e.g. 2 = double, 0.5 = halve)
   }): Promise<{
     adjusted: number;
@@ -2012,10 +2013,10 @@ export class PolymarketService {
       reason?: string;
     }>;
   }> {
-    if (!params.amount && !params.multiplier) {
+    if (params.amount === undefined && params.multiplier === undefined) {
       throw new Error('Must provide either amount or multiplier.');
     }
-    if (params.amount && params.multiplier) {
+    if (params.amount !== undefined && params.multiplier !== undefined) {
       throw new Error('Provide either amount or multiplier, not both.');
     }
     if (params.amount !== undefined && params.amount < 0) {
@@ -2065,7 +2066,32 @@ export class PolymarketService {
     }
 
     let availableBalance = Number(bankroll[0].currentBalance);
-    const initialBudget = Number(bankroll[0].initialBudget);
+
+    // ── Compute new sizes for all trades up front ─────────────────────
+    // For `amount`: distribute the total budget proportionally by current weight
+    // For `multiplier`: scale each trade individually
+
+    const currentTotalSize = trades.reduce(
+      (sum: number, t: any) => sum + Number(t.positionSizeUsd),
+      0,
+    );
+
+    // If using amount, figure out the effective budget we can actually deploy
+    let targetBudget = params.amount;
+    if (targetBudget !== undefined) {
+      // The net change needed = targetBudget - currentTotalSize
+      // If scaling up, cap by available balance
+      const netChange = targetBudget - currentTotalSize;
+      if (netChange > 0 && netChange > availableBalance) {
+        // Cap to what we can afford
+        targetBudget = currentTotalSize + availableBalance;
+        this.logger.log(
+          `Budget guard: capped target from $${params.amount!.toFixed(2)} → $${targetBudget.toFixed(2)} ` +
+            `(only $${availableBalance.toFixed(2)} available to add)`,
+        );
+      }
+    }
+
     let adjusted = 0;
     let skipped = 0;
     let totalDelta = 0;
@@ -2083,8 +2109,11 @@ export class PolymarketService {
       const entryPrice = Number(trade.entryPrice);
       let newSize: number;
 
-      if (params.amount !== undefined) {
-        newSize = params.amount;
+      if (targetBudget !== undefined) {
+        // Distribute proportionally by current weight
+        const weight =
+          currentTotalSize > 0 ? oldSize / currentTotalSize : 1 / trades.length;
+        newSize = targetBudget * weight;
       } else {
         newSize = oldSize * params.multiplier!;
       }
@@ -2092,9 +2121,9 @@ export class PolymarketService {
       // Round to 2 decimal places
       newSize = Number(newSize.toFixed(2));
 
-      const delta = newSize - oldSize; // positive = increase, negative = decrease
+      const delta = newSize - oldSize;
 
-      // Skip if no change
+      // Skip if no meaningful change
       if (Math.abs(delta) < 0.01) {
         skipped++;
         results.push({
@@ -2108,10 +2137,9 @@ export class PolymarketService {
         continue;
       }
 
-      // If scaling up, check available balance
-      if (delta > 0) {
+      // For multiplier mode: if scaling up, check available balance per trade
+      if (targetBudget === undefined && delta > 0) {
         if (delta > availableBalance) {
-          // Cap the increase to what's available
           const cappedNew = oldSize + availableBalance;
           if (cappedNew - oldSize < 0.01) {
             skipped++;
