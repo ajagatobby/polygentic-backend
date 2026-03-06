@@ -1,4 +1,4 @@
-import { Injectable, Inject, Logger } from '@nestjs/common';
+import { Injectable, Inject, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   eq,
@@ -46,7 +46,7 @@ import {
  * 7. Track bankroll and P&L
  */
 @Injectable()
-export class PolymarketService {
+export class PolymarketService implements OnModuleInit {
   private readonly logger = new Logger(PolymarketService.name);
 
   constructor(
@@ -57,6 +57,24 @@ export class PolymarketService {
     private readonly matcherService: PolymarketMatcherService,
     private readonly tradingAgent: PolymarketTradingAgent,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    // Create partial unique index to prevent duplicate open trades at DB level
+    try {
+      await this.db.execute(sql`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_polymarket_trades_open_market_outcome
+        ON polymarket_trades (polymarket_market_id, outcome_index)
+        WHERE status = 'open'
+      `);
+      this.logger.log(
+        'Ensured partial unique index on polymarket_trades (market_id, outcome_index) WHERE open',
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Could not create partial unique index (may already exist or duplicates need cleanup): ${error.message}`,
+      );
+    }
+  }
 
   // ─── Main agent loop ────────────────────────────────────────────────
 
@@ -1003,6 +1021,26 @@ export class PolymarketService {
       tradeValues.predictionId = candidate.prediction.id;
     }
 
+    // ── Duplicate guard: check right before insert (race condition defense) ──
+    const existingOpen = await this.db
+      .select({ id: schema.polymarketTrades.id })
+      .from(schema.polymarketTrades)
+      .where(
+        and(
+          eq(schema.polymarketTrades.polymarketMarketId, marketRecord.id),
+          eq(schema.polymarketTrades.outcomeIndex, decision.outcomeIndex),
+          eq(schema.polymarketTrades.status, 'open'),
+        ),
+      )
+      .limit(1);
+
+    if (existingOpen.length > 0) {
+      this.logger.warn(
+        `Duplicate guard: open trade #${existingOpen[0].id} already exists for market ${marketRecord.id} outcome ${decision.outcomeIndex} — skipping`,
+      );
+      return;
+    }
+
     await this.db.insert(schema.polymarketTrades).values(tradeValues);
 
     // Update bankroll
@@ -1762,6 +1800,157 @@ export class PolymarketService {
         closed: market.closed,
       },
     }));
+  }
+
+  // ─── Deduplication ───────────────────────────────────────────────────
+
+  /**
+   * Find and remove duplicate open trades.
+   *
+   * A duplicate is defined as: same polymarket_market_id + same outcome_index + same status('open').
+   * Keeps the oldest trade (lowest ID) and deletes the rest.
+   * Freed position value is returned to the bankroll.
+   */
+  async deduplicateTrades(): Promise<{
+    duplicatesFound: number;
+    deleted: number;
+    freedAmount: number;
+    details: Array<{
+      keptTradeId: number;
+      deletedTradeIds: number[];
+      outcomeName: string;
+      marketQuestion: string;
+      freedAmount: number;
+    }>;
+  }> {
+    // Find all open trades grouped by (polymarket_market_id, outcome_index)
+    // where count > 1
+    const allOpenTrades = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
+      .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
+      .where(eq(schema.polymarketTrades.status, 'open'))
+      .orderBy(
+        asc(schema.polymarketTrades.polymarketMarketId),
+        asc(schema.polymarketTrades.outcomeIndex),
+        asc(schema.polymarketTrades.id), // Oldest first
+      );
+
+    // Group by (polymarket_market_id, outcome_index)
+    const groups = new Map<string, Array<{ trade: any; market: any }>>();
+
+    for (const row of allOpenTrades) {
+      const key = `${row.trade.polymarketMarketId}_${row.trade.outcomeIndex}`;
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key)!.push(row);
+    }
+
+    let duplicatesFound = 0;
+    let deleted = 0;
+    let totalFreed = 0;
+    const details: Array<{
+      keptTradeId: number;
+      deletedTradeIds: number[];
+      outcomeName: string;
+      marketQuestion: string;
+      freedAmount: number;
+    }> = [];
+
+    // Track freed amount per bankroll mode
+    const freedByMode: Record<string, number> = {};
+
+    for (const [, rows] of groups) {
+      if (rows.length <= 1) continue;
+
+      duplicatesFound += rows.length - 1;
+
+      // Keep the first (oldest by ID), delete the rest
+      const keep = rows[0];
+      const dupes = rows.slice(1);
+
+      let groupFreed = 0;
+      const deletedIds: number[] = [];
+
+      for (const dupe of dupes) {
+        const posSize = Number(dupe.trade.positionSizeUsd);
+        groupFreed += posSize;
+
+        const dupeMode = dupe.trade.mode;
+        freedByMode[dupeMode] = (freedByMode[dupeMode] || 0) + posSize;
+
+        await this.db
+          .delete(schema.polymarketTrades)
+          .where(eq(schema.polymarketTrades.id, dupe.trade.id));
+
+        deletedIds.push(dupe.trade.id);
+        deleted++;
+      }
+
+      totalFreed += groupFreed;
+
+      details.push({
+        keptTradeId: keep.trade.id,
+        deletedTradeIds: deletedIds,
+        outcomeName: keep.trade.outcomeName,
+        marketQuestion: keep.market.marketQuestion,
+        freedAmount: Number(groupFreed.toFixed(2)),
+      });
+
+      this.logger.log(
+        `Dedup: kept trade #${keep.trade.id}, deleted ${deletedIds.join(', ')} ` +
+          `(${keep.trade.outcomeName}) — freed $${groupFreed.toFixed(2)}`,
+      );
+    }
+
+    // Return freed amounts to bankrolls
+    for (const [mode, freed] of Object.entries(freedByMode)) {
+      const bankroll =
+        mode === 'live'
+          ? await this.getOrCreateLiveBankroll()
+          : await this.getOrCreateBankroll();
+
+      await this.db
+        .update(schema.polymarketBankroll)
+        .set({
+          currentBalance: String(Number(bankroll.currentBalance) + freed),
+          openPositionsCount: Math.max(
+            0,
+            bankroll.openPositionsCount -
+              details.reduce((sum, d) => sum + d.deletedTradeIds.length, 0),
+          ),
+          openPositionsValue: String(
+            Math.max(0, Number(bankroll.openPositionsValue) - freed),
+          ),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.polymarketBankroll.id, bankroll.id));
+    }
+
+    if (deleted > 0) {
+      this.logger.log(
+        `Deduplication complete: ${deleted} duplicates deleted, $${totalFreed.toFixed(2)} freed`,
+      );
+    } else {
+      this.logger.log('No duplicates found');
+    }
+
+    return {
+      duplicatesFound,
+      deleted,
+      freedAmount: Number(totalFreed.toFixed(2)),
+      details,
+    };
   }
 
   // ─── Upcoming trades ─────────────────────────────────────────────────

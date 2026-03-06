@@ -114,6 +114,26 @@ export class PolymarketController {
     };
   }
 
+  @Roles('admin')
+  @Post('trades/deduplicate')
+  @ApiOperation({
+    summary:
+      '[Admin] Find and delete duplicate open trades, keeping the oldest per market+outcome',
+  })
+  async deduplicateTrades() {
+    this.logger.log('Triggering trade deduplication');
+
+    const result = await this.polymarketService.deduplicateTrades();
+
+    return {
+      message:
+        result.deleted > 0
+          ? `Deleted ${result.deleted} duplicate trades, freed $${result.freedAmount.toFixed(2)} back to bankroll`
+          : 'No duplicates found',
+      ...result,
+    };
+  }
+
   @Get('trades')
   @ApiOperation({
     summary:
