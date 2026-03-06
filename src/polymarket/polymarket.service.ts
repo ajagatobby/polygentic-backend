@@ -958,6 +958,8 @@ export class PolymarketService implements OnModuleInit {
         side: 'BUY',
         price: decision.entryPrice,
         size: tokensToReceive,
+        conditionId: candidate.match.market.conditionId,
+        negRisk: candidate.match.event.negRisk,
       });
 
       if (!result) {
@@ -1173,6 +1175,7 @@ export class PolymarketService implements OnModuleInit {
         side: 'BUY',
         price: entryPrice,
         size: tokensToReceive,
+        conditionId: market.conditionId ?? undefined,
       });
 
       if (!result) {
@@ -3254,6 +3257,7 @@ export class PolymarketService implements OnModuleInit {
           side: 'BUY',
           price: limitPrice,
           size: tokensToReceive,
+          conditionId: market.conditionId ?? undefined,
         });
 
         if (!orderResult) {
