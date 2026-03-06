@@ -1727,12 +1727,26 @@ export class PolymarketService implements OnModuleInit {
   // ─── Trades by month ────────────────────────────────────────────────
 
   /**
-   * Get trades filtered by month and year, joined with market details.
+   * Get trades filtered by market start date month/year, joined with market details.
+   * Filters by when the market starts (not when the trade was placed).
    */
-  async getTradesByMonth(month: number, year: number): Promise<any[]> {
+  async getTradesByMonth(
+    month: number,
+    year: number,
+    status?: string,
+  ): Promise<any[]> {
     // Build date range for the given month (1-indexed)
-    const startDate = new Date(year, month - 1, 1); // First day of month
-    const endDate = new Date(year, month, 1); // First day of next month
+    const monthStart = new Date(year, month - 1, 1); // First day of month
+    const monthEnd = new Date(year, month, 1); // First day of next month
+
+    const conditions: any[] = [
+      gte(schema.polymarketMarkets.startDate, monthStart),
+      lte(schema.polymarketMarkets.startDate, monthEnd),
+    ];
+
+    if (status && status !== 'all') {
+      conditions.push(eq(schema.polymarketTrades.status, status));
+    }
 
     const rows = await this.db
       .select({
@@ -1747,13 +1761,11 @@ export class PolymarketService implements OnModuleInit {
           schema.polymarketMarkets.id,
         ),
       )
-      .where(
-        and(
-          gte(schema.polymarketTrades.createdAt, startDate),
-          lte(schema.polymarketTrades.createdAt, endDate),
-        ),
-      )
-      .orderBy(desc(schema.polymarketTrades.createdAt));
+      .where(and(...conditions))
+      .orderBy(
+        asc(schema.polymarketMarkets.startDate),
+        desc(schema.polymarketTrades.createdAt),
+      );
 
     return rows.map(({ trade, market }: any) => ({
       id: trade.id,

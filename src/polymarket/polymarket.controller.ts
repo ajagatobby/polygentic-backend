@@ -137,23 +137,31 @@ export class PolymarketController {
   @Get('trades')
   @ApiOperation({
     summary:
-      'Get trades filtered by month and year, with market details and P&L',
+      'Get trades filtered by market start date month/year, with market details and P&L',
   })
   @ApiQuery({
     name: 'month',
     required: true,
     type: Number,
-    description: 'Month (1-12)',
+    description: 'Month (1-12) — filters by market start date',
   })
   @ApiQuery({
     name: 'year',
     required: true,
     type: Number,
-    description: 'Year (e.g. 2026)',
+    description: 'Year (e.g. 2026) — filters by market start date',
+  })
+  @ApiQuery({
+    name: 'status',
+    required: false,
+    type: String,
+    description:
+      'Trade status filter (e.g. open, resolved). Use "all" for all statuses. Default: all.',
   })
   async getTradesByMonth(
     @Query('month') month: string,
     @Query('year') year: string,
+    @Query('status') status?: string,
   ) {
     const m = Number(month);
     const y = Number(year);
@@ -165,7 +173,7 @@ export class PolymarketController {
       return { error: 'year must be a valid year (2020-2100)' };
     }
 
-    const trades = await this.polymarketService.getTradesByMonth(m, y);
+    const trades = await this.polymarketService.getTradesByMonth(m, y, status);
 
     const totalPnl = trades.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0);
     const openCount = trades.filter((t) => t.status === 'open').length;
