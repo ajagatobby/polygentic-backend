@@ -12,6 +12,7 @@ import * as postgresModule from 'postgres';
 import * as schema from '../database/schema';
 
 import { FootballService } from '../football/football.service';
+import { BasketballService } from '../basketball/basketball.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
 import { PerplexityService } from '../agents/perplexity.service';
@@ -59,6 +60,7 @@ export interface Services {
   db: ReturnType<typeof createDb>;
   config: ConfigService;
   footballService: FootballService;
+  basketballService: BasketballService;
   oddsService: OddsService;
   alertsService: AlertsService;
   perplexityService: PerplexityService;
@@ -80,6 +82,7 @@ export function initServices(): Services {
   const config = createConfigService();
 
   const footballService = new FootballService(config, db as any);
+  const basketballService = new BasketballService(config, db as any);
   const oddsService = new OddsService(config, db as any);
   const alertsService = new AlertsService(db as any);
   const perplexityService = new PerplexityService(config);
@@ -130,6 +133,7 @@ export function initServices(): Services {
     db,
     config,
     footballService,
+    basketballService,
     oddsService,
     alertsService,
     perplexityService,
