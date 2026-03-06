@@ -67,7 +67,7 @@ export class PolymarketService {
     this.logger.log('Starting Polymarket scan cycle');
 
     // Check if trading is stopped
-    const bankroll = await this.getOrCreateBankroll();
+    let bankroll = await this.getOrCreateBankroll();
     if (bankroll.isStopped) {
       this.logger.warn(
         `Trading is STOPPED: ${bankroll.stoppedReason}. Skipping scan.`,
@@ -118,11 +118,21 @@ export class PolymarketService {
     let tradesPlaced = 0;
     let tradesSkipped = 0;
 
-    const bankrollContext = await this.buildBankrollContext();
+    let bankrollContext = await this.buildBankrollContext();
     const openPositions = await this.getOpenPositionsSummary();
 
     for (const candidate of candidates) {
       try {
+        // Re-fetch bankroll for accurate balance after each trade
+        bankroll = await this.getOrCreateBankroll();
+        bankrollContext = await this.buildBankrollContext();
+
+        // Stop placing trades if budget is exhausted
+        if (Number(bankroll.currentBalance) <= 0) {
+          this.logger.warn('Budget exhausted — stopping scan cycle');
+          break;
+        }
+
         const decision = await this.tradingAgent.evaluate(
           candidate,
           bankrollContext,
@@ -861,6 +871,44 @@ export class PolymarketService {
     const isLive =
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
     const mode = isLive ? 'live' : 'paper';
+
+    // ── Budget guard: never exceed initial budget ─────────────────────
+    const currentBalance = Number(bankroll.currentBalance);
+    const maxPositionPct =
+      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
+    const maxPositionSize = currentBalance * maxPositionPct;
+    const minTradeSize = 1; // $1 minimum to be worth placing
+
+    if (currentBalance <= 0) {
+      this.logger.warn(
+        `Budget exhausted ($${currentBalance.toFixed(2)} remaining) — skipping trade`,
+      );
+      return;
+    }
+
+    // Cap position size to: min(agent suggestion, max position %, remaining balance)
+    let positionSizeUsd = Math.min(
+      decision.positionSizeUsd,
+      maxPositionSize,
+      currentBalance,
+    );
+
+    if (positionSizeUsd < minTradeSize) {
+      this.logger.warn(
+        `Position size $${positionSizeUsd.toFixed(2)} below minimum $${minTradeSize} — skipping trade`,
+      );
+      return;
+    }
+
+    if (positionSizeUsd < decision.positionSizeUsd) {
+      this.logger.log(
+        `Budget guard: capped position from $${decision.positionSizeUsd.toFixed(2)} → $${positionSizeUsd.toFixed(2)} ` +
+          `(balance: $${currentBalance.toFixed(2)}, max position: $${maxPositionSize.toFixed(2)})`,
+      );
+    }
+
+    // Use the capped size from here on
+    decision = { ...decision, positionSizeUsd };
 
     const marketRecord = await this.getOrCreateMarketRecord(candidate.match);
 
@@ -2047,6 +2095,32 @@ export class PolymarketService {
       }
 
       try {
+        // Re-fetch live bankroll for accurate balance
+        const freshBankroll = await this.getOrCreateLiveBankroll();
+        const liveBalance = Number(freshBankroll.currentBalance);
+        const positionSizeUsd = Number(trade.positionSizeUsd);
+
+        // Budget guard: skip if insufficient balance
+        if (liveBalance < positionSizeUsd) {
+          skipped++;
+          results.push({
+            tradeId: trade.id,
+            status: 'skipped',
+            reason: `Insufficient live bankroll: $${liveBalance.toFixed(2)} available, $${positionSizeUsd.toFixed(2)} needed`,
+          });
+          continue;
+        }
+
+        if (liveBalance <= 0) {
+          skipped++;
+          results.push({
+            tradeId: trade.id,
+            status: 'skipped',
+            reason: 'Live bankroll exhausted',
+          });
+          break; // No point continuing
+        }
+
         // Fetch current CLOB pricing
         const currentPricing =
           await this.clobService.getMarketPricingSnapshot(tokenId);
@@ -2063,7 +2137,6 @@ export class PolymarketService {
 
         // Use the current buy price (ask) or midpoint as the limit price
         const limitPrice = currentPricing.buyPrice || currentPricing.midpoint;
-        const positionSizeUsd = Number(trade.positionSizeUsd);
         const tokensToReceive = positionSizeUsd / limitPrice;
 
         // Place the real order
@@ -2100,20 +2173,20 @@ export class PolymarketService {
           })
           .where(eq(schema.polymarketTrades.id, trade.id));
 
-        // Update live bankroll
+        // Update live bankroll (use freshBankroll for accurate balance)
         const newBalance =
-          Number(liveBankroll.currentBalance) - positionSizeUsd;
+          Number(freshBankroll.currentBalance) - positionSizeUsd;
         await this.db
           .update(schema.polymarketBankroll)
           .set({
             currentBalance: String(newBalance),
-            openPositionsCount: liveBankroll.openPositionsCount + converted + 1,
+            openPositionsCount: freshBankroll.openPositionsCount + 1,
             openPositionsValue: String(
-              Number(liveBankroll.openPositionsValue) + positionSizeUsd,
+              Number(freshBankroll.openPositionsValue) + positionSizeUsd,
             ),
             updatedAt: new Date(),
           })
-          .where(eq(schema.polymarketBankroll.id, liveBankroll.id));
+          .where(eq(schema.polymarketBankroll.id, freshBankroll.id));
 
         converted++;
         results.push({
