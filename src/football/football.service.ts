@@ -8,18 +8,61 @@ import { inArray } from 'drizzle-orm';
 
 /** League IDs we actively track across all sync operations. */
 export const TRACKED_LEAGUES = [
-  // Domestic leagues
-  39, 140, 141, 135, 78, 61, 88, 94, 307,
-  // European club competitions
-  2, 3, 848,
-  // Americas
-  253, 262, 71, 128,
-  // Domestic cups
-  45, 143, 81, 66,
-  // International tournaments
-  1, 15, 4, 6, 9, 29, 5, 13,
-  // World Cup qualifiers
-  32, 34, 36,
+  // ── Top 5 European domestic leagues ─────────────────────────────
+  39, // Premier League
+  140, // La Liga
+  141, // La Liga 2
+  135, // Serie A
+  78, // Bundesliga
+  61, // Ligue 1
+  // ── Other European domestic leagues ─────────────────────────────
+  88, // Eredivisie
+  94, // Primeira Liga
+  203, // Turkish Super Lig
+  179, // Scottish Premiership
+  283, // Romania SuperLiga
+  345, // Czechia Fortuna Liga
+  103, // Norway Eliteserien
+  307, // Saudi Professional League
+  // ── European club competitions ──────────────────────────────────
+  2, // Champions League
+  3, // Europa League
+  848, // Conference League
+  // ── Americas ────────────────────────────────────────────────────
+  253, // MLS
+  262, // Liga MX
+  71, // Brazil Serie A
+  128, // Argentina Liga
+  239, // Colombia Primera A
+  265, // Chile Primera Division
+  281, // Peru Liga 1
+  13, // Copa Libertadores
+  11, // Copa Sudamericana
+  // ── Asia / Africa / Oceania ─────────────────────────────────────
+  98, // Japan J. League
+  99, // Japan J2 League
+  292, // K-League
+  188, // A-League
+  233, // Egypt Premier League
+  200, // Morocco Botola Pro
+  // ── Domestic cups ───────────────────────────────────────────────
+  45, // FA Cup
+  143, // Copa del Rey
+  81, // DFB-Pokal
+  66, // Coupe de France
+  // ── International tournaments ───────────────────────────────────
+  1, // World Cup
+  15, // FIFA Club World Cup
+  4, // Euro Championship
+  6, // Africa Cup of Nations
+  9, // Copa America
+  29, // CONCACAF Gold Cup
+  5, // UEFA Nations League
+  10, // FIFA Friendlies
+  // ── World Cup qualifiers ────────────────────────────────────────
+  32, // Europe
+  34, // South America
+  36, // Africa
 ] as const;
 
 interface ApiFootballResponse<T = any> {

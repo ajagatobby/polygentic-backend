@@ -4,6 +4,7 @@ import * as schema from '../../database/schema';
 import {
   ParsedPolymarketEvent,
   ParsedMarket,
+  POLYMARKET_SOCCER_TAGS,
 } from './polymarket-gamma.service';
 
 // ─── Market type classification ───────────────────────────────────────
@@ -66,51 +67,97 @@ interface LeaguePattern {
   leagueName: string;
   patterns: string[]; // Lowercase substrings to match
   season: number; // Current season (API-Football uses start year)
+  /** Polymarket tag slugs that map to this league */
+  tagSlugs?: string[];
 }
 
 const LEAGUE_MAPPINGS: LeaguePattern[] = [
-  // Domestic leagues
+  // ── Top 5 European domestic leagues ─────────────────────────────
   {
     leagueId: 39,
     leagueName: 'Premier League',
     patterns: ['premier league', 'epl', 'english premier'],
     season: 2025,
+    tagSlugs: ['epl'],
   },
   {
     leagueId: 140,
     leagueName: 'La Liga',
     patterns: ['la liga', 'laliga', 'spanish league', 'primera division'],
     season: 2025,
+    tagSlugs: ['la-liga'],
   },
   {
     leagueId: 135,
     leagueName: 'Serie A',
     patterns: ['serie a', 'italian league'],
     season: 2025,
+    tagSlugs: ['serie-a'],
   },
   {
     leagueId: 78,
     leagueName: 'Bundesliga',
     patterns: ['bundesliga', 'german league'],
     season: 2025,
+    tagSlugs: ['bundesliga'],
   },
   {
     leagueId: 61,
     leagueName: 'Ligue 1',
     patterns: ['ligue 1', 'french league'],
     season: 2025,
+    tagSlugs: ['ligue-1'],
   },
+
+  // ── Other European domestic leagues ─────────────────────────────
   {
     leagueId: 88,
     leagueName: 'Eredivisie',
     patterns: ['eredivisie', 'dutch league'],
     season: 2025,
+    tagSlugs: ['eredivisie'],
   },
   {
     leagueId: 94,
     leagueName: 'Primeira Liga',
     patterns: ['primeira liga', 'portuguese league', 'liga portugal'],
     season: 2025,
+    tagSlugs: ['primeira-liga'],
+  },
+  {
+    leagueId: 203,
+    leagueName: 'Turkish Super Lig',
+    patterns: ['super lig', 'turkish league', 'süper lig'],
+    season: 2025,
+    tagSlugs: ['super-lig'],
+  },
+  {
+    leagueId: 179,
+    leagueName: 'Scottish Premiership',
+    patterns: ['scottish premiership', 'scottish league', 'spfl'],
+    season: 2025,
+    tagSlugs: ['scottish-premiership'],
+  },
+  {
+    leagueId: 283,
+    leagueName: 'Romania SuperLiga',
+    patterns: ['romania superliga', 'romanian league', 'liga 1 romania'],
+    season: 2025,
+    tagSlugs: ['romania-superliga'],
+  },
+  {
+    leagueId: 345,
+    leagueName: 'Czechia Fortuna Liga',
+    patterns: ['fortuna liga', 'czech league', 'czech first league'],
+    season: 2025,
+    tagSlugs: ['czechia-fortuna-liga'],
+  },
+  {
+    leagueId: 103,
+    leagueName: 'Norway Eliteserien',
+    patterns: ['eliteserien', 'norwegian league'],
+    season: 2025,
+    tagSlugs: ['norway-eliteserien'],
   },
   {
     leagueId: 141,
@@ -118,26 +165,140 @@ const LEAGUE_MAPPINGS: LeaguePattern[] = [
     patterns: ['la liga 2', 'segunda division'],
     season: 2025,
   },
-  // European club competitions
+
+  // ── European club competitions ──────────────────────────────────
   {
     leagueId: 2,
     leagueName: 'Champions League',
     patterns: ['champions league', 'ucl'],
     season: 2025,
+    tagSlugs: ['ucl'],
   },
   {
     leagueId: 3,
     leagueName: 'Europa League',
     patterns: ['europa league', 'uel'],
     season: 2025,
+    tagSlugs: ['uel'],
   },
   {
     leagueId: 848,
     leagueName: 'Conference League',
     patterns: ['conference league', 'uecl'],
     season: 2025,
+    tagSlugs: ['uefa-europa-conference-league'],
   },
-  // International
+
+  // ── Americas ────────────────────────────────────────────────────
+  {
+    leagueId: 253,
+    leagueName: 'MLS',
+    patterns: ['mls', 'major league soccer'],
+    season: 2025,
+    tagSlugs: ['mls'],
+  },
+  {
+    leagueId: 262,
+    leagueName: 'Liga MX',
+    patterns: ['liga mx'],
+    season: 2025,
+    tagSlugs: ['liga-mx'],
+  },
+  {
+    leagueId: 71,
+    leagueName: 'Brazil Serie A',
+    patterns: ['brazil serie a', 'brasileirao', 'série a'],
+    season: 2025,
+    tagSlugs: ['brazil-serie-a'],
+  },
+  {
+    leagueId: 239,
+    leagueName: 'Colombia Primera A',
+    patterns: ['colombia primera', 'liga betplay'],
+    season: 2025,
+    tagSlugs: ['colombia-primera-a'],
+  },
+  {
+    leagueId: 13,
+    leagueName: 'Copa Libertadores',
+    patterns: ['copa libertadores', 'libertadores'],
+    season: 2025,
+    tagSlugs: ['copa-libertadores'],
+  },
+  {
+    leagueId: 11,
+    leagueName: 'Copa Sudamericana',
+    patterns: ['copa sudamericana', 'sudamericana'],
+    season: 2025,
+    tagSlugs: ['copa-sudamericana'],
+  },
+  {
+    leagueId: 265,
+    leagueName: 'Chile Primera Division',
+    patterns: ['chile primera', 'primera division chile'],
+    season: 2025,
+    tagSlugs: ['chile-primera'],
+  },
+  {
+    leagueId: 281,
+    leagueName: 'Peru Liga 1',
+    patterns: ['peru liga 1', 'liga 1 peru'],
+    season: 2025,
+    tagSlugs: ['peru-liga-1'],
+  },
+
+  // ── Asia / Africa / Oceania ─────────────────────────────────────
+  {
+    leagueId: 307,
+    leagueName: 'Saudi Professional League',
+    patterns: ['saudi professional league', 'saudi league', 'spl'],
+    season: 2025,
+    tagSlugs: ['saudi-professional-league'],
+  },
+  {
+    leagueId: 98,
+    leagueName: 'J. League',
+    patterns: ['j. league', 'j-league', 'j1 league', 'japan league'],
+    season: 2025,
+    tagSlugs: ['j-league'],
+  },
+  {
+    leagueId: 99,
+    leagueName: 'J2 League',
+    patterns: ['j2 league', 'j2'],
+    season: 2025,
+    tagSlugs: ['j2-league'],
+  },
+  {
+    leagueId: 292,
+    leagueName: 'K-League',
+    patterns: ['k-league', 'k league', 'korean league'],
+    season: 2025,
+    tagSlugs: ['k-league'],
+  },
+  {
+    leagueId: 188,
+    leagueName: 'A-League',
+    patterns: ['a-league', 'a league', 'australian league'],
+    season: 2025,
+    tagSlugs: ['a-league'],
+  },
+  {
+    leagueId: 233,
+    leagueName: 'Egypt Premier League',
+    patterns: ['egypt premier', 'egyptian league'],
+    season: 2025,
+    tagSlugs: ['egypt-premier-league'],
+  },
+  {
+    leagueId: 200,
+    leagueName: 'Morocco Botola Pro',
+    patterns: ['botola pro', 'moroccan league'],
+    season: 2025,
+    tagSlugs: ['morocco-botola-pro'],
+  },
+
+  // ── International ───────────────────────────────────────────────
   {
     leagueId: 1,
     leagueName: 'World Cup',
@@ -156,14 +317,28 @@ const LEAGUE_MAPPINGS: LeaguePattern[] = [
     patterns: ['copa america'],
     season: 2025,
   },
-  // World Cup qualifiers
+  {
+    leagueId: 10,
+    leagueName: 'FIFA Friendlies',
+    patterns: ['friendly', 'friendlies', 'international friendly'],
+    season: 2025,
+    tagSlugs: ['fifa-friendlies'],
+  },
+
+  // ── World Cup qualifiers ────────────────────────────────────────
   {
     leagueId: 32,
     leagueName: 'World Cup Qualifiers - Europe',
-    patterns: ['world cup qualif', 'qualify for the world cup'],
+    patterns: [
+      'world cup qualif',
+      'qualify for the world cup',
+      'wc qualifiers',
+    ],
     season: 2025,
+    tagSlugs: ['europe-wc-qualifiers'],
   },
-  // Domestic cups
+
+  // ── Domestic cups ───────────────────────────────────────────────
   {
     leagueId: 45,
     leagueName: 'FA Cup',
@@ -176,20 +351,19 @@ const LEAGUE_MAPPINGS: LeaguePattern[] = [
     patterns: ['copa del rey'],
     season: 2025,
   },
-  // Americas
-  {
-    leagueId: 253,
-    leagueName: 'MLS',
-    patterns: ['mls', 'major league soccer'],
-    season: 2025,
-  },
-  {
-    leagueId: 262,
-    leagueName: 'Liga MX',
-    patterns: ['liga mx'],
-    season: 2025,
-  },
 ];
+
+/**
+ * Build a quick lookup: Polymarket tag_slug → LeaguePattern
+ */
+const TAG_SLUG_TO_LEAGUE = new Map<string, LeaguePattern>();
+for (const mapping of LEAGUE_MAPPINGS) {
+  if (mapping.tagSlugs) {
+    for (const slug of mapping.tagSlugs) {
+      TAG_SLUG_TO_LEAGUE.set(slug, mapping);
+    }
+  }
+}
 
 /**
  * Well-known teams and their typical leagues — used to infer
@@ -212,6 +386,12 @@ const TEAM_LEAGUE_HINTS: Record<string, number> = {
   'west ham': 39,
   brighton: 39,
   'nottingham forest': 39,
+  everton: 39,
+  fulham: 39,
+  'crystal palace': 39,
+  bournemouth: 39,
+  wolves: 39,
+  wolverhampton: 39,
   // La Liga (140)
   'real madrid': 140,
   barcelona: 140,
@@ -220,6 +400,11 @@ const TEAM_LEAGUE_HINTS: Record<string, number> = {
   'real sociedad': 140,
   villarreal: 140,
   'real betis': 140,
+  sevilla: 140,
+  valencia: 140,
+  girona: 140,
+  osasuna: 140,
+  mallorca: 140,
   // Serie A (135)
   juventus: 135,
   'inter milan': 135,
@@ -231,6 +416,8 @@ const TEAM_LEAGUE_HINTS: Record<string, number> = {
   atalanta: 135,
   lazio: 135,
   fiorentina: 135,
+  bologna: 135,
+  torino: 135,
   // Bundesliga (78)
   'bayern munich': 78,
   'bayern münchen': 78,
@@ -240,6 +427,9 @@ const TEAM_LEAGUE_HINTS: Record<string, number> = {
   'rb leipzig': 78,
   leverkusen: 78,
   'bayer leverkusen': 78,
+  'eintracht frankfurt': 78,
+  stuttgart: 78,
+  wolfsburg: 78,
   // Ligue 1 (61)
   psg: 61,
   'paris saint-germain': 61,
@@ -247,6 +437,40 @@ const TEAM_LEAGUE_HINTS: Record<string, number> = {
   monaco: 61,
   lyon: 61,
   lille: 61,
+  nice: 61,
+  lens: 61,
+  // Eredivisie (88)
+  ajax: 88,
+  psv: 88,
+  feyenoord: 88,
+  'az alkmaar': 88,
+  // Primeira Liga (94)
+  benfica: 94,
+  porto: 94,
+  sporting: 94,
+  'sporting cp': 94,
+  // Turkish Super Lig (203)
+  galatasaray: 203,
+  fenerbahce: 203,
+  besiktas: 203,
+  trabzonspor: 203,
+  // Saudi Professional League (307)
+  'al hilal': 307,
+  'al ahli': 307,
+  'al nassr': 307,
+  'al ittihad': 307,
+  // MLS (253)
+  'inter miami': 253,
+  'la galaxy': 253,
+  lafc: 253,
+  'atlanta united': 253,
+  // Liga MX (262)
+  'club america': 262,
+  'cruz azul': 262,
+  guadalajara: 262,
+  chivas: 262,
+  tigres: 262,
+  monterrey: 262,
 };
 
 /**
@@ -255,10 +479,10 @@ const TEAM_LEAGUE_HINTS: Record<string, number> = {
  * Links Polymarket events to internal leagues, teams, and fixtures.
  * Handles both:
  * - Outright markets (league winners, tournament winners, qualification)
- * - Match outcome markets (individual fixture results)
+ * - Match outcome markets (individual fixture results — moneyline, spread, total)
  *
- * Since Polymarket currently has NO individual match outcome markets
- * for soccer, the outright path is the primary flow.
+ * Now supports structured sports event data from Polymarket (sportsMarketType,
+ * polymarketTagSlug, seriesSlug, etc.) for higher-confidence matching.
  */
 @Injectable()
 export class PolymarketMatcherService {
@@ -308,15 +532,27 @@ export class PolymarketMatcherService {
 
   /**
    * Classify a market into a type based on event title + market question.
-   * Examines per-market (not per-event) since one event can have mixed types.
+   * Also uses structured Polymarket sports data (sportsMarketType) when available.
    */
   classifyMarket(
     event: ParsedPolymarketEvent,
     market: ParsedMarket,
   ): MarketType {
+    // ── Structured sports data: sportsMarketType ──────────────────
+    // Polymarket's sports match markets have a sportsMarketType field
+    // that directly tells us the market type.
+    if (market.sportsMarketType) {
+      const smt = market.sportsMarketType.toLowerCase();
+      if (smt === 'moneyline' || smt === 'spread' || smt === 'total') {
+        return 'match_outcome';
+      }
+    }
+
     const text = `${event.title} ${market.question}`.toLowerCase();
 
-    // ── Match outcome ──────────────────────────────────────────────
+    // ── Match outcome (text-based detection) ─────────────────────
+    // Check for "vs" pattern first, and also handle event slug patterns
+    // like "lal-osa-mal-2026-03-06" which indicate match events
     if (
       text.includes(' beat ') ||
       text.includes(' win against ') ||
@@ -324,6 +560,17 @@ export class PolymarketMatcherService {
       /will .+ (beat|defeat) /.test(text) ||
       /\bvs\.?\s/.test(text) ||
       /\bv\s/.test(text)
+    ) {
+      return 'match_outcome';
+    }
+
+    // ── Detect multi-outcome match events by structure ────────────
+    // If the event has negRisk=true and the market question looks like
+    // a team name (e.g. "Real Madrid", "Draw"), it's a match moneyline
+    if (
+      event.negRisk &&
+      event.markets.length >= 3 &&
+      this.looksLikeMatchMoneyline(event)
     ) {
       return 'match_outcome';
     }
@@ -349,7 +596,9 @@ export class PolymarketMatcherService {
         text.includes('euro 20') ||
         text.includes('fa cup') ||
         text.includes('copa del rey') ||
-        text.includes('carabao cup'))
+        text.includes('carabao cup') ||
+        text.includes('copa libertadores') ||
+        text.includes('copa sudamericana'))
     ) {
       return 'tournament_winner';
     }
@@ -366,6 +615,12 @@ export class PolymarketMatcherService {
         text.includes('primeira liga') ||
         text.includes('mls') ||
         text.includes('liga mx') ||
+        text.includes('super lig') ||
+        text.includes('saudi professional league') ||
+        text.includes('a-league') ||
+        text.includes('k-league') ||
+        text.includes('j. league') ||
+        text.includes('eliteserien') ||
         text.includes('league title') ||
         // Generic "win the <X> 2025-26"
         /win the .+ 20\d{2}/.test(text))
@@ -412,12 +667,7 @@ export class PolymarketMatcherService {
       for (const pattern of mapping.patterns) {
         if (text.includes(pattern)) {
           if (text.includes('win') || text.includes('winner')) {
-            return mapping.leagueId === 2 ||
-              mapping.leagueId === 3 ||
-              mapping.leagueId === 848 ||
-              mapping.leagueId === 1 ||
-              mapping.leagueId === 4 ||
-              mapping.leagueId === 9
+            return this.isCompetitionLeague(mapping.leagueId)
               ? 'tournament_winner'
               : 'league_winner';
           }
@@ -432,11 +682,42 @@ export class PolymarketMatcherService {
     return 'other';
   }
 
+  /**
+   * Check whether a multi-outcome event looks like a match moneyline
+   * (e.g. has markets like "Real Madrid", "Draw", "Osasuna").
+   */
+  private looksLikeMatchMoneyline(event: ParsedPolymarketEvent): boolean {
+    const questions = event.markets.map((m) => m.question.toLowerCase());
+    // Check for "Draw" or "draw" as one of the outcomes — strong signal
+    if (questions.some((q) => q === 'draw' || q === 'the draw')) {
+      return true;
+    }
+    // Check if event title has "vs" or similar match patterns
+    const title = event.title.toLowerCase();
+    if (/\bvs\.?\b/.test(title) || /\bv\s/.test(title)) {
+      return true;
+    }
+    // Check slug pattern: league-prefix + team abbreviations + date
+    // e.g. "lal-osa-mal-2026-03-06"
+    if (/^\w{2,4}(-\w{2,4}){1,3}-\d{4}-\d{2}-\d{2}$/.test(event.slug)) {
+      return true;
+    }
+    return false;
+  }
+
+  /** Check if a league ID is a cup/tournament (not a domestic league) */
+  private isCompetitionLeague(leagueId: number): boolean {
+    const competitions = new Set([2, 3, 848, 1, 4, 9, 10, 11, 13, 32, 45, 143]);
+    return competitions.has(leagueId);
+  }
+
   // ─── Outright matching ──────────────────────────────────────────────
 
   /**
    * Match an outright market (league/tournament winner, qualification) to our data.
    * Returns the league, team, and season info.
+   *
+   * Now also uses the event's polymarketTagSlug for higher-confidence league detection.
    */
   private async matchToOutright(
     event: ParsedPolymarketEvent,
@@ -454,14 +735,22 @@ export class PolymarketMatcherService {
     // Step 1: Identify the league/competition
     let leagueMatch: LeaguePattern | null = null;
 
-    for (const mapping of LEAGUE_MAPPINGS) {
-      for (const pattern of mapping.patterns) {
-        if (textLower.includes(pattern)) {
-          leagueMatch = mapping;
-          break;
+    // First, try to identify from the polymarketTagSlug (highest confidence)
+    if (event.polymarketTagSlug) {
+      leagueMatch = TAG_SLUG_TO_LEAGUE.get(event.polymarketTagSlug) ?? null;
+    }
+
+    // Then, try text-based matching
+    if (!leagueMatch) {
+      for (const mapping of LEAGUE_MAPPINGS) {
+        for (const pattern of mapping.patterns) {
+          if (textLower.includes(pattern)) {
+            leagueMatch = mapping;
+            break;
+          }
         }
+        if (leagueMatch) break;
       }
-      if (leagueMatch) break;
     }
 
     // If no league found from text, try to infer from team name
@@ -497,6 +786,9 @@ export class PolymarketMatcherService {
     // Step 3: Look up the team in our DB using fuzzy matching
     const teamResult = await this.findTeamByName(teamName);
 
+    // Higher confidence if we resolved the league via tag slug
+    const baseScore = event.polymarketTagSlug ? 0.9 : 0.8;
+
     return {
       event,
       market,
@@ -506,7 +798,7 @@ export class PolymarketMatcherService {
       teamId: teamResult?.id ?? null,
       teamName: teamResult?.name ?? teamName,
       season: leagueMatch.season,
-      matchScore: teamResult ? 0.8 : 0.5, // Higher confidence if we found the team in DB
+      matchScore: teamResult ? baseScore : baseScore - 0.3,
     };
   }
 
@@ -553,6 +845,11 @@ export class PolymarketMatcherService {
       if (TEAM_LEAGUE_HINTS[lowerTrimmed]) {
         return this.cleanTeamName(trimmed);
       }
+      // Even if not in TEAM_LEAGUE_HINTS, if it's short and the event has
+      // a polymarketTagSlug, it's likely a team name from a multi-outcome event
+      if (trimmed.length < 30 && /^[A-Z]/.test(trimmed)) {
+        return this.cleanTeamName(trimmed);
+      }
     }
 
     return null;
@@ -596,12 +893,16 @@ export class PolymarketMatcherService {
     return bestMatch ? { id: bestMatch.id, name: bestMatch.name } : null;
   }
 
-  // ─── Fixture matching (kept for match_outcome markets) ──────────────
+  // ─── Fixture matching ───────────────────────────────────────────────
 
   /**
    * Match a match_outcome market to a fixture.
-   * Same approach as before — kept for completeness, even though
-   * Polymarket currently has no individual match outcome soccer markets.
+   *
+   * Uses multiple strategies:
+   * 1. If the event has a gameStartTime, use it to narrow the fixture date window
+   * 2. Extract team names from event title / market question / slug
+   * 3. If event has polymarketTagSlug, narrow fixtures to that league
+   * 4. Fuzzy-match team names against our fixture database
    */
   private async matchToFixture(
     event: ParsedPolymarketEvent,
@@ -609,6 +910,26 @@ export class PolymarketMatcherService {
   ): Promise<FixtureMarketMatch | null> {
     const textToSearch = `${event.title} ${market.question}`;
     const extractedTeams = this.extractTeamNamesFromMatchText(textToSearch);
+
+    // For multi-outcome match events (negRisk moneylines), the team names
+    // are in the individual market questions rather than the event title
+    if (
+      extractedTeams.length < 2 &&
+      event.negRisk &&
+      event.markets.length >= 3
+    ) {
+      // Collect team names from market questions (skip "Draw")
+      for (const m of event.markets) {
+        const q = m.question.trim();
+        if (
+          q.toLowerCase() !== 'draw' &&
+          q.toLowerCase() !== 'the draw' &&
+          q.length < 40
+        ) {
+          extractedTeams.push(this.cleanTeamName(q));
+        }
+      }
+    }
 
     if (extractedTeams.length < 2) return null;
 
@@ -618,13 +939,32 @@ export class PolymarketMatcherService {
     let searchFrom: Date;
     let searchTo: Date;
 
-    if (event.startDate) {
-      const eventStart = new Date(event.startDate);
-      searchFrom = new Date(eventStart.getTime() - windowDays * 86400000);
-      searchTo = new Date(eventStart.getTime() + windowDays * 86400000);
+    // Use gameStartTime (most precise) or event startDate
+    const refTime = market.gameStartTime || event.startDate;
+    if (refTime) {
+      const refDate = new Date(refTime);
+      searchFrom = new Date(refDate.getTime() - windowDays * 86400000);
+      searchTo = new Date(refDate.getTime() + windowDays * 86400000);
     } else {
       searchFrom = new Date(now.getTime() - 2 * 86400000);
       searchTo = new Date(now.getTime() + 14 * 86400000);
+    }
+
+    // Build query — optionally filter by league if we have a tag slug mapping
+    let leagueFilter: number | null = null;
+    if (event.polymarketTagSlug) {
+      const leagueMapping = TAG_SLUG_TO_LEAGUE.get(event.polymarketTagSlug);
+      if (leagueMapping) {
+        leagueFilter = leagueMapping.leagueId;
+      }
+    }
+
+    const conditions = [
+      gte(schema.fixtures.date, searchFrom),
+      lte(schema.fixtures.date, searchTo),
+    ];
+    if (leagueFilter) {
+      conditions.push(eq(schema.fixtures.leagueId, leagueFilter));
     }
 
     const candidates = await this.db
@@ -636,12 +976,7 @@ export class PolymarketMatcherService {
         status: schema.fixtures.status,
       })
       .from(schema.fixtures)
-      .where(
-        and(
-          gte(schema.fixtures.date, searchFrom),
-          lte(schema.fixtures.date, searchTo),
-        ),
-      );
+      .where(and(...conditions));
 
     if (candidates.length === 0) return null;
 
@@ -700,13 +1035,20 @@ export class PolymarketMatcherService {
         }
       }
 
-      if (event.startDate) {
-        const eventDate = new Date(event.startDate);
+      // Time proximity bonus
+      const refTimeStr = market.gameStartTime || event.startDate;
+      if (refTimeStr) {
+        const eventDate = new Date(refTimeStr);
         const fixtureDate = new Date(c.date);
         const timeDiff = Math.abs(eventDate.getTime() - fixtureDate.getTime());
         const maxDiff = windowDays * 86400000;
         const timeBonus = 1 - timeDiff / maxDiff;
         bestTeamScore = bestTeamScore * 0.85 + timeBonus * 0.15;
+      }
+
+      // League match bonus
+      if (leagueFilter) {
+        bestTeamScore += 0.05; // Small bonus for league-filtered results
       }
 
       if (
