@@ -133,14 +133,23 @@ export class PolymarketService implements OnModuleInit {
     let tradesSkipped = 0;
 
     let bankroll = await this.getOrCreateBankroll();
-    const tradingBlocked = bankroll.isStopped;
+    const tradingBlocked =
+      bankroll.isStopped || Number(bankroll.currentBalance) < 1;
 
-    if (tradingBlocked) {
+    if (bankroll.isStopped) {
       this.logger.warn(
         `Trading is STOPPED: ${bankroll.stoppedReason}. ` +
-          `Market scan completed (${events.length} events, ${matches.length} matched), but no trades will be placed.`,
+          `Market scan completed (${events.length} events, ${matches.length} matched), but no trades will be placed. No Anthropic credits used.`,
       );
       errors.push(`Trading stopped (no new trades): ${bankroll.stoppedReason}`);
+    } else if (Number(bankroll.currentBalance) < 1) {
+      this.logger.warn(
+        `Trading SKIPPED — balance $${Number(bankroll.currentBalance).toFixed(2)} too low. ` +
+          `Market scan completed (${events.length} events, ${matches.length} matched), but no Anthropic credits used for trade evaluation.`,
+      );
+      errors.push(
+        `Insufficient balance ($${Number(bankroll.currentBalance).toFixed(2)}). Skipped trade evaluation to save credits.`,
+      );
     }
 
     if (!tradingBlocked && candidates.length > 0) {
@@ -149,13 +158,21 @@ export class PolymarketService implements OnModuleInit {
 
       for (const candidate of candidates) {
         try {
-          // Re-fetch bankroll for accurate balance after each trade
+          // Re-fetch bankroll BEFORE calling Claude to avoid wasting credits
           bankroll = await this.getOrCreateBankroll();
           bankrollContext = await this.buildBankrollContext();
 
-          // Stop placing trades if budget is exhausted
-          if (Number(bankroll.currentBalance) <= 0) {
-            this.logger.warn('Budget exhausted — stopping trade placement');
+          // Stop if budget too low — saves Anthropic credits
+          if (Number(bankroll.currentBalance) < 1) {
+            this.logger.warn(
+              'Budget too low — skipping remaining outright candidates to save Anthropic credits',
+            );
+            break;
+          }
+          if (bankroll.isStopped) {
+            this.logger.warn(
+              'Stop-loss triggered — skipping remaining outright candidates to save Anthropic credits',
+            );
             break;
           }
 
@@ -264,10 +281,16 @@ export class PolymarketService implements OnModuleInit {
 
     this.logger.log('Starting Polymarket trading cycle (prediction-first)');
 
-    // ── Step 1: Check bankroll ──
+    // ── Step 1: Check bankroll — skip ENTIRE cycle if no funds ──
+    // This prevents wasting Anthropic credits on Claude trading agent calls
+    // when there's no money to trade with. Other tasks (scan, sync, predictions)
+    // are NOT affected — only the trading cycle is skipped.
+    const MIN_TRADE_BALANCE = 1; // $1 minimum to even attempt trading
     let bankroll = await this.getOrCreateBankroll();
     if (bankroll.isStopped) {
-      this.logger.warn(`Trading STOPPED: ${bankroll.stoppedReason}`);
+      this.logger.warn(
+        `Polymarket trading SKIPPED — stopped: ${bankroll.stoppedReason}. No Anthropic credits used.`,
+      );
       return {
         predictionsChecked: 0,
         candidatesFound: 0,
@@ -276,14 +299,19 @@ export class PolymarketService implements OnModuleInit {
         errors: [`Trading stopped: ${bankroll.stoppedReason}`],
       };
     }
-    if (Number(bankroll.currentBalance) <= 0) {
-      this.logger.warn('Budget exhausted');
+    if (Number(bankroll.currentBalance) < MIN_TRADE_BALANCE) {
+      this.logger.warn(
+        `Polymarket trading SKIPPED — balance $${Number(bankroll.currentBalance).toFixed(2)} < $${MIN_TRADE_BALANCE} minimum. ` +
+          `No Anthropic credits used. Will retry next cycle when funds are available.`,
+      );
       return {
         predictionsChecked: 0,
         candidatesFound: 0,
         tradesPlaced: 0,
         tradesSkipped: 0,
-        errors: ['Budget exhausted'],
+        errors: [
+          `Insufficient balance ($${Number(bankroll.currentBalance).toFixed(2)}). Skipped to save Anthropic credits.`,
+        ],
       };
     }
 
@@ -513,15 +541,19 @@ export class PolymarketService implements OnModuleInit {
 
     for (const { candidate } of candidates) {
       try {
-        // Re-fetch bankroll for accurate balance before each trade
+        // Re-fetch bankroll BEFORE calling Claude to avoid wasting credits
         bankroll = await this.getOrCreateBankroll();
 
-        if (Number(bankroll.currentBalance) <= 0) {
-          this.logger.warn('Budget exhausted — stopping');
+        if (Number(bankroll.currentBalance) < MIN_TRADE_BALANCE) {
+          this.logger.warn(
+            `Budget too low ($${Number(bankroll.currentBalance).toFixed(2)}) — skipping remaining candidates to save Anthropic credits`,
+          );
           break;
         }
         if (bankroll.isStopped) {
-          this.logger.warn('Stop-loss triggered — stopping');
+          this.logger.warn(
+            'Stop-loss triggered — skipping remaining candidates to save Anthropic credits',
+          );
           break;
         }
 
