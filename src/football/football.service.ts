@@ -80,6 +80,18 @@ export class FootballService {
   private readonly client: AxiosInstance;
   private readonly baseUrl: string;
 
+  // ─── Sliding-window rate limiter (shared across all callers) ─────────
+  // API-Football allows 300 req/min; we enforce 250 to leave headroom.
+  private static readonly RATE_LIMIT = 250;
+  private static readonly RATE_WINDOW_MS = 60_000;
+  // Static so the limiter is shared even if multiple FootballService
+  // instances are created (e.g. Trigger.dev workers via initServices()).
+  private static requestTimestamps: number[] = [];
+  private static rateLimitQueue: Array<{
+    resolve: () => void;
+  }> = [];
+  private static drainScheduled = false;
+
   constructor(
     private readonly config: ConfigService,
     @Inject('DRIZZLE') private db: any,
@@ -95,6 +107,76 @@ export class FootballService {
         'x-apisports-key': this.config.get<string>('API_FOOTBALL_KEY'),
       },
     });
+  }
+
+  /**
+   * Wait until a request slot is available within the rate window.
+   * Uses a simple sliding-window counter with FIFO queuing so
+   * concurrent callers don't stampede past the limit.
+   */
+  private async acquireRateSlot(): Promise<void> {
+    const now = Date.now();
+    const cutoff = now - FootballService.RATE_WINDOW_MS;
+
+    // Prune timestamps outside the window
+    FootballService.requestTimestamps =
+      FootballService.requestTimestamps.filter((t) => t > cutoff);
+
+    if (FootballService.requestTimestamps.length < FootballService.RATE_LIMIT) {
+      // Slot available — record and proceed
+      FootballService.requestTimestamps.push(Date.now());
+      return;
+    }
+
+    // No slot — queue and wait
+    return new Promise<void>((resolve) => {
+      FootballService.rateLimitQueue.push({ resolve });
+      this.scheduleDrain();
+    });
+  }
+
+  /**
+   * Periodically drains the wait queue as slots open up.
+   */
+  private scheduleDrain(): void {
+    if (FootballService.drainScheduled) return;
+    FootballService.drainScheduled = true;
+
+    const drain = () => {
+      if (FootballService.rateLimitQueue.length === 0) {
+        FootballService.drainScheduled = false;
+        return;
+      }
+
+      const now = Date.now();
+      const cutoff = now - FootballService.RATE_WINDOW_MS;
+      FootballService.requestTimestamps =
+        FootballService.requestTimestamps.filter((t) => t > cutoff);
+
+      while (
+        FootballService.rateLimitQueue.length > 0 &&
+        FootballService.requestTimestamps.length < FootballService.RATE_LIMIT
+      ) {
+        FootballService.requestTimestamps.push(Date.now());
+        const waiter = FootballService.rateLimitQueue.shift()!;
+        waiter.resolve();
+      }
+
+      if (FootballService.rateLimitQueue.length > 0) {
+        // Next slot opens when the oldest request expires from the window
+        const oldest = FootballService.requestTimestamps[0];
+        const waitMs = Math.max(
+          100,
+          oldest + FootballService.RATE_WINDOW_MS - Date.now() + 50,
+        );
+        setTimeout(drain, waitMs);
+      } else {
+        FootballService.drainScheduled = false;
+      }
+    };
+
+    // First drain attempt after a short delay
+    setTimeout(drain, 250);
   }
 
   // ─── SYNC METHODS ────────────────────────────────────────────────────
@@ -2020,7 +2102,8 @@ export class FootballService {
 
   /**
    * Makes an authenticated GET request to the API-Football endpoint.
-   * Handles rate limiting (429) with exponential backoff retry.
+   * Proactively rate-limits to 250 req/min (plan allows 300).
+   * Handles both HTTP 429 and in-body rate-limit errors with backoff retry.
    */
   private async apiRequest<T>(
     endpoint: string,
@@ -2029,6 +2112,9 @@ export class FootballService {
   ): Promise<ApiFootballResponse<T>> {
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
+        // Wait for a rate-limit slot before sending the request
+        await this.acquireRateSlot();
+
         const response = await this.client.get<ApiFootballResponse<T>>(
           endpoint,
           {
@@ -2046,6 +2132,20 @@ export class FootballService {
             const errorMsg = errorKeys
               .map((k) => `${k}: ${errors[k]}`)
               .join('; ');
+
+            // In-body rate-limit error — back off and retry
+            const isRateLimit = errorKeys.some(
+              (k) => k.toLowerCase() === 'ratelimit',
+            );
+            if (isRateLimit && attempt < retries) {
+              const backoff = Math.pow(2, attempt + 1) * 2000; // 4s, 8s
+              this.logger.warn(
+                `Rate limited (in-body) on ${endpoint}, retrying in ${backoff}ms (attempt ${attempt + 1}/${retries})`,
+              );
+              await this.sleep(backoff);
+              continue;
+            }
+
             throw new Error(`API-Football error: ${errorMsg}`);
           }
         }
@@ -2061,9 +2161,9 @@ export class FootballService {
 
           // Rate limited — back off and retry
           if (status === 429 && attempt < retries) {
-            const backoff = Math.pow(2, attempt + 1) * 1000;
+            const backoff = Math.pow(2, attempt + 1) * 2000; // 4s, 8s
             this.logger.warn(
-              `Rate limited on ${endpoint}, retrying in ${backoff}ms (attempt ${attempt + 1}/${retries})`,
+              `Rate limited (429) on ${endpoint}, retrying in ${backoff}ms (attempt ${attempt + 1}/${retries})`,
             );
             await this.sleep(backoff);
             continue;
@@ -2093,9 +2193,18 @@ export class FootballService {
             `API request failed: ${endpoint} — ${status ?? error.code} ${error.message}`,
           );
         } else {
-          this.logger.error(
-            `API request failed: ${endpoint} — ${(error as Error).message}`,
-          );
+          // Re-throw in-body rate-limit errors so the for-loop continue above works
+          const msg = (error as Error).message ?? '';
+          if (msg.includes('rateLimit') && attempt < retries) {
+            const backoff = Math.pow(2, attempt + 1) * 2000;
+            this.logger.warn(
+              `Rate limited (in-body) on ${endpoint}, retrying in ${backoff}ms (attempt ${attempt + 1}/${retries})`,
+            );
+            await this.sleep(backoff);
+            continue;
+          }
+
+          this.logger.error(`API request failed: ${endpoint} — ${msg}`);
         }
 
         throw error;
