@@ -170,6 +170,78 @@ export class PolymarketController {
     };
   }
 
+  @Get('trades/upcoming')
+  @ApiOperation({
+    summary:
+      'Get upcoming open trades sorted by soonest resolution, with profit projections',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max trades to return (default: 5)',
+  })
+  @ApiQuery({
+    name: 'month',
+    required: false,
+    type: Number,
+    description: 'Filter by month created (1-12)',
+  })
+  @ApiQuery({
+    name: 'year',
+    required: false,
+    type: Number,
+    description: 'Filter by year created',
+  })
+  @ApiQuery({
+    name: 'mode',
+    required: false,
+    type: String,
+    description: 'Filter by mode: paper or live',
+  })
+  async getUpcomingTrades(
+    @Query('limit') limit?: string,
+    @Query('month') month?: string,
+    @Query('year') year?: string,
+    @Query('mode') mode?: string,
+  ) {
+    const filters: {
+      limit?: number;
+      month?: number;
+      year?: number;
+      mode?: string;
+    } = {};
+
+    if (limit) filters.limit = Math.max(1, Math.min(100, Number(limit)));
+    if (month && year) {
+      const m = Number(month);
+      const y = Number(year);
+      if (m >= 1 && m <= 12) filters.month = m;
+      if (y >= 2020 && y <= 2100) filters.year = y;
+    }
+    if (mode && ['paper', 'live'].includes(mode)) filters.mode = mode;
+
+    const trades = await this.polymarketService.getUpcomingTrades(filters);
+
+    const totalCost = trades.reduce((s, t) => s + t.positionSizeUsd, 0);
+    const totalProfitIfAllWin = trades.reduce((s, t) => s + t.profitIfWin, 0);
+    const totalExpectedValue = trades.reduce((s, t) => s + t.expectedValue, 0);
+
+    return {
+      data: trades,
+      count: trades.length,
+      summary: {
+        totalCost: Number(totalCost.toFixed(2)),
+        totalProfitIfAllWin: Number(totalProfitIfAllWin.toFixed(2)),
+        totalRoiIfAllWin:
+          totalCost > 0
+            ? Number(((totalProfitIfAllWin / totalCost) * 100).toFixed(2))
+            : 0,
+        totalExpectedValue: Number(totalExpectedValue.toFixed(2)),
+      },
+    };
+  }
+
   @Get('trades/projections')
   @ApiOperation({
     summary:

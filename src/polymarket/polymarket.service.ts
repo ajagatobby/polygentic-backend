@@ -1,6 +1,16 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { eq, and, isNull, sql, desc, gte, lte, inArray } from 'drizzle-orm';
+import {
+  eq,
+  and,
+  isNull,
+  sql,
+  desc,
+  asc,
+  gte,
+  lte,
+  inArray,
+} from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { PolymarketGammaService } from './services/polymarket-gamma.service';
 import {
@@ -1752,6 +1762,112 @@ export class PolymarketService {
         closed: market.closed,
       },
     }));
+  }
+
+  // ─── Upcoming trades ─────────────────────────────────────────────────
+
+  /**
+   * Get upcoming open trades — sorted by market end date (soonest resolution first).
+   *
+   * Filters:
+   * - limit: max trades to return (default 5)
+   * - month + year: only trades created in that month
+   * - mode: 'paper' | 'live' | undefined (all)
+   */
+  async getUpcomingTrades(filters?: {
+    limit?: number;
+    month?: number;
+    year?: number;
+    mode?: string;
+  }): Promise<any[]> {
+    const limit = filters?.limit ?? 5;
+    const conditions: any[] = [eq(schema.polymarketTrades.status, 'open')];
+
+    if (filters?.month && filters?.year) {
+      const startDate = new Date(filters.year, filters.month - 1, 1);
+      const endDate = new Date(filters.year, filters.month, 1);
+      conditions.push(gte(schema.polymarketTrades.createdAt, startDate));
+      conditions.push(lte(schema.polymarketTrades.createdAt, endDate));
+    }
+
+    if (filters?.mode) {
+      conditions.push(eq(schema.polymarketTrades.mode, filters.mode));
+    }
+
+    const rows = await this.db
+      .select({
+        trade: schema.polymarketTrades,
+        market: schema.polymarketMarkets,
+      })
+      .from(schema.polymarketTrades)
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
+        ),
+      )
+      .where(and(...conditions))
+      .orderBy(
+        asc(schema.polymarketMarkets.endDate), // Soonest resolution first
+        desc(schema.polymarketTrades.createdAt),
+      )
+      .limit(limit);
+
+    return rows.map(({ trade, market }: any) => {
+      const entryPrice = Number(trade.entryPrice);
+      const positionSizeUsd = Number(trade.positionSizeUsd);
+      const tokenQuantity =
+        Number(trade.tokenQuantity) || positionSizeUsd / entryPrice;
+      const ensembleProb = Number(trade.ensembleProbability);
+
+      const payoutIfWin = tokenQuantity * 1.0;
+      const profitIfWin = payoutIfWin - positionSizeUsd;
+      const roiIfWin =
+        positionSizeUsd > 0 ? (profitIfWin / positionSizeUsd) * 100 : 0;
+      const lossIfLoss = -positionSizeUsd;
+      const expectedValue =
+        ensembleProb * profitIfWin + (1 - ensembleProb) * lossIfLoss;
+
+      return {
+        id: trade.id,
+        mode: trade.mode,
+        side: trade.side,
+        outcomeIndex: trade.outcomeIndex,
+        outcomeName: trade.outcomeName,
+        entryPrice,
+        positionSizeUsd,
+        tokenQuantity: Number(tokenQuantity.toFixed(4)),
+        ensembleProbability: ensembleProb,
+        polymarketProbability: Number(trade.polymarketProbability),
+        edgePercent: Number(trade.edgePercent),
+        confidenceAtEntry: trade.confidenceAtEntry,
+        agentReasoning: trade.agentReasoning,
+        status: trade.status,
+        createdAt: trade.createdAt,
+        // Projections
+        payoutIfWin: Number(payoutIfWin.toFixed(2)),
+        profitIfWin: Number(profitIfWin.toFixed(2)),
+        roiIfWin: Number(roiIfWin.toFixed(2)),
+        lossIfLoss: Number(lossIfLoss.toFixed(2)),
+        expectedValue: Number(expectedValue.toFixed(2)),
+        // Market details
+        market: {
+          eventTitle: market.eventTitle,
+          marketQuestion: market.marketQuestion,
+          marketType: market.marketType,
+          outcomes: market.outcomes,
+          startDate: market.startDate,
+          endDate: market.endDate,
+          leagueName: market.leagueName,
+          teamName: market.teamName,
+          season: market.season,
+          liquidity: market.liquidity ? Number(market.liquidity) : null,
+          active: market.active,
+          closed: market.closed,
+        },
+      };
+    });
   }
 
   // ─── Potential profit projection ─────────────────────────────────────
