@@ -417,9 +417,14 @@ export class BasketballController {
   @Roles('admin')
   @Post('fixtures/sync')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: '[Admin] Trigger a manual basketball fixture sync' })
+  @ApiOperation({
+    summary: '[Admin] Trigger a manual basketball fixture sync',
+    description:
+      'Send an empty JSON body {} to sync all tracked leagues. ' +
+      'Optionally provide { "leagueIds": [12, 116] } to sync specific leagues.',
+  })
   @ApiResponse({ status: 200, description: 'Sync result with counts' })
-  async syncFixtures(@Body() body?: BasketballSyncFixturesDto) {
+  async syncFixtures(@Body() body: BasketballSyncFixturesDto) {
     this.logger.log('Manual basketball fixture sync triggered');
 
     try {
