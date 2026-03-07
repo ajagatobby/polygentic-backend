@@ -309,7 +309,80 @@ export class PolymarketService implements OnModuleInit {
     // Invalidate cache so next read picks up the new values
     this.configCache = null;
 
+    // ── Sync defaultBudget to the active bankroll's initialBudget ───
+    // This makes budget changes take effect immediately for all trading
+    // decisions (position sizing, stop-loss, drawdown, etc.)
+    if (updates.defaultBudget !== undefined && updates.defaultBudget > 0) {
+      await this.syncBudgetToBankroll(updates.defaultBudget, mode);
+    }
+
     return this.getTradingConfig();
+  }
+
+  /**
+   * Sync a new budget value to the active bankroll.
+   * Updates initialBudget, recalculates currentBalance, and resets
+   * peak/drawdown tracking relative to the new budget.
+   */
+  private async syncBudgetToBankroll(
+    newBudget: number,
+    mode: string,
+  ): Promise<void> {
+    const bankroll = await this.getOrCreateBankroll();
+    const oldBudget = Number(bankroll.initialBudget);
+
+    if (newBudget === oldBudget) return;
+
+    // currentBalance = initialBudget + realizedPnl - openPositionsValue
+    // When we change initialBudget, currentBalance shifts by the same delta.
+    const realizedPnl = Number(bankroll.realizedPnl ?? 0);
+    const openPositionsValue = Number(bankroll.openPositionsValue ?? 0);
+    const newCurrentBalance = newBudget + realizedPnl - openPositionsValue;
+    const totalPortfolioValue = newCurrentBalance + openPositionsValue;
+
+    // Reset peak to the higher of old peak (adjusted) or new portfolio value
+    const newPeakBalance = Math.max(totalPortfolioValue, newBudget);
+
+    // Recalculate drawdown from the new peak
+    const newDrawdownPct =
+      newPeakBalance > 0
+        ? Math.max(0, (newPeakBalance - totalPortfolioValue) / newPeakBalance)
+        : 0;
+
+    // If the budget change means we're above the stop-loss threshold, clear the stop
+    const tradingConfig = await this.getTradingConfig();
+    const portfolioRatio = newBudget > 0 ? totalPortfolioValue / newBudget : 1;
+    const shouldClearStop =
+      bankroll.isStopped && portfolioRatio >= tradingConfig.stopLossPct;
+
+    const updates: any = {
+      initialBudget: String(newBudget),
+      currentBalance: String(newCurrentBalance),
+      totalDeposited: String(newBudget),
+      peakBalance: String(newPeakBalance),
+      currentDrawdownPct: String(newDrawdownPct),
+      updatedAt: new Date(),
+    };
+
+    if (shouldClearStop) {
+      updates.isStopped = false;
+      updates.stoppedReason = null;
+      this.logger.log(
+        `Budget change cleared stop-loss (portfolio at ${(portfolioRatio * 100).toFixed(1)}% of new budget)`,
+      );
+    }
+
+    await this.db
+      .update(schema.polymarketBankroll)
+      .set(updates)
+      .where(eq(schema.polymarketBankroll.id, bankroll.id));
+
+    this.logger.log(
+      `Budget updated: $${oldBudget.toFixed(2)} → $${newBudget.toFixed(2)}. ` +
+        `Balance: $${newCurrentBalance.toFixed(2)}, ` +
+        `portfolio: $${totalPortfolioValue.toFixed(2)}, ` +
+        `peak: $${newPeakBalance.toFixed(2)}`,
+    );
   }
 
   /**
