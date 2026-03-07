@@ -820,6 +820,310 @@ export class AgentsService {
   }
 
   /**
+   * Get a detailed breakdown of prediction performance for a specific day.
+   *
+   * Returns:
+   * - Summary stats: total, correct, incorrect, pending (unresolved), accuracy
+   * - Each prediction with: match info, predicted vs actual result, correctness,
+   *   confidence, and a link to the Polymarket game (if one exists)
+   */
+  async getDailyBreakdown(date?: string): Promise<{
+    date: string;
+    summary: {
+      total: number;
+      resolved: number;
+      correct: number;
+      incorrect: number;
+      pending: number;
+      accuracy: number;
+      avgConfidence: number;
+      avgBrierScore: number | null;
+    };
+    byResult: {
+      home_win: { predicted: number; correct: number; accuracy: number };
+      draw: { predicted: number; correct: number; accuracy: number };
+      away_win: { predicted: number; correct: number; accuracy: number };
+    };
+    predictions: Array<{
+      predictionId: number;
+      fixtureId: number;
+      matchDate: Date;
+      matchStatus: string;
+      league: { id: number; name: string | null; country: string | null };
+      homeTeam: { id: number; name: string | null; logo: string | null };
+      awayTeam: { id: number; name: string | null; logo: string | null };
+      predicted: {
+        result: string;
+        homeWinProb: number;
+        drawProb: number;
+        awayWinProb: number;
+        homeGoals: number | null;
+        awayGoals: number | null;
+        confidence: number | null;
+      };
+      actual: {
+        result: string | null;
+        homeGoals: number | null;
+        awayGoals: number | null;
+      };
+      wasCorrect: boolean | null;
+      brierScore: number | null;
+      predictionType: string;
+      polymarketLink: string | null;
+      createdAt: Date;
+    }>;
+  }> {
+    const dateStr = date ?? new Date().toISOString().split('T')[0];
+    const startOfDay = new Date(`${dateStr}T00:00:00Z`);
+    const endOfDay = new Date(`${dateStr}T23:59:59Z`);
+
+    // Get all predictions for fixtures on this date
+    const rows = await this.db
+      .select({
+        prediction: schema.predictions,
+        fixtureId: schema.fixtures.id,
+        fixtureDate: schema.fixtures.date,
+        fixtureStatus: schema.fixtures.status,
+        leagueId: schema.fixtures.leagueId,
+        leagueName: schema.fixtures.leagueName,
+        leagueCountry: schema.fixtures.leagueCountry,
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+        goalsHome: schema.fixtures.goalsHome,
+        goalsAway: schema.fixtures.goalsAway,
+      })
+      .from(schema.predictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.predictions.fixtureId, schema.fixtures.id),
+      )
+      .where(
+        and(
+          gte(schema.fixtures.date, startOfDay),
+          lte(schema.fixtures.date, endOfDay),
+        ),
+      )
+      .orderBy(asc(schema.fixtures.date), desc(schema.predictions.createdAt));
+
+    // Deduplicate: keep best prediction per fixture (pre_match > daily > on_demand)
+    const typePriority: Record<string, number> = {
+      pre_match: 0,
+      daily: 1,
+      on_demand: 2,
+    };
+    const fixtureMap = new Map<number, (typeof rows)[0]>();
+    for (const row of rows) {
+      const existing = fixtureMap.get(row.fixtureId);
+      if (
+        !existing ||
+        (typePriority[row.prediction.predictionType] ?? 99) <
+          (typePriority[existing.prediction.predictionType] ?? 99)
+      ) {
+        fixtureMap.set(row.fixtureId, row);
+      }
+    }
+
+    const dedupedRows = Array.from(fixtureMap.values());
+
+    // Batch-fetch team names + logos
+    const teamIds = new Set<number>();
+    for (const row of dedupedRows) {
+      if (row.homeTeamId) teamIds.add(row.homeTeamId);
+      if (row.awayTeamId) teamIds.add(row.awayTeamId);
+    }
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    if (teamIds.size > 0) {
+      const teamRows = await this.db
+        .select({
+          id: schema.teams.id,
+          name: schema.teams.name,
+          logo: schema.teams.logo,
+        })
+        .from(schema.teams)
+        .where(
+          sql`${schema.teams.id} IN (${sql.join(
+            [...teamIds].map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        );
+      for (const t of teamRows) {
+        teamMap.set(t.id, { name: t.name, logo: t.logo });
+      }
+    }
+
+    // Batch-fetch Polymarket market links for these fixtures
+    const fixtureIds = dedupedRows.map((r) => r.fixtureId);
+    const polymarketMap = new Map<number, string>();
+    if (fixtureIds.length > 0) {
+      const marketRows = await this.db
+        .select({
+          fixtureId: schema.polymarketMarkets.fixtureId,
+          eventSlug: schema.polymarketMarkets.eventSlug,
+          slug: schema.polymarketMarkets.slug,
+        })
+        .from(schema.polymarketMarkets)
+        .where(
+          and(
+            sql`${schema.polymarketMarkets.fixtureId} IN (${sql.join(
+              fixtureIds.map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+            eq(schema.polymarketMarkets.marketType, 'match_outcome'),
+          ),
+        );
+
+      for (const m of marketRows) {
+        if (m.fixtureId && (m.eventSlug || m.slug)) {
+          const slug = m.eventSlug || m.slug;
+          polymarketMap.set(
+            m.fixtureId,
+            `https://polymarket.com/event/${slug}`,
+          );
+        }
+      }
+    }
+
+    // Build per-prediction results and compute summary
+    let totalResolved = 0;
+    let totalCorrect = 0;
+    let totalIncorrect = 0;
+    let totalPending = 0;
+    let totalConfidence = 0;
+    let confidenceCount = 0;
+    let brierSum = 0;
+    let brierCount = 0;
+
+    const byResult = {
+      home_win: { predicted: 0, correct: 0, accuracy: 0 },
+      draw: { predicted: 0, correct: 0, accuracy: 0 },
+      away_win: { predicted: 0, correct: 0, accuracy: 0 },
+    };
+
+    const predictionDetails = dedupedRows.map((row) => {
+      const p = row.prediction;
+      const homeProb = Number(p.homeWinProb);
+      const drawProb = Number(p.drawProb);
+      const awayProb = Number(p.awayWinProb);
+      const predictedResult = this.getPredictedResultFromProbs(
+        homeProb,
+        drawProb,
+        awayProb,
+      );
+
+      // Track predicted outcomes
+      if (
+        predictedResult === 'home_win' ||
+        predictedResult === 'draw' ||
+        predictedResult === 'away_win'
+      ) {
+        byResult[predictedResult].predicted++;
+      }
+
+      if (p.resolvedAt) {
+        totalResolved++;
+        if (p.wasCorrect === true) {
+          totalCorrect++;
+          if (
+            predictedResult === 'home_win' ||
+            predictedResult === 'draw' ||
+            predictedResult === 'away_win'
+          ) {
+            byResult[predictedResult].correct++;
+          }
+        } else if (p.wasCorrect === false) {
+          totalIncorrect++;
+        }
+      } else {
+        totalPending++;
+      }
+
+      if (p.confidence != null) {
+        totalConfidence += p.confidence;
+        confidenceCount++;
+      }
+
+      const brier = p.probabilityAccuracy
+        ? Number(p.probabilityAccuracy)
+        : null;
+      if (brier != null) {
+        brierSum += brier;
+        brierCount++;
+      }
+
+      const homeTeam = teamMap.get(row.homeTeamId) ?? {
+        name: null,
+        logo: null,
+      };
+      const awayTeam = teamMap.get(row.awayTeamId) ?? {
+        name: null,
+        logo: null,
+      };
+
+      return {
+        predictionId: p.id,
+        fixtureId: row.fixtureId,
+        matchDate: row.fixtureDate,
+        matchStatus: row.fixtureStatus,
+        league: {
+          id: row.leagueId,
+          name: row.leagueName,
+          country: row.leagueCountry,
+        },
+        homeTeam: { id: row.homeTeamId, ...homeTeam },
+        awayTeam: { id: row.awayTeamId, ...awayTeam },
+        predicted: {
+          result: predictedResult,
+          homeWinProb: homeProb,
+          drawProb,
+          awayWinProb: awayProb,
+          homeGoals: p.predictedHomeGoals ? Number(p.predictedHomeGoals) : null,
+          awayGoals: p.predictedAwayGoals ? Number(p.predictedAwayGoals) : null,
+          confidence: p.confidence,
+        },
+        actual: {
+          result: p.actualResult ?? null,
+          homeGoals: p.actualHomeGoals ?? null,
+          awayGoals: p.actualAwayGoals ?? null,
+        },
+        wasCorrect: p.wasCorrect ?? null,
+        brierScore: brier,
+        predictionType: p.predictionType,
+        polymarketLink: polymarketMap.get(row.fixtureId) ?? null,
+        createdAt: p.createdAt,
+      };
+    });
+
+    // Compute by-result accuracies
+    for (const key of Object.keys(byResult) as Array<keyof typeof byResult>) {
+      byResult[key].accuracy =
+        byResult[key].predicted > 0
+          ? byResult[key].correct / byResult[key].predicted
+          : 0;
+    }
+
+    return {
+      date: dateStr,
+      summary: {
+        total: dedupedRows.length,
+        resolved: totalResolved,
+        correct: totalCorrect,
+        incorrect: totalIncorrect,
+        pending: totalPending,
+        accuracy: totalResolved > 0 ? totalCorrect / totalResolved : 0,
+        avgConfidence:
+          confidenceCount > 0
+            ? Number((totalConfidence / confidenceCount).toFixed(1))
+            : 0,
+        avgBrierScore:
+          brierCount > 0 ? Number((brierSum / brierCount).toFixed(6)) : null,
+      },
+      byResult,
+      predictions: predictionDetails,
+    };
+  }
+
+  /**
    * Generate performance feedback from historical predictions to inform future predictions.
    * This creates a self-improving feedback loop by identifying systematic biases.
    */

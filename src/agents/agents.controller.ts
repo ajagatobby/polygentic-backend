@@ -116,6 +116,25 @@ export class AgentsController {
     return feedback;
   }
 
+  @Get('daily-breakdown')
+  @ApiOperation({
+    summary:
+      'Get a detailed breakdown of prediction performance for today or a given day',
+    description:
+      'Returns summary stats (total, correct, incorrect, pending, accuracy, avg confidence, avg Brier score), ' +
+      'a breakdown by predicted result (home_win, draw, away_win), and each individual prediction with ' +
+      'match info, predicted vs actual result, correctness, and a link to the Polymarket game if one exists.',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    type: String,
+    description: 'Date to get breakdown for (YYYY-MM-DD). Defaults to today.',
+  })
+  async getDailyBreakdown(@Query('date') date?: string) {
+    return this.agentsService.getDailyBreakdown(date || undefined);
+  }
+
   @Get('today')
   @ApiOperation({
     summary: "Get predictions for today's football matches",
