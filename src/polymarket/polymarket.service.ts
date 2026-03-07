@@ -2387,18 +2387,38 @@ export class PolymarketService implements OnModuleInit {
 
   // ─── Query helpers ──────────────────────────────────────────────────
 
-  async getOpenPositionsSummary(): Promise<
+  async getOpenPositionsSummary(filters?: { date?: string }): Promise<
     Array<{
       outcomeName: string;
       fixtureId?: number;
       leagueId?: number;
       positionSizeUsd: number;
       polymarketUrl?: string;
+      fixtureDate?: string;
+      homeTeamName?: string;
+      awayTeamName?: string;
+      entryPrice?: number;
+      edgePercent?: number;
+      confidence?: number;
+      createdAt?: Date;
     }>
   > {
     const isLive =
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
     const mode = isLive ? 'live' : 'paper';
+
+    const conditions: any[] = [
+      eq(schema.polymarketTrades.mode, mode),
+      eq(schema.polymarketTrades.status, 'open'),
+    ];
+
+    // Date filter on fixture match date
+    if (filters?.date) {
+      const startOfDay = new Date(`${filters.date}T00:00:00Z`);
+      const endOfDay = new Date(`${filters.date}T23:59:59Z`);
+      conditions.push(gte(schema.fixtures.date, startOfDay));
+      conditions.push(lte(schema.fixtures.date, endOfDay));
+    }
 
     const trades = await this.db
       .select({
@@ -2406,7 +2426,13 @@ export class PolymarketService implements OnModuleInit {
         fixtureId: schema.polymarketTrades.fixtureId,
         leagueId: schema.polymarketTrades.leagueId,
         positionSizeUsd: schema.polymarketTrades.positionSizeUsd,
+        entryPrice: schema.polymarketTrades.entryPrice,
+        edgePercent: schema.polymarketTrades.edgePercent,
+        confidenceAtEntry: schema.polymarketTrades.confidenceAtEntry,
+        createdAt: schema.polymarketTrades.createdAt,
         eventSlug: schema.polymarketMarkets.eventSlug,
+        fixtureDate: schema.fixtures.date,
+        homeTeamName: schema.teams.name,
       })
       .from(schema.polymarketTrades)
       .innerJoin(
@@ -2416,18 +2442,51 @@ export class PolymarketService implements OnModuleInit {
           schema.polymarketMarkets.id,
         ),
       )
-      .where(
-        and(
-          eq(schema.polymarketTrades.mode, mode),
-          eq(schema.polymarketTrades.status, 'open'),
-        ),
-      );
+      .leftJoin(
+        schema.fixtures,
+        eq(schema.polymarketTrades.fixtureId, schema.fixtures.id),
+      )
+      .leftJoin(schema.teams, eq(schema.fixtures.homeTeamId, schema.teams.id))
+      .where(and(...conditions));
+
+    // Need away team name too — get it in a second pass to avoid double join on teams
+    const fixtureIds: number[] = [
+      ...new Set(
+        trades.map((t: any) => t.fixtureId).filter(Boolean) as number[],
+      ),
+    ];
+
+    const awayTeamMap = new Map<number, string>();
+    if (fixtureIds.length > 0) {
+      const awayRows = await this.db
+        .select({
+          fixtureId: schema.fixtures.id,
+          awayTeamName: schema.teams.name,
+        })
+        .from(schema.fixtures)
+        .innerJoin(
+          schema.teams,
+          eq(schema.fixtures.awayTeamId, schema.teams.id),
+        )
+        .where(inArray(schema.fixtures.id, fixtureIds));
+
+      for (const row of awayRows) {
+        awayTeamMap.set(row.fixtureId, row.awayTeamName);
+      }
+    }
 
     return trades.map((t: any) => ({
       outcomeName: t.outcomeName,
       fixtureId: t.fixtureId ?? undefined,
       leagueId: t.leagueId ?? undefined,
       positionSizeUsd: Number(t.positionSizeUsd),
+      entryPrice: t.entryPrice ? Number(t.entryPrice) : undefined,
+      edgePercent: t.edgePercent ? Number(t.edgePercent) : undefined,
+      confidence: t.confidenceAtEntry ?? undefined,
+      fixtureDate: t.fixtureDate?.toISOString?.() ?? undefined,
+      homeTeamName: t.homeTeamName ?? undefined,
+      awayTeamName: t.fixtureId ? awayTeamMap.get(t.fixtureId) : undefined,
+      createdAt: t.createdAt ?? undefined,
       polymarketUrl: t.eventSlug
         ? `https://polymarket.com/event/${t.eventSlug}`
         : undefined,

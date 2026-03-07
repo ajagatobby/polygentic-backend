@@ -294,9 +294,22 @@ export class PolymarketController {
   }
 
   @Get('open-positions')
-  @ApiOperation({ summary: 'Get current open positions' })
-  async getOpenPositions() {
-    const positions = await this.polymarketService.getOpenPositionsSummary();
+  @ApiOperation({
+    summary: 'Get current open positions',
+    description:
+      'Returns all open trades. Optionally filter by fixture match date.',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    type: String,
+    description:
+      'Filter by fixture match date (YYYY-MM-DD). If omitted, returns all open positions.',
+  })
+  async getOpenPositions(@Query('date') date?: string) {
+    const positions = await this.polymarketService.getOpenPositionsSummary({
+      date: date || undefined,
+    });
     return {
       data: positions,
       count: positions.length,
