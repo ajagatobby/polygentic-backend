@@ -131,8 +131,18 @@ export class AgentsController {
     type: String,
     description: 'Date to get breakdown for (YYYY-MM-DD). Defaults to today.',
   })
-  async getDailyBreakdown(@Query('date') date?: string) {
-    return this.agentsService.getDailyBreakdown(date || undefined);
+  @ApiQuery({
+    name: 'day',
+    required: false,
+    type: String,
+    description: 'Alias for date (YYYY-MM-DD). Defaults to today.',
+  })
+  async getDailyBreakdown(
+    @Query('date') date?: string,
+    @Query('day') day?: string,
+  ) {
+    const target = date || day || undefined;
+    return this.agentsService.getDailyBreakdown(target);
   }
 
   @Get('today')
