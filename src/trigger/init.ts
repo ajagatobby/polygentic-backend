@@ -26,6 +26,7 @@ import { PolymarketGammaService } from '../polymarket/services/polymarket-gamma.
 import { PolymarketClobService } from '../polymarket/services/polymarket-clob.service';
 import { PolymarketMatcherService } from '../polymarket/services/polymarket-matcher.service';
 import { PolymarketTradingAgent } from '../polymarket/services/polymarket-trading.agent';
+import { PredictionMemoryService } from '../agents/prediction-memory.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
@@ -96,6 +97,8 @@ export function initServices(): Services {
   const analysisAgent = new AnalysisAgent(config);
   const poissonModel = new PoissonModelService(db as any);
 
+  const predictionMemory = new PredictionMemoryService(config);
+
   const agentsService = new AgentsService(
     db as any,
     config,
@@ -106,6 +109,7 @@ export function initServices(): Services {
     footballService,
     oddsService,
     alertsService,
+    predictionMemory,
   );
 
   const syncService = new SyncService(

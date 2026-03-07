@@ -9,6 +9,7 @@ import { PoissonModelService } from './poisson-model.service';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
+import { PredictionMemoryService } from './prediction-memory.service';
 import {
   PredictionType,
   PerformanceFeedback,
@@ -32,6 +33,7 @@ export class AgentsService {
     private readonly footballService: FootballService,
     private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
+    private readonly predictionMemory: PredictionMemoryService,
   ) {}
 
   // ─── Core prediction pipeline ───────────────────────────────────────
@@ -66,12 +68,20 @@ export class AgentsService {
       throw error;
     }
 
-    // Step 2: Web research + performance feedback + Poisson model (in parallel)
+    // Step 2: Web research + performance feedback + Poisson model + memory recall (in parallel)
     let research: ResearchResult;
     let feedback: PerformanceFeedback | null = null;
     let poissonOutput: PoissonModelOutput | null = null;
+    let memories: string | null = null;
     try {
-      const [researchResult, feedbackResult, poissonResult] =
+      const homeName =
+        matchData.homeTeam?.team?.name ??
+        `Team ${matchData.fixture.homeTeamId}`;
+      const awayName =
+        matchData.awayTeam?.team?.name ??
+        `Team ${matchData.fixture.awayTeamId}`;
+
+      const [researchResult, feedbackResult, poissonResult, memoriesResult] =
         await Promise.allSettled([
           this.researchAgent.research(matchData),
           this.getPerformanceFeedback(),
@@ -81,6 +91,16 @@ export class AgentsService {
             matchData.fixture.leagueId,
             fixtureId,
           ),
+          this.predictionMemory.recallForPrediction({
+            homeTeamName: homeName,
+            awayTeamName: awayName,
+            homeTeamId: matchData.fixture.homeTeamId,
+            awayTeamId: matchData.fixture.awayTeamId,
+            leagueId: matchData.fixture.leagueId,
+            leagueName:
+              matchData.fixture.leagueName ??
+              `League ${matchData.fixture.leagueId}`,
+          }),
         ]);
 
       research =
@@ -107,11 +127,20 @@ export class AgentsService {
       poissonOutput =
         poissonResult.status === 'fulfilled' ? poissonResult.value : null;
 
+      memories =
+        memoriesResult.status === 'fulfilled' ? memoriesResult.value : null;
+
       if (poissonOutput) {
         this.logger.log(
           `Poisson model for fixture ${fixtureId}: H=${(poissonOutput.homeWinProb * 100).toFixed(1)}% ` +
             `D=${(poissonOutput.drawProb * 100).toFixed(1)}% A=${(poissonOutput.awayWinProb * 100).toFixed(1)}% ` +
             `(conf=${poissonOutput.confidence}, data=${poissonOutput.dataPoints})`,
+        );
+      }
+
+      if (memories) {
+        this.logger.log(
+          `Recalled prediction memories for fixture ${fixtureId} (${homeName} vs ${awayName})`,
         );
       }
     } catch (error) {
@@ -128,7 +157,7 @@ export class AgentsService {
       };
     }
 
-    // Step 3: Analysis (Claude gets Poisson output as input for reasoning)
+    // Step 3: Analysis (Claude reasons independently, memories provide context)
     let prediction: PredictionOutput;
     try {
       prediction = await this.analysisAgent.analyze(
@@ -136,6 +165,7 @@ export class AgentsService {
         research,
         feedback,
         poissonOutput,
+        memories,
       );
     } catch (error) {
       this.logger.error(
@@ -420,6 +450,19 @@ export class AgentsService {
             updatedAt: new Date(),
           })
           .where(eq(schema.predictions.id, prediction.id));
+
+        // Store memory in Supermemory for future predictions (best-effort, non-blocking)
+        this.storeResolutionMemory(prediction, fixture, {
+          predictedResult,
+          actualResult,
+          wasCorrect,
+          brierScore,
+          homeProb,
+          drawProb,
+          awayProb,
+        }).catch((err) =>
+          this.logger.warn(`Memory storage failed: ${err.message}`),
+        );
 
         resolved++;
       } catch (error) {
@@ -1630,6 +1673,75 @@ export class AgentsService {
       `Data freshened for fixture ${fixtureId} in ${duration}ms` +
         (summary ? `: ${summary}` : ' (all cached)'),
     );
+  }
+
+  // ─── Supermemory helpers ─────────────────────────────────────────────
+
+  /**
+   * Store a resolved prediction as a Supermemory memory.
+   * Fetches team names for readable memory content.
+   */
+  private async storeResolutionMemory(
+    prediction: any,
+    fixture: any,
+    resolution: {
+      predictedResult: string;
+      actualResult: string;
+      wasCorrect: boolean;
+      brierScore: number;
+      homeProb: number;
+      drawProb: number;
+      awayProb: number;
+    },
+  ): Promise<void> {
+    // Fetch team names
+    const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(Boolean);
+    const teamRows =
+      teamIds.length > 0
+        ? await this.db
+            .select({ id: schema.teams.id, name: schema.teams.name })
+            .from(schema.teams)
+            .where(
+              sql`${schema.teams.id} IN (${sql.join(
+                teamIds.map((id: number) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+        : [];
+
+    const teamMap = new Map<number, string>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, t.name);
+    }
+
+    await this.predictionMemory.storeResolvedPrediction({
+      predictionId: prediction.id,
+      fixtureId: prediction.fixtureId,
+      homeTeamName:
+        teamMap.get(fixture.homeTeamId) ?? `Team ${fixture.homeTeamId}`,
+      awayTeamName:
+        teamMap.get(fixture.awayTeamId) ?? `Team ${fixture.awayTeamId}`,
+      homeTeamId: fixture.homeTeamId,
+      awayTeamId: fixture.awayTeamId,
+      leagueId: fixture.leagueId,
+      leagueName: fixture.leagueName ?? `League ${fixture.leagueId}`,
+      round: fixture.round,
+      matchDate: fixture.date,
+      predictedResult: resolution.predictedResult,
+      actualResult: resolution.actualResult,
+      wasCorrect: resolution.wasCorrect,
+      homeWinProb: resolution.homeProb,
+      drawProb: resolution.drawProb,
+      awayWinProb: resolution.awayProb,
+      predictedHomeGoals: Number(prediction.predictedHomeGoals),
+      predictedAwayGoals: Number(prediction.predictedAwayGoals),
+      actualHomeGoals: fixture.goalsHome,
+      actualAwayGoals: fixture.goalsAway,
+      confidence: prediction.confidence ?? 5,
+      brierScore: resolution.brierScore,
+      keyFactors: prediction.keyFactors,
+      riskFactors: prediction.riskFactors,
+    });
   }
 
   // ─── Private helpers ────────────────────────────────────────────────

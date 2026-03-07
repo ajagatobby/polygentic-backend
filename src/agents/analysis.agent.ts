@@ -113,6 +113,7 @@ export class AnalysisAgent {
     research: ResearchResult,
     feedback?: PerformanceFeedback | null,
     poissonModel?: PoissonModelOutput | null,
+    memories?: string | null,
   ): Promise<PredictionOutput> {
     const homeName =
       data.homeTeam?.team?.name ?? `Team ${data.fixture.homeTeamId}`;
@@ -123,7 +124,13 @@ export class AnalysisAgent {
       `Analyzing: ${homeName} vs ${awayName} with model ${this.model}`,
     );
 
-    const userPrompt = this.buildPrompt(data, research, feedback, poissonModel);
+    const userPrompt = this.buildPrompt(
+      data,
+      research,
+      feedback,
+      poissonModel,
+      memories,
+    );
 
     const response = await this.anthropic.messages.create({
       model: this.model,
@@ -151,9 +158,15 @@ export class AnalysisAgent {
     research: ResearchResult,
     feedback?: PerformanceFeedback | null,
     poissonModel?: PoissonModelOutput | null,
+    memories?: string | null,
   ): string {
     const sections: string[] = [];
     const fixture = data.fixture;
+
+    // Supermemory: specific past prediction memories (injected before feedback)
+    if (memories) {
+      sections.push(memories);
+    }
 
     // Performance feedback (self-improvement loop)
     if (feedback && feedback.totalResolved >= 10) {
