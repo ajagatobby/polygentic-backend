@@ -241,19 +241,19 @@ export class PolymarketService implements OnModuleInit {
     if (updates.defaultBudget !== undefined && updates.defaultBudget > 0) {
       const walletBalance = await this.clobService.getWalletBalance();
 
-      if (walletBalance === null) {
-        throw new BadRequestException(
-          'Unable to verify your Polymarket wallet balance. ' +
-            'Make sure POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS are configured correctly.',
-        );
-      }
-
-      if (updates.defaultBudget > walletBalance) {
+      if (walletBalance !== null && updates.defaultBudget > walletBalance) {
         throw new BadRequestException(
           `Insufficient Polymarket wallet balance. ` +
             `You want to set a budget of $${updates.defaultBudget.toFixed(2)}, ` +
             `but your wallet only has $${walletBalance.toFixed(2)} USDC. ` +
             `Please deposit more USDC to your Polymarket wallet or set a lower budget.`,
+        );
+      }
+
+      if (walletBalance === null) {
+        this.logger.warn(
+          `Could not verify wallet balance for budget of $${updates.defaultBudget}. ` +
+            `Proceeding without validation — check POLYMARKET credentials.`,
         );
       }
     }

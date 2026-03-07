@@ -1,14 +1,8 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
-import { Wallet, Contract, providers } from 'ethers';
+import { Wallet } from 'ethers';
 import axios, { AxiosInstance } from 'axios';
-
-// USDC on Polygon (6 decimals)
-const POLYGON_USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-const ERC20_BALANCE_ABI = [
-  'function balanceOf(address owner) view returns (uint256)',
-];
 
 export interface ClobPrice {
   tokenId: string;
@@ -503,46 +497,38 @@ export class PolymarketClobService implements OnModuleInit {
   }
 
   /**
-   * Get the USDC balance of the Polymarket trading wallet (proxy/funder address).
-   * Returns the balance in USD (USDC has 6 decimals).
-   * Returns null if the wallet address is not configured or the query fails.
+   * Get the USDC collateral balance on Polymarket via the CLOB SDK.
+   * Uses the authenticated getBalanceAllowance endpoint — no raw RPC needed.
+   * Returns the balance in USD, or null if not authenticated.
    */
   async getWalletBalance(): Promise<number | null> {
-    const privateKey = this.config.get<string>('POLYMARKET_PRIVATE_KEY');
-    if (!privateKey) {
+    await this.ensureInitialized();
+
+    if (!this.clobClient || !this.hasCredentials) {
       this.logger.warn(
-        'Cannot check wallet balance — no POLYMARKET_PRIVATE_KEY configured',
+        'Cannot check wallet balance — CLOB client not initialized (missing credentials)',
       );
       return null;
     }
 
-    const signer = new Wallet(privateKey);
-    const funderAddress =
-      this.config.get<string>('POLYMARKET_FUNDER_ADDRESS') || signer.address;
-
-    const rpcUrl =
-      this.config.get<string>('POLYGON_RPC_URL') || 'https://polygon-rpc.com';
-
     try {
-      const provider = new providers.JsonRpcProvider(rpcUrl);
-      const usdc = new Contract(
-        POLYGON_USDC_ADDRESS,
-        ERC20_BALANCE_ABI,
-        provider,
-      );
+      const result = await this.clobClient.getBalanceAllowance({
+        asset_type: 'COLLATERAL' as any,
+      });
 
-      const rawBalance = await usdc.balanceOf(funderAddress);
-      // USDC has 6 decimals
-      const balance = Number(rawBalance) / 1e6;
+      const rawBalance = Number(result?.balance ?? 0);
+
+      // Polymarket API returns balance in raw USDC units (6 decimals).
+      // If the value is suspiciously large (> 100k), it's in micro-units.
+      // Otherwise, it's already human-readable.
+      const balance = rawBalance > 100_000 ? rawBalance / 1e6 : rawBalance;
 
       this.logger.log(
-        `Wallet USDC balance for ${funderAddress}: $${balance.toFixed(2)}`,
+        `Polymarket USDC balance: $${balance.toFixed(2)} (raw: ${rawBalance})`,
       );
       return balance;
     } catch (error) {
-      this.logger.error(
-        `Failed to query wallet USDC balance: ${error.message}`,
-      );
+      this.logger.error(`Failed to get Polymarket balance: ${error.message}`);
       return null;
     }
   }
