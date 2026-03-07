@@ -2876,10 +2876,14 @@ export class PolymarketService implements OnModuleInit {
   // ─── Deduplication ───────────────────────────────────────────────────
 
   /**
-   * Find and remove duplicate open trades.
+   * Find and remove duplicate/conflicting open trades.
    *
-   * A duplicate is defined as: same polymarket_market_id + same outcome_index + same status('open').
-   * Keeps the oldest trade (lowest ID) and deletes the rest.
+   * Catches three types of problems:
+   *   1. Same market + same outcome (exact duplicates)
+   *   2. Same market + opposite outcome (betting Yes AND No — guaranteed loss)
+   *   3. Same fixture across different markets (duplicate exposure)
+   *
+   * For each group, keeps the trade with the highest edge (best value).
    * Freed position value is returned to the bankroll.
    */
   async deduplicateTrades(): Promise<{
@@ -2887,6 +2891,7 @@ export class PolymarketService implements OnModuleInit {
     deleted: number;
     freedAmount: number;
     details: Array<{
+      reason: string;
       keptTradeId: number;
       deletedTradeIds: number[];
       outcomeName: string;
@@ -2894,8 +2899,6 @@ export class PolymarketService implements OnModuleInit {
       freedAmount: number;
     }>;
   }> {
-    // Find all open trades grouped by (polymarket_market_id, outcome_index)
-    // where count > 1
     const allOpenTrades = await this.db
       .select({
         trade: schema.polymarketTrades,
@@ -2910,27 +2913,13 @@ export class PolymarketService implements OnModuleInit {
         ),
       )
       .where(eq(schema.polymarketTrades.status, 'open'))
-      .orderBy(
-        asc(schema.polymarketTrades.polymarketMarketId),
-        asc(schema.polymarketTrades.outcomeIndex),
-        asc(schema.polymarketTrades.id), // Oldest first
-      );
+      .orderBy(asc(schema.polymarketTrades.id));
 
-    // Group by (polymarket_market_id, outcome_index)
-    const groups = new Map<string, Array<{ trade: any; market: any }>>();
+    // Track which trade IDs have already been marked for deletion
+    const toDelete = new Set<number>();
 
-    for (const row of allOpenTrades) {
-      const key = `${row.trade.polymarketMarketId}_${row.trade.outcomeIndex}`;
-      if (!groups.has(key)) {
-        groups.set(key, []);
-      }
-      groups.get(key)!.push(row);
-    }
-
-    let duplicatesFound = 0;
-    let deleted = 0;
-    let totalFreed = 0;
     const details: Array<{
+      reason: string;
       keptTradeId: number;
       deletedTradeIds: number[];
       outcomeName: string;
@@ -2941,48 +2930,110 @@ export class PolymarketService implements OnModuleInit {
     // Track freed amount per bankroll mode
     const freedByMode: Record<string, number> = {};
 
-    for (const [, rows] of groups) {
-      if (rows.length <= 1) continue;
-
-      duplicatesFound += rows.length - 1;
-
-      // Keep the first (oldest by ID), delete the rest
-      const keep = rows[0];
-      const dupes = rows.slice(1);
-
+    const markForDeletion = (
+      keep: { trade: any; market: any },
+      dupes: Array<{ trade: any; market: any }>,
+      reason: string,
+    ) => {
       let groupFreed = 0;
       const deletedIds: number[] = [];
 
       for (const dupe of dupes) {
+        if (toDelete.has(dupe.trade.id)) continue; // Already scheduled
+        toDelete.add(dupe.trade.id);
+
         const posSize = Number(dupe.trade.positionSizeUsd);
         groupFreed += posSize;
+        deletedIds.push(dupe.trade.id);
 
         const dupeMode = dupe.trade.mode;
         freedByMode[dupeMode] = (freedByMode[dupeMode] || 0) + posSize;
-
-        await this.db
-          .delete(schema.polymarketTrades)
-          .where(eq(schema.polymarketTrades.id, dupe.trade.id));
-
-        deletedIds.push(dupe.trade.id);
-        deleted++;
       }
 
-      totalFreed += groupFreed;
+      if (deletedIds.length > 0) {
+        details.push({
+          reason,
+          keptTradeId: keep.trade.id,
+          deletedTradeIds: deletedIds,
+          outcomeName: keep.trade.outcomeName,
+          marketQuestion: keep.market.marketQuestion,
+          freedAmount: Number(groupFreed.toFixed(2)),
+        });
+      }
+    };
 
-      details.push({
-        keptTradeId: keep.trade.id,
-        deletedTradeIds: deletedIds,
-        outcomeName: keep.trade.outcomeName,
-        marketQuestion: keep.market.marketQuestion,
-        freedAmount: Number(groupFreed.toFixed(2)),
-      });
-
-      this.logger.log(
-        `Dedup: kept trade #${keep.trade.id}, deleted ${deletedIds.join(', ')} ` +
-          `(${keep.trade.outcomeName}) — freed $${groupFreed.toFixed(2)}`,
-      );
+    // ── Pass 1: Same market, same outcome (exact duplicates) ──
+    const byMarketOutcome = new Map<
+      string,
+      Array<{ trade: any; market: any }>
+    >();
+    for (const row of allOpenTrades) {
+      const key = `${row.trade.polymarketMarketId}_${row.trade.outcomeIndex}`;
+      if (!byMarketOutcome.has(key)) byMarketOutcome.set(key, []);
+      byMarketOutcome.get(key)!.push(row);
     }
+
+    for (const [, rows] of byMarketOutcome) {
+      if (rows.length <= 1) continue;
+      // Keep highest edge
+      rows.sort(
+        (a, b) =>
+          Number(b.trade.edgePercent ?? 0) - Number(a.trade.edgePercent ?? 0),
+      );
+      markForDeletion(rows[0], rows.slice(1), 'exact_duplicate');
+    }
+
+    // ── Pass 2: Same market, opposite outcome (Yes + No) ──
+    const byMarket = new Map<string, Array<{ trade: any; market: any }>>();
+    for (const row of allOpenTrades) {
+      if (toDelete.has(row.trade.id)) continue;
+      const key = `${row.trade.polymarketMarketId}`;
+      if (!byMarket.has(key)) byMarket.set(key, []);
+      byMarket.get(key)!.push(row);
+    }
+
+    for (const [, rows] of byMarket) {
+      if (rows.length <= 1) continue;
+      // Multiple outcomes on the same market — keep highest edge, delete others
+      rows.sort(
+        (a, b) =>
+          Number(b.trade.edgePercent ?? 0) - Number(a.trade.edgePercent ?? 0),
+      );
+      markForDeletion(rows[0], rows.slice(1), 'opposite_side');
+    }
+
+    // ── Pass 3: Same fixture, different markets (multi-market exposure) ──
+    const byFixture = new Map<number, Array<{ trade: any; market: any }>>();
+    for (const row of allOpenTrades) {
+      if (toDelete.has(row.trade.id)) continue;
+      const fId = row.trade.fixtureId;
+      if (!fId) continue;
+      if (!byFixture.has(fId)) byFixture.set(fId, []);
+      byFixture.get(fId)!.push(row);
+    }
+
+    for (const [, rows] of byFixture) {
+      if (rows.length <= 1) continue;
+      // Multiple markets for the same fixture — keep highest edge, delete others
+      rows.sort(
+        (a, b) =>
+          Number(b.trade.edgePercent ?? 0) - Number(a.trade.edgePercent ?? 0),
+      );
+      markForDeletion(rows[0], rows.slice(1), 'multi_market_fixture');
+    }
+
+    // ── Execute deletions ──
+    let deleted = 0;
+    let totalFreed = 0;
+
+    for (const id of toDelete) {
+      await this.db
+        .delete(schema.polymarketTrades)
+        .where(eq(schema.polymarketTrades.id, id));
+      deleted++;
+    }
+
+    totalFreed = Object.values(freedByMode).reduce((sum, val) => sum + val, 0);
 
     // Return freed amounts to bankrolls
     for (const [mode, freed] of Object.entries(freedByMode)) {
@@ -2991,14 +3042,18 @@ export class PolymarketService implements OnModuleInit {
           ? await this.getOrCreateLiveBankroll()
           : await this.getOrCreateBankroll();
 
+      // Count how many deleted trades belong to this mode
+      const deletedCountForMode = allOpenTrades.filter(
+        (row) => toDelete.has(row.trade.id) && row.trade.mode === mode,
+      ).length;
+
       await this.db
         .update(schema.polymarketBankroll)
         .set({
           currentBalance: String(Number(bankroll.currentBalance) + freed),
           openPositionsCount: Math.max(
             0,
-            bankroll.openPositionsCount -
-              details.reduce((sum, d) => sum + d.deletedTradeIds.length, 0),
+            bankroll.openPositionsCount - deletedCountForMode,
           ),
           openPositionsValue: String(
             Math.max(0, Number(bankroll.openPositionsValue) - freed),
@@ -3010,14 +3065,14 @@ export class PolymarketService implements OnModuleInit {
 
     if (deleted > 0) {
       this.logger.log(
-        `Deduplication complete: ${deleted} duplicates deleted, $${totalFreed.toFixed(2)} freed`,
+        `Deduplication complete: ${deleted} trades deleted, $${totalFreed.toFixed(2)} freed`,
       );
     } else {
-      this.logger.log('No duplicates found');
+      this.logger.log('No duplicates or conflicts found');
     }
 
     return {
-      duplicatesFound,
+      duplicatesFound: toDelete.size,
       deleted,
       freedAmount: Number(totalFreed.toFixed(2)),
       details,
