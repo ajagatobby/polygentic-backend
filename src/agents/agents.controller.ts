@@ -304,6 +304,73 @@ export class AgentsController {
     });
   }
 
+  @Roles('admin')
+  @Post('rerun')
+  @ApiOperation({
+    summary:
+      '[Admin] Re-run predictions for all fixtures on a given date (overwrites existing predictions)',
+    description:
+      'Clears resolution data on existing predictions, then re-generates predictions ' +
+      'for every fixture on the specified date. Uses the upsert behaviour to overwrite. ' +
+      'Optionally scope to specific fixture IDs or a different prediction type.',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: true,
+    type: String,
+    description: 'Date to re-run predictions for (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['daily', 'pre_match', 'on_demand'],
+    description: 'Which prediction type to overwrite (defaults to daily)',
+  })
+  @ApiQuery({
+    name: 'fixtureIds',
+    required: false,
+    type: String,
+    description:
+      'Comma-separated fixture IDs to scope the re-run (e.g. 123,456). If omitted, all fixtures on the date are re-run.',
+  })
+  async rerunPredictions(
+    @Query('date') date: string,
+    @Query('type') type?: string,
+    @Query('fixtureIds') fixtureIds?: string,
+  ) {
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return {
+        error: 'A valid date query parameter is required (YYYY-MM-DD)',
+      };
+    }
+
+    const predictionType = (type as PredictionType) || 'daily';
+    const parsedFixtureIds = fixtureIds
+      ? fixtureIds
+          .split(',')
+          .map((id) => Number(id.trim()))
+          .filter((id) => !isNaN(id))
+      : undefined;
+
+    this.logger.log(
+      `Triggering prediction re-run for ${date} (type: ${predictionType}, fixtures: ${parsedFixtureIds?.length ?? 'all'})`,
+    );
+
+    const handle = await rerunPredictionsTask.trigger({
+      date,
+      predictionType,
+      fixtureIds: parsedFixtureIds,
+    });
+
+    return {
+      message: `Prediction re-run triggered for ${date}`,
+      taskRunId: handle.id,
+      date,
+      predictionType,
+      fixtureIds: parsedFixtureIds ?? 'all',
+    };
+  }
+
   @Get(':fixtureId')
   @ApiOperation({ summary: 'Get predictions for a specific fixture' })
   @ApiParam({ name: 'fixtureId', type: Number })
@@ -409,73 +476,6 @@ export class AgentsController {
     return {
       message: 'Sync and resolve task triggered',
       taskRunId: handle.id,
-    };
-  }
-
-  @Roles('admin')
-  @Post('rerun')
-  @ApiOperation({
-    summary:
-      '[Admin] Re-run predictions for all fixtures on a given date (overwrites existing predictions)',
-    description:
-      'Clears resolution data on existing predictions, then re-generates predictions ' +
-      'for every fixture on the specified date. Uses the upsert behaviour to overwrite. ' +
-      'Optionally scope to specific fixture IDs or a different prediction type.',
-  })
-  @ApiQuery({
-    name: 'date',
-    required: true,
-    type: String,
-    description: 'Date to re-run predictions for (YYYY-MM-DD)',
-  })
-  @ApiQuery({
-    name: 'type',
-    required: false,
-    enum: ['daily', 'pre_match', 'on_demand'],
-    description: 'Which prediction type to overwrite (defaults to daily)',
-  })
-  @ApiQuery({
-    name: 'fixtureIds',
-    required: false,
-    type: String,
-    description:
-      'Comma-separated fixture IDs to scope the re-run (e.g. 123,456). If omitted, all fixtures on the date are re-run.',
-  })
-  async rerunPredictions(
-    @Query('date') date: string,
-    @Query('type') type?: string,
-    @Query('fixtureIds') fixtureIds?: string,
-  ) {
-    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return {
-        error: 'A valid date query parameter is required (YYYY-MM-DD)',
-      };
-    }
-
-    const predictionType = (type as PredictionType) || 'daily';
-    const parsedFixtureIds = fixtureIds
-      ? fixtureIds
-          .split(',')
-          .map((id) => Number(id.trim()))
-          .filter((id) => !isNaN(id))
-      : undefined;
-
-    this.logger.log(
-      `Triggering prediction re-run for ${date} (type: ${predictionType}, fixtures: ${parsedFixtureIds?.length ?? 'all'})`,
-    );
-
-    const handle = await rerunPredictionsTask.trigger({
-      date,
-      predictionType,
-      fixtureIds: parsedFixtureIds,
-    });
-
-    return {
-      message: `Prediction re-run triggered for ${date}`,
-      taskRunId: handle.id,
-      date,
-      predictionType,
-      fixtureIds: parsedFixtureIds ?? 'all',
     };
   }
 }
