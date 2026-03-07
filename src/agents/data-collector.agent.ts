@@ -1,5 +1,5 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
-import { eq, and, gte, lte, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, sql } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
@@ -119,8 +119,8 @@ export class DataCollectorAgent {
       this.getTeamForm(fixture.homeTeamId, fixture.leagueId),
       this.getTeamForm(fixture.awayTeamId, fixture.leagueId),
       this.fetchApiPredictionSafe(fixtureId),
-      this.getTeamRecentStats(fixture.homeTeamId, fixtureId),
-      this.getTeamRecentStats(fixture.awayTeamId, fixtureId),
+      this.getTeamRecentStats(fixture.homeTeamId, fixtureId, fixture.leagueId),
+      this.getTeamRecentStats(fixture.awayTeamId, fixtureId, fixture.leagueId),
     ]);
 
     // 3. Get odds data by matching team names
@@ -276,60 +276,32 @@ export class DataCollectorAgent {
     bookmakers: any[];
   }> {
     try {
-      // Search consensus_odds by matching team names and commence time
-      // The odds API uses team names, not IDs, so we need to match by time window
-      const fixtureDate = new Date(fixture.date);
-      const windowStart = new Date(fixtureDate.getTime() - 24 * 60 * 60 * 1000);
-      const windowEnd = new Date(fixtureDate.getTime() + 24 * 60 * 60 * 1000);
+      // Use the pre-linked oddsApiEventId on the fixture (set by the proper
+      // fuzzy matching in OddsService.matchEventToFixture during odds sync).
+      // This replaces the previous fragile substring-based team name matching.
+      const eventId = fixture.oddsApiEventId;
 
+      if (!eventId) {
+        this.logger.debug(
+          `Fixture ${fixture.id} has no linked oddsApiEventId — no odds available`,
+        );
+        return { consensus: [], bookmakers: [] };
+      }
+
+      // Get consensus odds for this event
       const consensus = await this.db
         .select()
         .from(schema.consensusOdds)
-        .where(
-          and(
-            gte(schema.consensusOdds.commenceTime, windowStart),
-            lte(schema.consensusOdds.commenceTime, windowEnd),
-          ),
-        )
-        .orderBy(desc(schema.consensusOdds.calculatedAt))
-        .limit(20);
+        .where(eq(schema.consensusOdds.oddsApiEventId, eventId))
+        .orderBy(desc(schema.consensusOdds.calculatedAt));
 
-      // Try to find the best match by team names
-      const homeTeamRows = await this.db
-        .select()
-        .from(schema.teams)
-        .where(eq(schema.teams.id, fixture.homeTeamId))
-        .limit(1);
-      const awayTeamRows = await this.db
-        .select()
-        .from(schema.teams)
-        .where(eq(schema.teams.id, fixture.awayTeamId))
-        .limit(1);
-
-      const homeName = homeTeamRows?.[0]?.name?.toLowerCase() ?? '';
-      const awayName = awayTeamRows?.[0]?.name?.toLowerCase() ?? '';
-
-      // Filter consensus to matching fixture
-      const matchedConsensus = consensus.filter((c: any) => {
-        const cHome = (c.homeTeam || '').toLowerCase();
-        const cAway = (c.awayTeam || '').toLowerCase();
-        return (
-          (cHome.includes(homeName) || homeName.includes(cHome)) &&
-          (cAway.includes(awayName) || awayName.includes(cAway))
-        );
-      });
-
-      // Get bookmaker odds for matched events
+      // Get bookmaker odds
       let bookmakers: any[] = [];
-      if (matchedConsensus.length > 0) {
-        const eventId = matchedConsensus[0].oddsApiEventId;
+      if (consensus.length > 0) {
         bookmakers = await this.oddsService.getOddsForEvent(eventId);
       }
 
-      return {
-        consensus: matchedConsensus,
-        bookmakers,
-      };
+      return { consensus, bookmakers };
     } catch (error) {
       this.logger.warn(`Odds fetch for fixture failed: ${error.message}`);
       return { consensus: [], bookmakers: [] };
@@ -344,10 +316,12 @@ export class DataCollectorAgent {
   private async getTeamRecentStats(
     teamId: number,
     currentFixtureId: number,
+    leagueId: number,
     matchCount: number = 10,
   ): Promise<TeamRecentStats> {
     try {
-      // Get the team's recent fixture stats (excluding current fixture)
+      // Get the team's recent fixture stats — filtered by league to avoid
+      // cross-competition contamination (cup matches, continental fixtures)
       const recentStats = await this.db
         .select({
           stat: schema.fixtureStatistics,
@@ -362,6 +336,7 @@ export class DataCollectorAgent {
           and(
             eq(schema.fixtureStatistics.teamId, teamId),
             eq(schema.fixtures.status, 'FT'),
+            eq(schema.fixtures.leagueId, leagueId),
             sql`${schema.fixtureStatistics.fixtureId} != ${currentFixtureId}`,
           ),
         )

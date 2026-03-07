@@ -31,8 +31,8 @@ export class PoissonModelService {
     try {
       // Get recent completed fixtures with stats for both teams
       const [homeStats, awayStats, leagueAvg] = await Promise.all([
-        this.getTeamStrength(homeTeamId, fixtureId),
-        this.getTeamStrength(awayTeamId, fixtureId),
+        this.getTeamStrength(homeTeamId, fixtureId, leagueId, true),
+        this.getTeamStrength(awayTeamId, fixtureId, leagueId, false),
         this.getLeagueAverages(leagueId, fixtureId),
       ]);
 
@@ -156,19 +156,26 @@ export class PoissonModelService {
 
   /**
    * Get team's average attacking and defensive strength from recent matches.
-   * Prefers xG when available, falls back to actual goals.
+   *
+   * Improvements over previous version:
+   * - Filters by league (avoids cross-competition contamination)
+   * - Filters by home/away context (home xG differs significantly from away xG)
+   * - Applies exponential recency weighting (half-life of 8 matches)
+   * - Prefers xG when available, falls back to actual goals with confidence penalty
    */
   private async getTeamStrength(
     teamId: number,
     currentFixtureId: number,
-    matchCount: number = 15,
+    leagueId: number,
+    isHome: boolean,
+    matchCount: number = 20,
   ): Promise<{
     avgXG: number;
     avgXGA: number;
     matchCount: number;
     hasXG: boolean;
   }> {
-    // Get team's recent stats
+    // Get team's recent stats — filtered by league and home/away context
     const teamStats = await this.db
       .select({
         stat: schema.fixtureStatistics,
@@ -183,11 +190,46 @@ export class PoissonModelService {
         and(
           eq(schema.fixtureStatistics.teamId, teamId),
           eq(schema.fixtures.status, 'FT'),
+          eq(schema.fixtures.leagueId, leagueId),
           sql`${schema.fixtureStatistics.fixtureId} != ${currentFixtureId}`,
+          // Filter by home/away context
+          isHome
+            ? eq(schema.fixtures.homeTeamId, teamId)
+            : eq(schema.fixtures.awayTeamId, teamId),
         ),
       )
       .orderBy(desc(schema.fixtures.date))
       .limit(matchCount);
+
+    // If we have very few context-specific matches, supplement with all league matches
+    if (teamStats.length < 4) {
+      const allLeagueStats = await this.db
+        .select({
+          stat: schema.fixtureStatistics,
+          fixture: schema.fixtures,
+        })
+        .from(schema.fixtureStatistics)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.fixtureStatistics.fixtureId, schema.fixtures.id),
+        )
+        .where(
+          and(
+            eq(schema.fixtureStatistics.teamId, teamId),
+            eq(schema.fixtures.status, 'FT'),
+            eq(schema.fixtures.leagueId, leagueId),
+            sql`${schema.fixtureStatistics.fixtureId} != ${currentFixtureId}`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(matchCount);
+
+      // Use all league matches if context-specific were too few
+      if (allLeagueStats.length > teamStats.length) {
+        teamStats.length = 0;
+        teamStats.push(...allLeagueStats);
+      }
+    }
 
     if (teamStats.length === 0) {
       return { avgXG: 0, avgXGA: 0, matchCount: 0, hasXG: false };
@@ -213,37 +255,46 @@ export class PoissonModelService {
       opponentMap.set(os.fixtureId, os);
     }
 
-    // Calculate averages using xG where available, falling back to actual goals
-    let totalXG = 0;
-    let totalXGA = 0;
-    let xgCount = 0;
-    let goalsCount = 0;
-    let totalGoalsFor = 0;
-    let totalGoalsAgainst = 0;
+    // Calculate recency-weighted averages
+    // Exponential decay: weight = e^(-i * ln(2) / halfLife)
+    const HALF_LIFE = 8; // matches
+    const decayRate = Math.log(2) / HALF_LIFE;
 
-    for (const { stat, fixture } of teamStats) {
+    let weightedXG = 0;
+    let weightedXGA = 0;
+    let xgWeightSum = 0;
+    let weightedGoalsFor = 0;
+    let weightedGoalsAgainst = 0;
+    let goalsWeightSum = 0;
+    let xgCount = 0;
+
+    for (let i = 0; i < teamStats.length; i++) {
+      const { stat, fixture } = teamStats[i];
+      const weight = Math.exp(-i * decayRate);
+
       // Team's xG (attack)
       if (stat.expectedGoals && Number(stat.expectedGoals) > 0) {
-        totalXG += Number(stat.expectedGoals);
+        weightedXG += Number(stat.expectedGoals) * weight;
+        xgWeightSum += weight;
         xgCount++;
       }
 
       // Opponent's xG (defense = what was created against us)
       const opp = opponentMap.get(stat.fixtureId);
       if (opp?.expectedGoals && Number(opp.expectedGoals) > 0) {
-        totalXGA += Number(opp.expectedGoals);
+        weightedXGA += Number(opp.expectedGoals) * weight;
       }
 
       // Actual goals as fallback
-      const isHome = fixture.homeTeamId === teamId;
-      const goalsFor = isHome ? fixture.goalsHome : fixture.goalsAway;
-      const goalsAgainst = isHome ? fixture.goalsAway : fixture.goalsHome;
+      const teamIsHome = fixture.homeTeamId === teamId;
+      const goalsFor = teamIsHome ? fixture.goalsHome : fixture.goalsAway;
+      const goalsAgainst = teamIsHome ? fixture.goalsAway : fixture.goalsHome;
       if (goalsFor != null) {
-        totalGoalsFor += goalsFor;
-        goalsCount++;
+        weightedGoalsFor += goalsFor * weight;
+        goalsWeightSum += weight;
       }
       if (goalsAgainst != null) {
-        totalGoalsAgainst += goalsAgainst;
+        weightedGoalsAgainst += goalsAgainst * weight;
       }
     }
 
@@ -252,16 +303,16 @@ export class PoissonModelService {
 
     return {
       avgXG:
-        hasXG && xgCount > 0
-          ? totalXG / xgCount
-          : goalsCount > 0
-            ? totalGoalsFor / goalsCount
+        hasXG && xgWeightSum > 0
+          ? weightedXG / xgWeightSum
+          : goalsWeightSum > 0
+            ? weightedGoalsFor / goalsWeightSum
             : 0,
       avgXGA:
-        hasXG && xgCount > 0
-          ? totalXGA / xgCount
-          : goalsCount > 0
-            ? totalGoalsAgainst / goalsCount
+        hasXG && xgWeightSum > 0
+          ? weightedXGA / xgWeightSum
+          : goalsWeightSum > 0
+            ? weightedGoalsAgainst / goalsWeightSum
             : 0,
       matchCount: n,
       hasXG,

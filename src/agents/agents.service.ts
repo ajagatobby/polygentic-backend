@@ -1888,14 +1888,36 @@ export class AgentsService {
     );
   }
 
+  /**
+   * Determine the predicted result from probabilities.
+   *
+   * Uses a draw-aware threshold instead of pure argmax, because:
+   * - In football, ~26% of matches end in draws
+   * - Draw probability rarely exceeds BOTH home and away in argmax
+   * - Pure argmax almost never predicts draws, missing ~26% of correct answers
+   *
+   * Strategy:
+   * - Predict draw when: drawProb >= DRAW_THRESHOLD AND the home/away
+   *   spread is tight (neither team is a clear favourite)
+   * - Otherwise, pick the higher of home or away
+   */
   private getPredictedResultFromProbs(
     homeProb: number,
     drawProb: number,
     awayProb: number,
   ): string {
-    if (homeProb >= drawProb && homeProb >= awayProb) return 'home_win';
-    if (awayProb >= homeProb && awayProb >= drawProb) return 'away_win';
-    return 'draw';
+    const DRAW_THRESHOLD = 0.27; // Slightly above typical base rate
+    const SPREAD_THRESHOLD = 0.1; // If home-away gap is < 10%, it's tight
+
+    // If draw probability is high and the match looks close, predict draw
+    const homeAwaySpread = Math.abs(homeProb - awayProb);
+    if (drawProb >= DRAW_THRESHOLD && homeAwaySpread < SPREAD_THRESHOLD) {
+      return 'draw';
+    }
+
+    // Otherwise pick the higher of home or away
+    if (homeProb >= awayProb) return 'home_win';
+    return 'away_win';
   }
 
   /**
