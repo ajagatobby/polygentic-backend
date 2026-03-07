@@ -2889,6 +2889,7 @@ export class PolymarketService implements OnModuleInit {
   async deduplicateTrades(): Promise<{
     duplicatesFound: number;
     deleted: number;
+    cancelledOrders: number;
     freedAmount: number;
     details: Array<{
       reason: string;
@@ -3023,10 +3024,40 @@ export class PolymarketService implements OnModuleInit {
     }
 
     // ── Execute deletions ──
+    // For live trades with a CLOB order, attempt to cancel the order first.
+    // If the order already filled, the tokens remain in the wallet — we log
+    // a warning but still remove the DB record to fix the bookkeeping.
     let deleted = 0;
+    let cancelledOrders = 0;
     let totalFreed = 0;
 
     for (const id of toDelete) {
+      const tradeRow = allOpenTrades.find((r) => r.trade.id === id);
+
+      if (tradeRow?.trade.mode === 'live' && tradeRow.trade.orderId) {
+        try {
+          const cancelled = await this.clobService.cancelOrder(
+            tradeRow.trade.orderId,
+          );
+          if (cancelled) {
+            cancelledOrders++;
+            this.logger.log(
+              `Cancelled CLOB order ${tradeRow.trade.orderId} for trade #${id}`,
+            );
+          } else {
+            this.logger.warn(
+              `Could not cancel CLOB order ${tradeRow.trade.orderId} for trade #${id} — may already be filled. ` +
+                `Tokens may remain in wallet. Removing DB record anyway.`,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Error cancelling CLOB order ${tradeRow.trade.orderId} for trade #${id}: ${error.message}. ` +
+              `Removing DB record anyway.`,
+          );
+        }
+      }
+
       await this.db
         .delete(schema.polymarketTrades)
         .where(eq(schema.polymarketTrades.id, id));
@@ -3074,6 +3105,7 @@ export class PolymarketService implements OnModuleInit {
     return {
       duplicatesFound: toDelete.size,
       deleted,
+      cancelledOrders,
       freedAmount: Number(totalFreed.toFixed(2)),
       details,
     };
