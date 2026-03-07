@@ -450,8 +450,14 @@ export class PolymarketService implements OnModuleInit {
     let tradesSkipped = 0;
 
     let bankroll = await this.getOrCreateBankroll();
-    const tradingBlocked =
-      bankroll.isStopped || Number(bankroll.currentBalance) < 1;
+
+    // Use wallet balance (actual USDC on Polymarket) for the "can we trade?" check.
+    // currentBalance can be negative when open positions exceed budget — that doesn't
+    // mean we're broke, just that our money is deployed. Wallet balance is the truth.
+    const walletBalance = await this.clobService.getWalletBalance();
+    const availableCash =
+      walletBalance ?? Math.max(0, Number(bankroll.currentBalance));
+    const tradingBlocked = bankroll.isStopped || availableCash < 1;
 
     if (bankroll.isStopped) {
       this.logger.warn(
@@ -459,13 +465,13 @@ export class PolymarketService implements OnModuleInit {
           `Market scan completed (${events.length} events, ${matches.length} matched), but no trades will be placed. No Anthropic credits used.`,
       );
       errors.push(`Trading stopped (no new trades): ${bankroll.stoppedReason}`);
-    } else if (Number(bankroll.currentBalance) < 1) {
+    } else if (availableCash < 1) {
       this.logger.warn(
-        `Trading SKIPPED — balance $${Number(bankroll.currentBalance).toFixed(2)} too low. ` +
+        `Trading SKIPPED — available cash $${availableCash.toFixed(2)} too low. ` +
           `Market scan completed (${events.length} events, ${matches.length} matched), but no Anthropic credits used for trade evaluation.`,
       );
       errors.push(
-        `Insufficient balance ($${Number(bankroll.currentBalance).toFixed(2)}). Skipped trade evaluation to save credits.`,
+        `Insufficient available cash ($${availableCash.toFixed(2)}). Skipped trade evaluation to save credits.`,
       );
     }
 
@@ -615,9 +621,16 @@ export class PolymarketService implements OnModuleInit {
         errors: [`Trading stopped: ${bankroll.stoppedReason}`],
       };
     }
-    if (Number(bankroll.currentBalance) < MIN_TRADE_BALANCE) {
+
+    // Use wallet balance (actual USDC on Polymarket) instead of currentBalance.
+    // currentBalance can go negative when open positions > budget — that's normal,
+    // it just means money is deployed in bets. Wallet balance is the real free cash.
+    const walletBal = await this.clobService.getWalletBalance();
+    const freeCash = walletBal ?? Math.max(0, Number(bankroll.currentBalance));
+
+    if (freeCash < MIN_TRADE_BALANCE) {
       this.logger.warn(
-        `Polymarket trading SKIPPED — balance $${Number(bankroll.currentBalance).toFixed(2)} < $${MIN_TRADE_BALANCE} minimum. ` +
+        `Polymarket trading SKIPPED — available cash $${freeCash.toFixed(2)} < $${MIN_TRADE_BALANCE} minimum. ` +
           `No Anthropic credits used. Will retry next cycle when funds are available.`,
       );
       return {
@@ -626,7 +639,7 @@ export class PolymarketService implements OnModuleInit {
         tradesPlaced: 0,
         tradesSkipped: 0,
         errors: [
-          `Insufficient balance ($${Number(bankroll.currentBalance).toFixed(2)}). Skipped to save Anthropic credits.`,
+          `Insufficient available cash ($${freeCash.toFixed(2)}). Skipped to save Anthropic credits.`,
         ],
       };
     }
@@ -862,9 +875,15 @@ export class PolymarketService implements OnModuleInit {
         // Re-fetch bankroll BEFORE calling Claude to avoid wasting credits
         bankroll = await this.getOrCreateBankroll();
 
-        if (Number(bankroll.currentBalance) < MIN_TRADE_BALANCE) {
+        // Check actual wallet balance, not currentBalance (which can be negative
+        // when open positions exceed budget — that's normal, not broke)
+        const loopWalletBal = await this.clobService.getWalletBalance();
+        const loopFreeCash =
+          loopWalletBal ?? Math.max(0, Number(bankroll.currentBalance));
+
+        if (loopFreeCash < MIN_TRADE_BALANCE) {
           this.logger.warn(
-            `Budget too low ($${Number(bankroll.currentBalance).toFixed(2)}) — skipping remaining candidates to save Anthropic credits`,
+            `Available cash too low ($${loopFreeCash.toFixed(2)}) — skipping remaining candidates to save Anthropic credits`,
           );
           break;
         }
