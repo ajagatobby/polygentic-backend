@@ -41,6 +41,10 @@ export interface BankrollContext {
   currentDrawdownPct: number;
   maxDrawdownPct: number;
   peakBalance: number;
+  // Trading config (passed from DB config)
+  kellyFraction: number;
+  maxPositionPct: number;
+  stopLossPct: number;
 }
 
 // ─── Outright trading candidate ───────────────────────────────────────
@@ -346,12 +350,9 @@ export class PolymarketTradingAgent {
       topCompetitors,
     } = candidate;
 
-    const kellyFraction =
-      this.config.get<number>('POLYMARKET_KELLY_FRACTION') || 0.25;
-    const maxPositionPct =
-      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
-    const stopLossPct =
-      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+    const kellyFraction = bankroll.kellyFraction;
+    const maxPositionPct = bankroll.maxPositionPct;
+    const stopLossPct = bankroll.stopLossPct;
 
     // Bankroll state
     sections.push(`# BANKROLL STATE`);
@@ -463,12 +464,9 @@ export class PolymarketTradingAgent {
     const sections: string[] = [];
     const { match, pricing, prediction } = candidate;
 
-    const kellyFraction =
-      this.config.get<number>('POLYMARKET_KELLY_FRACTION') || 0.25;
-    const maxPositionPct =
-      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
-    const stopLossPct =
-      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+    const kellyFraction = bankroll.kellyFraction;
+    const maxPositionPct = bankroll.maxPositionPct;
+    const stopLossPct = bankroll.stopLossPct;
 
     // Bankroll state
     sections.push(`# BANKROLL STATE`);

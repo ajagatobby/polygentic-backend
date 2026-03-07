@@ -74,6 +74,36 @@ export class PolymarketService implements OnModuleInit {
         `Could not create partial unique index (may already exist or duplicates need cleanup): ${error.message}`,
       );
     }
+
+    // Auto-create polymarket_config table if it doesn't exist
+    try {
+      await this.db.execute(sql`
+        CREATE TABLE IF NOT EXISTS polymarket_config (
+          id SERIAL PRIMARY KEY,
+          mode VARCHAR(20) NOT NULL,
+          live_trading_enabled BOOLEAN DEFAULT false,
+          min_edge NUMERIC(5,4) DEFAULT '0.05',
+          min_liquidity NUMERIC(14,2) DEFAULT '1000',
+          min_confidence INTEGER DEFAULT 6,
+          kelly_fraction NUMERIC(5,4) DEFAULT '0.25',
+          max_position_pct NUMERIC(5,4) DEFAULT '0.10',
+          stop_loss_pct NUMERIC(5,4) DEFAULT '0.30',
+          target_multiplier NUMERIC(5,2) DEFAULT '3',
+          default_budget NUMERIC(14,2) DEFAULT '500',
+          created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+          updated_at TIMESTAMP DEFAULT NOW()
+        )
+      `);
+      await this.db.execute(sql`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_polymarket_config_mode
+        ON polymarket_config (mode)
+      `);
+      this.logger.log('Ensured polymarket_config table exists');
+    } catch (error) {
+      this.logger.warn(
+        `Could not auto-create polymarket_config table: ${error.message}`,
+      );
+    }
   }
 
   // ─── Runtime config (DB first, env fallback) ─────────────────────────
@@ -101,52 +131,79 @@ export class PolymarketService implements OnModuleInit {
       return this.configCache;
     }
 
-    const isLive =
+    const envLive =
       this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
-    const mode = isLive ? 'live' : 'paper';
 
-    const rows = await this.db
-      .select()
-      .from(schema.polymarketConfig)
-      .where(eq(schema.polymarketConfig.mode, mode))
-      .limit(1);
+    // Try to read DB config. If the table doesn't exist yet (no db:push), fall back gracefully.
+    let dbRow: any = null;
+    try {
+      // Try both modes — prefer the one matching env, but if someone set liveTradingEnabled
+      // in DB, that's the source of truth
+      const mode = envLive ? 'live' : 'paper';
+      const rows = await this.db
+        .select()
+        .from(schema.polymarketConfig)
+        .where(eq(schema.polymarketConfig.mode, mode))
+        .limit(1);
+      dbRow = rows[0] ?? null;
+    } catch (error) {
+      // Table likely doesn't exist yet — fall back to env
+      this.logger.debug(
+        `polymarket_config table not available, using env defaults: ${error.message}`,
+      );
+    }
 
-    const dbRow = rows[0] ?? null;
+    // Helper: use DB value if set (not null/undefined), otherwise env, otherwise hardcoded default
+    const pick = (dbVal: any, envVal: any, fallback: number): number => {
+      if (dbVal != null && dbVal !== '') return Number(dbVal);
+      if (envVal != null && envVal !== '' && envVal !== undefined)
+        return Number(envVal);
+      return fallback;
+    };
 
     const result = {
-      liveTradingEnabled: dbRow?.liveTradingEnabled ?? isLive,
-      minEdge:
-        Number(dbRow?.minEdge) ||
-        this.config.get<number>('POLYMARKET_MIN_EDGE') ||
+      liveTradingEnabled:
+        dbRow?.liveTradingEnabled != null ? dbRow.liveTradingEnabled : envLive,
+      minEdge: pick(
+        dbRow?.minEdge,
+        this.config.get('POLYMARKET_MIN_EDGE'),
         0.05,
-      minLiquidity:
-        Number(dbRow?.minLiquidity) ||
-        this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') ||
+      ),
+      minLiquidity: pick(
+        dbRow?.minLiquidity,
+        this.config.get('POLYMARKET_MIN_LIQUIDITY'),
         1000,
-      minConfidence:
-        dbRow?.minConfidence ??
-        this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') ??
+      ),
+      minConfidence: pick(
+        dbRow?.minConfidence,
+        this.config.get('POLYMARKET_MIN_CONFIDENCE'),
         6,
-      kellyFraction:
-        Number(dbRow?.kellyFraction) ||
-        this.config.get<number>('POLYMARKET_KELLY_FRACTION') ||
+      ),
+      kellyFraction: pick(
+        dbRow?.kellyFraction,
+        this.config.get('POLYMARKET_KELLY_FRACTION'),
         0.25,
-      maxPositionPct:
-        Number(dbRow?.maxPositionPct) ||
-        this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') ||
+      ),
+      maxPositionPct: pick(
+        dbRow?.maxPositionPct,
+        this.config.get('POLYMARKET_MAX_POSITION_PCT'),
         0.1,
-      stopLossPct:
-        Number(dbRow?.stopLossPct) ||
-        this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') ||
+      ),
+      stopLossPct: pick(
+        dbRow?.stopLossPct,
+        this.config.get('POLYMARKET_STOP_LOSS_PCT'),
         0.3,
-      targetMultiplier:
-        Number(dbRow?.targetMultiplier) ||
-        this.config.get<number>('POLYMARKET_TARGET_MULTIPLIER') ||
+      ),
+      targetMultiplier: pick(
+        dbRow?.targetMultiplier,
+        this.config.get('POLYMARKET_TARGET_MULTIPLIER'),
         3,
-      defaultBudget:
-        Number(dbRow?.defaultBudget) ||
-        this.config.get<number>('POLYMARKET_BUDGET') ||
+      ),
+      defaultBudget: pick(
+        dbRow?.defaultBudget,
+        this.config.get('POLYMARKET_BUDGET'),
         500,
+      ),
     };
 
     this.configCache = result;
@@ -170,40 +227,59 @@ export class PolymarketService implements OnModuleInit {
       defaultBudget: number;
     }>,
   ): Promise<any> {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
-    const mode = isLive ? 'live' : 'paper';
+    // Read current config to get the mode (DB or env)
+    const current = await this.getTradingConfig();
+    const mode = current.liveTradingEnabled ? 'live' : 'paper';
 
-    const dbValues: any = { mode, updatedAt: new Date() };
+    // Build a full row: start from current values, overlay updates
+    // This ensures the first insert has all fields populated
+    const fullValues: any = {
+      mode,
+      liveTradingEnabled:
+        updates.liveTradingEnabled ?? current.liveTradingEnabled,
+      minEdge: String(updates.minEdge ?? current.minEdge),
+      minLiquidity: String(updates.minLiquidity ?? current.minLiquidity),
+      minConfidence: updates.minConfidence ?? current.minConfidence,
+      kellyFraction: String(updates.kellyFraction ?? current.kellyFraction),
+      maxPositionPct: String(updates.maxPositionPct ?? current.maxPositionPct),
+      stopLossPct: String(updates.stopLossPct ?? current.stopLossPct),
+      targetMultiplier: String(
+        updates.targetMultiplier ?? current.targetMultiplier,
+      ),
+      defaultBudget: String(updates.defaultBudget ?? current.defaultBudget),
+      updatedAt: new Date(),
+    };
 
+    // Build the set clause with only the fields that were explicitly updated
+    const setValues: any = { updatedAt: new Date() };
     if (updates.liveTradingEnabled !== undefined)
-      dbValues.liveTradingEnabled = updates.liveTradingEnabled;
+      setValues.liveTradingEnabled = updates.liveTradingEnabled;
     if (updates.minEdge !== undefined)
-      dbValues.minEdge = String(updates.minEdge);
+      setValues.minEdge = String(updates.minEdge);
     if (updates.minLiquidity !== undefined)
-      dbValues.minLiquidity = String(updates.minLiquidity);
+      setValues.minLiquidity = String(updates.minLiquidity);
     if (updates.minConfidence !== undefined)
-      dbValues.minConfidence = updates.minConfidence;
+      setValues.minConfidence = updates.minConfidence;
     if (updates.kellyFraction !== undefined)
-      dbValues.kellyFraction = String(updates.kellyFraction);
+      setValues.kellyFraction = String(updates.kellyFraction);
     if (updates.maxPositionPct !== undefined)
-      dbValues.maxPositionPct = String(updates.maxPositionPct);
+      setValues.maxPositionPct = String(updates.maxPositionPct);
     if (updates.stopLossPct !== undefined)
-      dbValues.stopLossPct = String(updates.stopLossPct);
+      setValues.stopLossPct = String(updates.stopLossPct);
     if (updates.targetMultiplier !== undefined)
-      dbValues.targetMultiplier = String(updates.targetMultiplier);
+      setValues.targetMultiplier = String(updates.targetMultiplier);
     if (updates.defaultBudget !== undefined)
-      dbValues.defaultBudget = String(updates.defaultBudget);
+      setValues.defaultBudget = String(updates.defaultBudget);
 
     await this.db
       .insert(schema.polymarketConfig)
-      .values({ ...dbValues, createdAt: new Date() })
+      .values({ ...fullValues, createdAt: new Date() })
       .onConflictDoUpdate({
         target: [schema.polymarketConfig.mode],
-        set: dbValues,
+        set: setValues,
       });
 
-    // Invalidate cache
+    // Invalidate cache so next read picks up the new values
     this.configCache = null;
 
     return this.getTradingConfig();
@@ -2347,12 +2423,11 @@ export class PolymarketService implements OnModuleInit {
   async buildBankrollContext(): Promise<BankrollContext> {
     const bankroll = await this.getOrCreateBankroll();
     const tradingConfig = await this.getTradingConfig();
-    const targetMultiplier = tradingConfig.targetMultiplier;
 
     return {
       initialBudget: Number(bankroll.initialBudget),
       currentBalance: Number(bankroll.currentBalance),
-      targetMultiplier,
+      targetMultiplier: tradingConfig.targetMultiplier,
       realizedPnl: Number(bankroll.realizedPnl),
       openPositionsCount: bankroll.openPositionsCount ?? 0,
       openPositionsValue: Number(bankroll.openPositionsValue ?? 0),
@@ -2361,6 +2436,9 @@ export class PolymarketService implements OnModuleInit {
       currentDrawdownPct: Number(bankroll.currentDrawdownPct ?? 0),
       maxDrawdownPct: Number(bankroll.maxDrawdownPct ?? 0),
       peakBalance: Number(bankroll.peakBalance ?? bankroll.initialBudget),
+      kellyFraction: tradingConfig.kellyFraction,
+      maxPositionPct: tradingConfig.maxPositionPct,
+      stopLossPct: tradingConfig.stopLossPct,
     };
   }
 
