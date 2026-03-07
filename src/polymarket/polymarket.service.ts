@@ -76,6 +76,139 @@ export class PolymarketService implements OnModuleInit {
     }
   }
 
+  // ─── Runtime config (DB first, env fallback) ─────────────────────────
+
+  /**
+   * Read-through config: DB row first, then env, then hardcoded default.
+   * Caches the DB row for the lifetime of a single request cycle.
+   */
+  private configCache: any | null = null;
+  private configCacheAt = 0;
+
+  async getTradingConfig(): Promise<{
+    liveTradingEnabled: boolean;
+    minEdge: number;
+    minLiquidity: number;
+    minConfidence: number;
+    kellyFraction: number;
+    maxPositionPct: number;
+    stopLossPct: number;
+    targetMultiplier: number;
+    defaultBudget: number;
+  }> {
+    // Cache for 30s to avoid hammering DB on every call in a trading cycle
+    if (this.configCache && Date.now() - this.configCacheAt < 30_000) {
+      return this.configCache;
+    }
+
+    const isLive =
+      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const mode = isLive ? 'live' : 'paper';
+
+    const rows = await this.db
+      .select()
+      .from(schema.polymarketConfig)
+      .where(eq(schema.polymarketConfig.mode, mode))
+      .limit(1);
+
+    const dbRow = rows[0] ?? null;
+
+    const result = {
+      liveTradingEnabled: dbRow?.liveTradingEnabled ?? isLive,
+      minEdge:
+        Number(dbRow?.minEdge) ||
+        this.config.get<number>('POLYMARKET_MIN_EDGE') ||
+        0.05,
+      minLiquidity:
+        Number(dbRow?.minLiquidity) ||
+        this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') ||
+        1000,
+      minConfidence:
+        dbRow?.minConfidence ??
+        this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') ??
+        6,
+      kellyFraction:
+        Number(dbRow?.kellyFraction) ||
+        this.config.get<number>('POLYMARKET_KELLY_FRACTION') ||
+        0.25,
+      maxPositionPct:
+        Number(dbRow?.maxPositionPct) ||
+        this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') ||
+        0.1,
+      stopLossPct:
+        Number(dbRow?.stopLossPct) ||
+        this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') ||
+        0.3,
+      targetMultiplier:
+        Number(dbRow?.targetMultiplier) ||
+        this.config.get<number>('POLYMARKET_TARGET_MULTIPLIER') ||
+        3,
+      defaultBudget:
+        Number(dbRow?.defaultBudget) ||
+        this.config.get<number>('POLYMARKET_BUDGET') ||
+        500,
+    };
+
+    this.configCache = result;
+    this.configCacheAt = Date.now();
+    return result;
+  }
+
+  /**
+   * Update trading config in DB (upsert by mode).
+   */
+  async updateTradingConfig(
+    updates: Partial<{
+      liveTradingEnabled: boolean;
+      minEdge: number;
+      minLiquidity: number;
+      minConfidence: number;
+      kellyFraction: number;
+      maxPositionPct: number;
+      stopLossPct: number;
+      targetMultiplier: number;
+      defaultBudget: number;
+    }>,
+  ): Promise<any> {
+    const isLive =
+      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const mode = isLive ? 'live' : 'paper';
+
+    const dbValues: any = { mode, updatedAt: new Date() };
+
+    if (updates.liveTradingEnabled !== undefined)
+      dbValues.liveTradingEnabled = updates.liveTradingEnabled;
+    if (updates.minEdge !== undefined)
+      dbValues.minEdge = String(updates.minEdge);
+    if (updates.minLiquidity !== undefined)
+      dbValues.minLiquidity = String(updates.minLiquidity);
+    if (updates.minConfidence !== undefined)
+      dbValues.minConfidence = updates.minConfidence;
+    if (updates.kellyFraction !== undefined)
+      dbValues.kellyFraction = String(updates.kellyFraction);
+    if (updates.maxPositionPct !== undefined)
+      dbValues.maxPositionPct = String(updates.maxPositionPct);
+    if (updates.stopLossPct !== undefined)
+      dbValues.stopLossPct = String(updates.stopLossPct);
+    if (updates.targetMultiplier !== undefined)
+      dbValues.targetMultiplier = String(updates.targetMultiplier);
+    if (updates.defaultBudget !== undefined)
+      dbValues.defaultBudget = String(updates.defaultBudget);
+
+    await this.db
+      .insert(schema.polymarketConfig)
+      .values({ ...dbValues, createdAt: new Date() })
+      .onConflictDoUpdate({
+        target: [schema.polymarketConfig.mode],
+        set: dbValues,
+      });
+
+    // Invalidate cache
+    this.configCache = null;
+
+    return this.getTradingConfig();
+  }
+
   // ─── Main agent loop ────────────────────────────────────────────────
 
   /**
@@ -273,11 +406,10 @@ export class PolymarketService implements OnModuleInit {
     let tradesPlaced = 0;
     let tradesSkipped = 0;
 
-    const minEdge = this.config.get<number>('POLYMARKET_MIN_EDGE') || 0.05;
-    const minLiquidity =
-      this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') || 1000;
-    const minConfidence =
-      this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
+    const tradingConfig = await this.getTradingConfig();
+    const minEdge = tradingConfig.minEdge;
+    const minLiquidity = tradingConfig.minLiquidity;
+    const minConfidence = tradingConfig.minConfidence;
 
     this.logger.log('Starting Polymarket trading cycle (prediction-first)');
 
@@ -623,9 +755,9 @@ export class PolymarketService implements OnModuleInit {
   private async buildTradingCandidates(
     matches: MarketMatch[],
   ): Promise<TradingCandidate[]> {
-    const minEdge = this.config.get<number>('POLYMARKET_MIN_EDGE') || 0.05;
-    const minLiquidity =
-      this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') || 1000;
+    const tradingConfig = await this.getTradingConfig();
+    const minEdge = tradingConfig.minEdge;
+    const minLiquidity = tradingConfig.minLiquidity;
 
     const candidates: TradingCandidate[] = [];
 
@@ -1139,8 +1271,8 @@ export class PolymarketService implements OnModuleInit {
     match: FixtureMarketMatch,
     minEdge: number,
   ): Promise<FixtureTradingCandidate | null> {
-    const minConfidence =
-      this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
+    const tradingCfg = await this.getTradingConfig();
+    const minConfidence = tradingCfg.minConfidence;
 
     // Get our prediction for this fixture
     const [prediction] = await this.db
@@ -1457,14 +1589,13 @@ export class PolymarketService implements OnModuleInit {
     decision: TradingDecision,
     bankroll: any,
   ): Promise<boolean> {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const tradingConfig = await this.getTradingConfig();
+    const isLive = tradingConfig.liveTradingEnabled;
     const mode = isLive ? 'live' : 'paper';
 
     // ── Budget guard: never exceed initial budget ─────────────────────
     const currentBalance = Number(bankroll.currentBalance);
-    const maxPositionPct =
-      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
+    const maxPositionPct = tradingConfig.maxPositionPct;
     const maxPositionSize = currentBalance * maxPositionPct;
     const minTradeSize = 1; // $1 minimum to be worth placing
 
@@ -1747,8 +1878,8 @@ export class PolymarketService implements OnModuleInit {
     }
 
     // 5. Determine mode
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const tradingCfg = await this.getTradingConfig();
+    const isLive = tradingCfg.liveTradingEnabled;
     const mode = isLive ? 'live' : 'paper';
 
     // 6. Place live order if applicable
@@ -2117,8 +2248,8 @@ export class PolymarketService implements OnModuleInit {
   // ─── Bankroll management ────────────────────────────────────────────
 
   async getOrCreateBankroll(): Promise<any> {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const tradingConfig = await this.getTradingConfig();
+    const isLive = tradingConfig.liveTradingEnabled;
     const mode = isLive ? 'live' : 'paper';
 
     const existing = await this.db
@@ -2130,7 +2261,7 @@ export class PolymarketService implements OnModuleInit {
 
     if (existing.length > 0) return existing[0];
 
-    const budget = this.config.get<number>('POLYMARKET_BUDGET') || 500;
+    const budget = tradingConfig.defaultBudget;
 
     const [created] = await this.db
       .insert(schema.polymarketBankroll)
@@ -2215,8 +2346,8 @@ export class PolymarketService implements OnModuleInit {
 
   async buildBankrollContext(): Promise<BankrollContext> {
     const bankroll = await this.getOrCreateBankroll();
-    const targetMultiplier =
-      this.config.get<number>('POLYMARKET_TARGET_MULTIPLIER') || 3;
+    const tradingConfig = await this.getTradingConfig();
+    const targetMultiplier = tradingConfig.targetMultiplier;
 
     return {
       initialBudget: Number(bankroll.initialBudget),
@@ -2235,8 +2366,8 @@ export class PolymarketService implements OnModuleInit {
 
   async updateBankrollSnapshot(): Promise<void> {
     const bankroll = await this.getOrCreateBankroll();
-    const stopLossPct =
-      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+    const tradingConfig = await this.getTradingConfig();
+    const stopLossPct = tradingConfig.stopLossPct;
 
     const resolvedTrades = await this.db
       .select()
@@ -2446,9 +2577,8 @@ export class PolymarketService implements OnModuleInit {
       createdAt?: Date;
     }>
   > {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
-    const mode = isLive ? 'live' : 'paper';
+    const tradingCfg = await this.getTradingConfig();
+    const mode = tradingCfg.liveTradingEnabled ? 'live' : 'paper';
 
     const conditions: any[] = [
       eq(schema.polymarketTrades.mode, mode),
@@ -4268,7 +4398,8 @@ export class PolymarketService implements OnModuleInit {
 
     if (existing.length > 0) return existing[0];
 
-    const budget = this.config.get<number>('POLYMARKET_BUDGET') || 500;
+    const tradingCfg = await this.getTradingConfig();
+    const budget = tradingCfg.defaultBudget;
 
     const [created] = await this.db
       .insert(schema.polymarketBankroll)

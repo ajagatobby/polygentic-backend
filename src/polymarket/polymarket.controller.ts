@@ -1,4 +1,12 @@
-import { Controller, Get, Post, Query, Body, Logger } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Patch,
+  Query,
+  Body,
+  Logger,
+} from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
@@ -28,6 +36,101 @@ export class PolymarketController {
   })
   async getPerformance() {
     return this.polymarketService.getPerformanceSummary();
+  }
+
+  @Get('config')
+  @ApiOperation({
+    summary: 'Get current Polymarket trading configuration',
+    description:
+      'Returns all trading parameters (DB values override env defaults). ' +
+      'Includes edge thresholds, position sizing, risk management, and budget settings.',
+  })
+  async getConfig() {
+    return this.polymarketService.getTradingConfig();
+  }
+
+  @Roles('admin')
+  @Patch('config')
+  @ApiOperation({
+    summary: '[Admin] Update Polymarket trading configuration',
+    description:
+      'Partially update trading parameters. Only provided fields are changed. ' +
+      'Values are persisted to the database and take effect immediately (overrides env vars).',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        liveTradingEnabled: {
+          type: 'boolean',
+          description:
+            'Enable/disable live trading (true = real CLOB orders, false = paper mode)',
+          example: true,
+        },
+        minEdge: {
+          type: 'number',
+          description:
+            'Minimum edge (as decimal) required to consider a trade. 0.05 = 5%',
+          example: 0.05,
+        },
+        minLiquidity: {
+          type: 'number',
+          description: 'Minimum market liquidity in USD to consider trading',
+          example: 1000,
+        },
+        minConfidence: {
+          type: 'integer',
+          description: 'Minimum prediction confidence (1-10) required to trade',
+          example: 6,
+        },
+        kellyFraction: {
+          type: 'number',
+          description:
+            'Kelly criterion fraction for position sizing. 0.25 = quarter-Kelly (conservative)',
+          example: 0.25,
+        },
+        maxPositionPct: {
+          type: 'number',
+          description:
+            'Maximum position size as fraction of bankroll. 0.10 = 10% max per trade',
+          example: 0.1,
+        },
+        stopLossPct: {
+          type: 'number',
+          description:
+            'Stop-loss threshold as fraction of initial budget. 0.30 = stop when balance drops to 30%',
+          example: 0.3,
+        },
+        targetMultiplier: {
+          type: 'number',
+          description:
+            'Target return multiplier on initial budget. 3 = aim for 3x return',
+          example: 3,
+        },
+        defaultBudget: {
+          type: 'number',
+          description:
+            'Default budget in USD when creating a new bankroll (does not change existing bankroll)',
+          example: 500,
+        },
+      },
+    },
+  })
+  async updateConfig(
+    @Body()
+    body: Partial<{
+      liveTradingEnabled: boolean;
+      minEdge: number;
+      minLiquidity: number;
+      minConfidence: number;
+      kellyFraction: number;
+      maxPositionPct: number;
+      stopLossPct: number;
+      targetMultiplier: number;
+      defaultBudget: number;
+    }>,
+  ) {
+    return this.polymarketService.updateTradingConfig(body);
   }
 
   @Get('markets')
