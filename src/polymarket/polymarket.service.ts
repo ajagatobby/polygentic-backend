@@ -95,6 +95,7 @@ export class PolymarketService implements OnModuleInit {
           max_position_pct NUMERIC(5,4) DEFAULT '0.10',
           stop_loss_pct NUMERIC(5,4) DEFAULT '0.30',
           target_multiplier NUMERIC(5,2) DEFAULT '3',
+          max_consecutive_losses INTEGER DEFAULT 5,
           default_budget NUMERIC(14,2) DEFAULT '500',
           created_at TIMESTAMP DEFAULT NOW() NOT NULL,
           updated_at TIMESTAMP DEFAULT NOW()
@@ -103,6 +104,11 @@ export class PolymarketService implements OnModuleInit {
       await this.db.execute(sql`
         CREATE UNIQUE INDEX IF NOT EXISTS uq_polymarket_config_mode
         ON polymarket_config (mode)
+      `);
+      // Add max_consecutive_losses column if missing (table may already exist)
+      await this.db.execute(sql`
+        ALTER TABLE polymarket_config
+        ADD COLUMN IF NOT EXISTS max_consecutive_losses INTEGER DEFAULT 5
       `);
       this.logger.log('Ensured polymarket_config table exists');
     } catch (error) {
@@ -130,6 +136,7 @@ export class PolymarketService implements OnModuleInit {
     maxPositionPct: number;
     stopLossPct: number;
     targetMultiplier: number;
+    maxConsecutiveLosses: number;
     defaultBudget: number;
   }> {
     // Cache for 30s to avoid hammering DB on every call in a trading cycle
@@ -205,6 +212,11 @@ export class PolymarketService implements OnModuleInit {
         this.config.get('POLYMARKET_TARGET_MULTIPLIER'),
         3,
       ),
+      maxConsecutiveLosses: pick(
+        dbRow?.maxConsecutiveLosses,
+        this.config.get('POLYMARKET_MAX_CONSECUTIVE_LOSSES'),
+        5,
+      ),
       defaultBudget: pick(
         dbRow?.defaultBudget,
         this.config.get('POLYMARKET_BUDGET'),
@@ -230,6 +242,7 @@ export class PolymarketService implements OnModuleInit {
       maxPositionPct: number;
       stopLossPct: number;
       targetMultiplier: number;
+      maxConsecutiveLosses: number;
       defaultBudget: number;
     }>,
   ): Promise<any> {
@@ -273,6 +286,8 @@ export class PolymarketService implements OnModuleInit {
       targetMultiplier: String(
         updates.targetMultiplier ?? current.targetMultiplier,
       ),
+      maxConsecutiveLosses:
+        updates.maxConsecutiveLosses ?? current.maxConsecutiveLosses,
       defaultBudget: String(updates.defaultBudget ?? current.defaultBudget),
       updatedAt: new Date(),
     };
@@ -295,6 +310,8 @@ export class PolymarketService implements OnModuleInit {
       setValues.stopLossPct = String(updates.stopLossPct);
     if (updates.targetMultiplier !== undefined)
       setValues.targetMultiplier = String(updates.targetMultiplier);
+    if (updates.maxConsecutiveLosses !== undefined)
+      setValues.maxConsecutiveLosses = updates.maxConsecutiveLosses;
     if (updates.defaultBudget !== undefined)
       setValues.defaultBudget = String(updates.defaultBudget);
 
@@ -2660,7 +2677,8 @@ export class PolymarketService implements OnModuleInit {
     // 3. CONSECUTIVE LOSS STOP: If the last N resolved trades are all
     //    losses, the model may be fundamentally broken. Stop to prevent
     //    further damage while the model is reviewed.
-    //    Trigger: 5+ consecutive losses.
+    //    Trigger: maxConsecutiveLosses+ consecutive losses (configurable, default 5).
+    //    Set to 0 to disable this check.
 
     const realizedLossRatio =
       initialBudget > 0
@@ -2691,7 +2709,9 @@ export class PolymarketService implements OnModuleInit {
         break;
       }
     }
-    const consecutiveLossTriggered = consecutiveLosses >= 5;
+    const maxConsecLosses = tradingConfig.maxConsecutiveLosses;
+    const consecutiveLossTriggered =
+      maxConsecLosses > 0 && consecutiveLosses >= maxConsecLosses;
 
     const isStopped =
       realizedLossTriggered || drawdownTriggered || consecutiveLossTriggered;

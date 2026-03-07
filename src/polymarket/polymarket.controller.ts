@@ -116,10 +116,16 @@ export class PolymarketController {
             'Target return multiplier on initial budget. 3 = aim for 3x return',
           example: 3,
         },
+        maxConsecutiveLosses: {
+          type: 'integer',
+          description:
+            'Stop trading after this many consecutive losing trades. Set to 0 to disable. Default: 5',
+          example: 10,
+        },
         defaultBudget: {
           type: 'number',
           description:
-            'Default budget in USD when creating a new bankroll (does not change existing bankroll)',
+            'Budget in USD for the trading agent. Updates the active bankroll immediately.',
           example: 500,
         },
       },
@@ -136,6 +142,7 @@ export class PolymarketController {
       maxPositionPct: number;
       stopLossPct: number;
       targetMultiplier: number;
+      maxConsecutiveLosses: number;
       defaultBudget: number;
     }>,
   ) {

@@ -286,6 +286,9 @@ export const polymarketConfig = pgTable(
       scale: 2,
     }).default('3'), // 3x return target
 
+    // Consecutive loss stop
+    maxConsecutiveLosses: integer('max_consecutive_losses').default(5),
+
     // Budget
     defaultBudget: numeric('default_budget', {
       precision: 14,
