@@ -4,6 +4,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { FootballModule } from './football/football.module';
+import { BasketballModule } from './basketball/basketball.module';
 import { OddsModule } from './odds/odds.module';
 import { AlertsModule } from './alerts/alerts.module';
 import { AgentsModule } from './agents/agents.module';
@@ -43,6 +44,7 @@ import { PolymarketModule } from './polymarket/polymarket.module';
     AuthModule,
     DatabaseModule,
     FootballModule,
+    BasketballModule,
     OddsModule,
     AlertsModule,
     AgentsModule,

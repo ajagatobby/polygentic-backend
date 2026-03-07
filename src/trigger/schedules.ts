@@ -11,7 +11,12 @@ import {
   syncStandingsTask,
   syncOddsTask,
 } from './sync-data';
-import { polymarketScanTask } from './polymarket-scan';
+import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
+import {
+  syncBasketballFixturesTask,
+  syncBasketballCompletedFixturesTask,
+  syncBasketballStandingsTask,
+} from './basketball-sync-data';
 
 /**
  * ┌──────────────────────────────────────────────────────────────────┐
@@ -25,6 +30,10 @@ import { polymarketScanTask } from './polymarket-scan';
  * │  - Pre-match predictions    — every 15 min                       │
  * │  - Lineup predictions       — every 5 min                        │
  * │  - Sync + resolve           — every hour                         │
+ * │                                                                  │
+ * │  Polymarket:                                                      │
+ * │  - Market scan (Gamma API)  — every 30 min                       │
+ * │  - Trading cycle            — every 2 hours                      │
  * │                                                                  │
  * │  Data sync:                                                      │
  * │  - Fixtures (upcoming)      — every 30 min                       │
@@ -148,6 +157,66 @@ export const oddsSyncSchedule = schedules.task({
   },
 });
 
+// ─── Basketball data sync schedules ─────────────────────────────────
+//
+// Conservative schedules for the API-Basketball free tier (100 req/day).
+// Each sync run uses ~10 requests (1 per tracked league).
+// Total daily API usage: ~40-50 requests, leaving headroom for manual calls.
+//
+// To increase frequency, upgrade your API plan and set
+// API_BASKETBALL_DAILY_LIMIT in .env accordingly.
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * Every 12 hours (6 AM and 6 PM UTC): Sync upcoming basketball fixtures.
+ * ~10 API requests per run.
+ */
+export const basketballFixturesSyncSchedule = schedules.task({
+  id: 'scheduled-sync-basketball-fixtures',
+  cron: '0 6,18 * * *',
+  run: async () => {
+    logger.info('Scheduled: basketball fixtures sync');
+    const handle = await syncBasketballFixturesTask.trigger(undefined as void);
+    logger.info('Triggered basketball fixtures sync task', {
+      runId: handle.id,
+    });
+  },
+});
+
+/**
+ * Once per day at 7 AM UTC: Sync basketball standings.
+ * ~10 API requests per run.
+ */
+export const basketballStandingsSyncSchedule = schedules.task({
+  id: 'scheduled-sync-basketball-standings',
+  cron: '0 7 * * *',
+  run: async () => {
+    logger.info('Scheduled: basketball standings sync');
+    const handle = await syncBasketballStandingsTask.trigger(undefined as void);
+    logger.info('Triggered basketball standings sync task', {
+      runId: handle.id,
+    });
+  },
+});
+
+/**
+ * Once per day at 8 AM UTC: Sync completed basketball fixtures (final scores).
+ * ~20 API requests per run (2 dates x 10 leagues).
+ */
+export const basketballCompletedFixturesSyncSchedule = schedules.task({
+  id: 'scheduled-sync-basketball-completed-fixtures',
+  cron: '0 8 * * *',
+  run: async () => {
+    logger.info('Scheduled: basketball completed fixtures sync');
+    const handle = await syncBasketballCompletedFixturesTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered basketball completed fixtures sync task', {
+      runId: handle.id,
+    });
+  },
+});
+
 // ─── Polymarket trading agent ───────────────────────────────────────
 
 /**
@@ -161,5 +230,19 @@ export const polymarketScanSchedule = schedules.task({
     logger.info('Scheduled: Polymarket trading agent scan');
     const handle = await polymarketScanTask.trigger(undefined as void);
     logger.info('Triggered Polymarket scan task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 2 hours: Evaluate persisted Polymarket markets, generate predictions
+ * for fixtures that need them (soonest-first), and place trades.
+ */
+export const polymarketTradeSchedule = schedules.task({
+  id: 'scheduled-polymarket-trade',
+  cron: '15 */2 * * *',
+  run: async () => {
+    logger.info('Scheduled: Polymarket trading cycle');
+    const handle = await polymarketTradeTask.trigger(undefined as void);
+    logger.info('Triggered Polymarket trade task', { runId: handle.id });
   },
 });

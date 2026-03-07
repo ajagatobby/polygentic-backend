@@ -8,6 +8,7 @@ import { DataCollectorAgent } from './data-collector.agent';
 import { ResearchAgent } from './research.agent';
 import { AnalysisAgent } from './analysis.agent';
 import { PoissonModelService } from './poisson-model.service';
+import { PredictionMemoryService } from './prediction-memory.service';
 import { AgentsService } from './agents.service';
 import { AgentsController } from './agents.controller';
 
@@ -20,6 +21,7 @@ import { AgentsController } from './agents.controller';
     ResearchAgent,
     AnalysisAgent,
     PoissonModelService,
+    PredictionMemoryService,
     AgentsService,
   ],
   exports: [AgentsService],

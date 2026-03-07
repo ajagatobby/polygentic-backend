@@ -41,6 +41,10 @@ export interface BankrollContext {
   currentDrawdownPct: number;
   maxDrawdownPct: number;
   peakBalance: number;
+  // Trading config (passed from DB config)
+  kellyFraction: number;
+  maxPositionPct: number;
+  stopLossPct: number;
 }
 
 // ─── Outright trading candidate ───────────────────────────────────────
@@ -310,7 +314,14 @@ export class PolymarketTradingAgent {
       max_tokens: 2048,
       temperature: 0.1,
       system: systemPrompt,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        {
+          role: 'user',
+          content:
+            prompt +
+            '\n\nIMPORTANT: Your ENTIRE response must be a single valid JSON object. Do NOT include any text, explanation, or markdown before or after the JSON. Start your response with { and end with }.',
+        },
+      ],
     });
 
     const textBlock = response.content.find((b) => b.type === 'text');
@@ -339,12 +350,9 @@ export class PolymarketTradingAgent {
       topCompetitors,
     } = candidate;
 
-    const kellyFraction =
-      this.config.get<number>('POLYMARKET_KELLY_FRACTION') || 0.25;
-    const maxPositionPct =
-      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
-    const stopLossPct =
-      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+    const kellyFraction = bankroll.kellyFraction;
+    const maxPositionPct = bankroll.maxPositionPct;
+    const stopLossPct = bankroll.stopLossPct;
 
     // Bankroll state
     sections.push(`# BANKROLL STATE`);
@@ -456,12 +464,9 @@ export class PolymarketTradingAgent {
     const sections: string[] = [];
     const { match, pricing, prediction } = candidate;
 
-    const kellyFraction =
-      this.config.get<number>('POLYMARKET_KELLY_FRACTION') || 0.25;
-    const maxPositionPct =
-      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
-    const stopLossPct =
-      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+    const kellyFraction = bankroll.kellyFraction;
+    const maxPositionPct = bankroll.maxPositionPct;
+    const stopLossPct = bankroll.stopLossPct;
 
     // Bankroll state
     sections.push(`# BANKROLL STATE`);
@@ -562,6 +567,8 @@ export class PolymarketTradingAgent {
     candidate: TradingCandidate,
   ): TradingDecision {
     let cleaned = rawText.trim();
+
+    // Strip markdown fences
     if (cleaned.startsWith('```json')) {
       cleaned = cleaned.slice(7);
     } else if (cleaned.startsWith('```')) {
@@ -572,8 +579,44 @@ export class PolymarketTradingAgent {
     }
     cleaned = cleaned.trim();
 
+    // If direct parse fails, try to extract JSON object from the text
+    let parsed: any;
     try {
-      const parsed = JSON.parse(cleaned);
+      parsed = JSON.parse(cleaned);
+    } catch {
+      // Look for a JSON object anywhere in the text
+      const jsonMatch = cleaned.match(
+        /\{[\s\S]*"action"\s*:\s*"(bet|skip)"[\s\S]*\}/,
+      );
+      if (jsonMatch) {
+        try {
+          parsed = JSON.parse(jsonMatch[0]);
+        } catch {
+          // Try to find the largest balanced { } block
+          const start = cleaned.indexOf('{');
+          if (start >= 0) {
+            let depth = 0;
+            let end = start;
+            for (let i = start; i < cleaned.length; i++) {
+              if (cleaned[i] === '{') depth++;
+              if (cleaned[i] === '}') depth--;
+              if (depth === 0) {
+                end = i;
+                break;
+              }
+            }
+            try {
+              parsed = JSON.parse(cleaned.substring(start, end + 1));
+            } catch {
+              // Give up
+            }
+          }
+        }
+      }
+    }
+
+    try {
+      if (!parsed) throw new Error('No valid JSON found in response');
 
       return {
         action: parsed.action === 'bet' ? 'bet' : 'skip',

@@ -12,6 +12,7 @@ import * as postgresModule from 'postgres';
 import * as schema from '../database/schema';
 
 import { FootballService } from '../football/football.service';
+import { BasketballService } from '../basketball/basketball.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
 import { PerplexityService } from '../agents/perplexity.service';
@@ -25,6 +26,7 @@ import { PolymarketGammaService } from '../polymarket/services/polymarket-gamma.
 import { PolymarketClobService } from '../polymarket/services/polymarket-clob.service';
 import { PolymarketMatcherService } from '../polymarket/services/polymarket-matcher.service';
 import { PolymarketTradingAgent } from '../polymarket/services/polymarket-trading.agent';
+import { PredictionMemoryService } from '../agents/prediction-memory.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
@@ -59,6 +61,7 @@ export interface Services {
   db: ReturnType<typeof createDb>;
   config: ConfigService;
   footballService: FootballService;
+  basketballService: BasketballService;
   oddsService: OddsService;
   alertsService: AlertsService;
   perplexityService: PerplexityService;
@@ -80,6 +83,7 @@ export function initServices(): Services {
   const config = createConfigService();
 
   const footballService = new FootballService(config, db as any);
+  const basketballService = new BasketballService(config, db as any);
   const oddsService = new OddsService(config, db as any);
   const alertsService = new AlertsService(db as any);
   const perplexityService = new PerplexityService(config);
@@ -93,6 +97,8 @@ export function initServices(): Services {
   const analysisAgent = new AnalysisAgent(config);
   const poissonModel = new PoissonModelService(db as any);
 
+  const predictionMemory = new PredictionMemoryService(config);
+
   const agentsService = new AgentsService(
     db as any,
     config,
@@ -103,6 +109,7 @@ export function initServices(): Services {
     footballService,
     oddsService,
     alertsService,
+    predictionMemory,
   );
 
   const syncService = new SyncService(
@@ -130,6 +137,7 @@ export function initServices(): Services {
     db,
     config,
     footballService,
+    basketballService,
     oddsService,
     alertsService,
     perplexityService,

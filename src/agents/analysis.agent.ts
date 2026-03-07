@@ -47,12 +47,7 @@ You must follow this step-by-step reasoning process before assigning probabiliti
 - Match context (relegation battle, title decider, dead rubber = different motivations).
 - Home/away record splits.
 
-### Step 4: Cross-Reference with Sharp Bookmaker Lines
-- Pinnacle and Betfair Exchange are the sharpest odds. Their implied probabilities (after vig removal) represent the market's best estimate.
-- If your analysis differs significantly (>5%) from Pinnacle's line, you need a STRONG, specific reason. The market is usually right.
-- Do NOT systematically deviate from sharp lines without evidence. They incorporate information you may not have.
-
-### Step 5: Calibrate and Sanity Check
+### Step 4: Calibrate and Sanity Check
 - Draws are typically underbet by the public but correctly priced by sharp books. Do not underestimate draw probability.
 - Favorites win less often than casual bettors think. Home advantage is ~5-8% in most leagues, not 15%.
 - Avoid the trap of always picking a winner — if the match is genuinely close, your draw probability should reflect that.
@@ -79,7 +74,7 @@ You must follow this step-by-step reasoning process before assigning probabiliti
 4. Predicted goals should be based on xG averages where available
 5. Key factors: Top 3-5 data-driven reasons (cite specific numbers)
 6. Risk factors: Top 2-4 things that could invalidate the prediction
-7. Value bets: Only flag if your probability differs from SHARP (Pinnacle) line by >5% with a specific, articulable reason
+7. Value bets: Flag any markets where you see value based on your analysis
 8. detailedAnalysis: Walk through your step-by-step reasoning (base rate → adjustments → final probabilities)
 
 You must respond with ONLY valid JSON matching this exact schema:
@@ -118,6 +113,7 @@ export class AnalysisAgent {
     research: ResearchResult,
     feedback?: PerformanceFeedback | null,
     poissonModel?: PoissonModelOutput | null,
+    memories?: string | null,
   ): Promise<PredictionOutput> {
     const homeName =
       data.homeTeam?.team?.name ?? `Team ${data.fixture.homeTeamId}`;
@@ -128,7 +124,13 @@ export class AnalysisAgent {
       `Analyzing: ${homeName} vs ${awayName} with model ${this.model}`,
     );
 
-    const userPrompt = this.buildPrompt(data, research, feedback, poissonModel);
+    const userPrompt = this.buildPrompt(
+      data,
+      research,
+      feedback,
+      poissonModel,
+      memories,
+    );
 
     const response = await this.anthropic.messages.create({
       model: this.model,
@@ -156,9 +158,15 @@ export class AnalysisAgent {
     research: ResearchResult,
     feedback?: PerformanceFeedback | null,
     poissonModel?: PoissonModelOutput | null,
+    memories?: string | null,
   ): string {
     const sections: string[] = [];
     const fixture = data.fixture;
+
+    // Supermemory: specific past prediction memories (injected before feedback)
+    if (memories) {
+      sections.push(memories);
+    }
 
     // Performance feedback (self-improvement loop)
     if (feedback && feedback.totalResolved >= 10) {
@@ -362,75 +370,10 @@ export class AnalysisAgent {
       }
     }
 
-    // Odds
-    if (data.odds.consensus.length > 0) {
-      sections.push(`\n## Bookmaker Consensus Odds`);
-      const h2hConsensus = data.odds.consensus.find(
-        (c: any) => c.marketKey === 'h2h',
-      );
-      if (h2hConsensus) {
-        sections.push(
-          `- Home Win: ${h2hConsensus.consensusHomeWin ?? '?'}`,
-          `- Draw: ${h2hConsensus.consensusDraw ?? '?'}`,
-          `- Away Win: ${h2hConsensus.consensusAwayWin ?? '?'}`,
-          `- Bookmakers: ${h2hConsensus.numBookmakers ?? '?'}`,
-        );
-        if (h2hConsensus.pinnacleHomeWin) {
-          sections.push(
-            `- Pinnacle (sharp): Home ${h2hConsensus.pinnacleHomeWin}, Draw ${h2hConsensus.pinnacleDraw}, Away ${h2hConsensus.pinnacleAwayWin}`,
-          );
-        }
-      }
-      const totalsConsensus = data.odds.consensus.find(
-        (c: any) => c.marketKey === 'totals',
-      );
-      if (totalsConsensus) {
-        sections.push(
-          `- Over ${totalsConsensus.consensusPoint ?? '2.5'}: ${totalsConsensus.consensusOver ?? '?'}`,
-          `- Under ${totalsConsensus.consensusPoint ?? '2.5'}: ${totalsConsensus.consensusUnder ?? '?'}`,
-        );
-      }
-    }
-
-    // External prediction reference
-    if (data.apiPrediction) {
-      const pred = data.apiPrediction;
-      sections.push(`\n## External Prediction Reference`);
-      if (pred.predictions) {
-        sections.push(
-          `- Winner: ${pred.predictions.winner?.name ?? '?'}`,
-          `- Advice: ${pred.predictions.advice ?? '?'}`,
-          `- Predicted Score: ${pred.predictions.goals?.home ?? '?'} - ${pred.predictions.goals?.away ?? '?'}`,
-        );
-      }
-      if (pred.comparison) {
-        sections.push(
-          `- Form: Home ${pred.comparison.form?.home ?? '?'} vs Away ${pred.comparison.form?.away ?? '?'}`,
-        );
-        sections.push(
-          `- Attack: Home ${pred.comparison.att?.home ?? '?'} vs Away ${pred.comparison.att?.away ?? '?'}`,
-        );
-        sections.push(
-          `- Defense: Home ${pred.comparison.def?.home ?? '?'} vs Away ${pred.comparison.def?.away ?? '?'}`,
-        );
-      }
-    }
-
-    // Poisson statistical model output
-    if (poissonModel && poissonModel.dataPoints > 0) {
-      sections.push(`\n## Statistical Model (Poisson/Dixon-Coles)`);
-      sections.push(
-        `This is the output of a pure mathematical model based on xG data and league averages:`,
-        `- Home Win: ${(poissonModel.homeWinProb * 100).toFixed(1)}%`,
-        `- Draw: ${(poissonModel.drawProb * 100).toFixed(1)}%`,
-        `- Away Win: ${(poissonModel.awayWinProb * 100).toFixed(1)}%`,
-        `- Expected Home Goals: ${poissonModel.expectedHomeGoals}`,
-        `- Expected Away Goals: ${poissonModel.expectedAwayGoals}`,
-        `- Model Confidence: ${(poissonModel.confidence * 100).toFixed(0)}% (based on ${poissonModel.dataPoints} data points)`,
-        ``,
-        `NOTE: Use this as a STRONG anchor. Only deviate significantly from these probabilities if you have specific qualitative reasons (injuries to key players, motivation factors, etc). The mathematical model is typically better calibrated than human intuition.`,
-      );
-    }
+    // NOTE: Bookmaker odds and Poisson model output are intentionally NOT shown
+    // to Claude. They enter the final prediction via the ensemble step instead.
+    // This avoids double-counting these signals (once via Claude's reasoning,
+    // once via the ensemble blend).
 
     // Research
     if (research.combinedResearch) {

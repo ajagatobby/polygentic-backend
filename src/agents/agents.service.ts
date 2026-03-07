@@ -9,6 +9,7 @@ import { PoissonModelService } from './poisson-model.service';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
+import { PredictionMemoryService } from './prediction-memory.service';
 import {
   PredictionType,
   PerformanceFeedback,
@@ -32,6 +33,7 @@ export class AgentsService {
     private readonly footballService: FootballService,
     private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
+    private readonly predictionMemory: PredictionMemoryService,
   ) {}
 
   // ─── Core prediction pipeline ───────────────────────────────────────
@@ -66,12 +68,20 @@ export class AgentsService {
       throw error;
     }
 
-    // Step 2: Web research + performance feedback + Poisson model (in parallel)
+    // Step 2: Web research + performance feedback + Poisson model + memory recall (in parallel)
     let research: ResearchResult;
     let feedback: PerformanceFeedback | null = null;
     let poissonOutput: PoissonModelOutput | null = null;
+    let memories: string | null = null;
     try {
-      const [researchResult, feedbackResult, poissonResult] =
+      const homeName =
+        matchData.homeTeam?.team?.name ??
+        `Team ${matchData.fixture.homeTeamId}`;
+      const awayName =
+        matchData.awayTeam?.team?.name ??
+        `Team ${matchData.fixture.awayTeamId}`;
+
+      const [researchResult, feedbackResult, poissonResult, memoriesResult] =
         await Promise.allSettled([
           this.researchAgent.research(matchData),
           this.getPerformanceFeedback(),
@@ -81,6 +91,16 @@ export class AgentsService {
             matchData.fixture.leagueId,
             fixtureId,
           ),
+          this.predictionMemory.recallForPrediction({
+            homeTeamName: homeName,
+            awayTeamName: awayName,
+            homeTeamId: matchData.fixture.homeTeamId,
+            awayTeamId: matchData.fixture.awayTeamId,
+            leagueId: matchData.fixture.leagueId,
+            leagueName:
+              matchData.fixture.leagueName ??
+              `League ${matchData.fixture.leagueId}`,
+          }),
         ]);
 
       research =
@@ -107,11 +127,20 @@ export class AgentsService {
       poissonOutput =
         poissonResult.status === 'fulfilled' ? poissonResult.value : null;
 
+      memories =
+        memoriesResult.status === 'fulfilled' ? memoriesResult.value : null;
+
       if (poissonOutput) {
         this.logger.log(
           `Poisson model for fixture ${fixtureId}: H=${(poissonOutput.homeWinProb * 100).toFixed(1)}% ` +
             `D=${(poissonOutput.drawProb * 100).toFixed(1)}% A=${(poissonOutput.awayWinProb * 100).toFixed(1)}% ` +
             `(conf=${poissonOutput.confidence}, data=${poissonOutput.dataPoints})`,
+        );
+      }
+
+      if (memories) {
+        this.logger.log(
+          `Recalled prediction memories for fixture ${fixtureId} (${homeName} vs ${awayName})`,
         );
       }
     } catch (error) {
@@ -128,7 +157,7 @@ export class AgentsService {
       };
     }
 
-    // Step 3: Analysis (Claude gets Poisson output as input for reasoning)
+    // Step 3: Analysis (Claude reasons independently, memories provide context)
     let prediction: PredictionOutput;
     try {
       prediction = await this.analysisAgent.analyze(
@@ -136,6 +165,7 @@ export class AgentsService {
         research,
         feedback,
         poissonOutput,
+        memories,
       );
     } catch (error) {
       this.logger.error(
@@ -421,6 +451,19 @@ export class AgentsService {
           })
           .where(eq(schema.predictions.id, prediction.id));
 
+        // Store memory in Supermemory for future predictions (best-effort, non-blocking)
+        this.storeResolutionMemory(prediction, fixture, {
+          predictedResult,
+          actualResult,
+          wasCorrect,
+          brierScore,
+          homeProb,
+          drawProb,
+          awayProb,
+        }).catch((err) =>
+          this.logger.warn(`Memory storage failed: ${err.message}`),
+        );
+
         resolved++;
       } catch (error) {
         errors.push(
@@ -542,6 +585,220 @@ export class AgentsService {
     };
   }
 
+  /**
+   * Get predictions for football fixtures by match date.
+   *
+   * Unlike `getPredictions` (which filters on `predictions.created_at`),
+   * this joins with `fixtures` and filters on the actual **match date**.
+   *
+   * Supports:
+   *  - Single date: `date` (YYYY-MM-DD, defaults to today)
+   *  - Date range:  `from` + `to` (YYYY-MM-DD)
+   *  - Shorthand:   `days` (e.g. 2 = today + next 2 days)
+   *
+   * For each fixture, picks the "best" prediction by priority:
+   * pre_match > daily > on_demand.
+   */
+  async getPredictionsByMatchDate(filters: {
+    date?: string;
+    from?: string;
+    to?: string;
+    days?: number;
+    leagueId?: number;
+    leagueName?: string;
+    minConfidence?: number;
+    unresolved?: boolean;
+    page?: number;
+    limit?: number;
+  }): Promise<{
+    data: any[];
+    total: number;
+    page: number;
+    limit: number;
+    dateRange: { from: string; to: string };
+  }> {
+    const page = filters.page || 1;
+    const limit = filters.limit || 50;
+    const offset = (page - 1) * limit;
+
+    // ── Resolve date range ──────────────────────────────────────────
+    let fromDate: Date;
+    let toDate: Date;
+
+    if (filters.from && filters.to) {
+      fromDate = new Date(`${filters.from}T00:00:00Z`);
+      toDate = new Date(`${filters.to}T23:59:59Z`);
+    } else if (filters.days != null) {
+      fromDate = new Date();
+      fromDate.setUTCHours(0, 0, 0, 0);
+      toDate = new Date(fromDate);
+      toDate.setUTCDate(toDate.getUTCDate() + filters.days);
+      toDate.setUTCHours(23, 59, 59, 999);
+    } else {
+      const dateStr = filters.date ?? new Date().toISOString().split('T')[0];
+      fromDate = new Date(`${dateStr}T00:00:00Z`);
+      toDate = new Date(`${dateStr}T23:59:59Z`);
+    }
+
+    // ── Build conditions ────────────────────────────────────────────
+    const conditions: any[] = [
+      gte(schema.fixtures.date, fromDate),
+      lte(schema.fixtures.date, toDate),
+    ];
+
+    if (filters.leagueId) {
+      conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+
+    if (filters.leagueName) {
+      conditions.push(
+        sql`${schema.fixtures.leagueName} ILIKE ${'%' + filters.leagueName + '%'}`,
+      );
+    }
+
+    if (filters.minConfidence) {
+      conditions.push(
+        sql`${schema.predictions.confidence} >= ${filters.minConfidence}`,
+      );
+    }
+
+    if (filters.unresolved) {
+      conditions.push(isNull(schema.predictions.resolvedAt));
+    }
+
+    const whereClause = and(...conditions);
+
+    // ── Query: predictions joined with fixtures and teams ───────────
+    const [rows, countResult] = await Promise.all([
+      this.db
+        .select({
+          prediction: schema.predictions,
+          fixtureId: schema.fixtures.id,
+          fixtureDate: schema.fixtures.date,
+          fixtureStatus: schema.fixtures.status,
+          fixtureStatusLong: schema.fixtures.statusLong,
+          leagueId: schema.fixtures.leagueId,
+          leagueName: schema.fixtures.leagueName,
+          leagueCountry: schema.fixtures.leagueCountry,
+          homeTeamId: schema.fixtures.homeTeamId,
+          awayTeamId: schema.fixtures.awayTeamId,
+          goalsHome: schema.fixtures.goalsHome,
+          goalsAway: schema.fixtures.goalsAway,
+        })
+        .from(schema.predictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.predictions.fixtureId, schema.fixtures.id),
+        )
+        .where(whereClause)
+        .orderBy(asc(schema.fixtures.date), desc(schema.predictions.createdAt))
+        .limit(limit)
+        .offset(offset),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.predictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.predictions.fixtureId, schema.fixtures.id),
+        )
+        .where(whereClause),
+    ]);
+
+    // ── Batch-fetch team names ──────────────────────────────────────
+    const teamIds = new Set<number>();
+    for (const row of rows) {
+      if (row.homeTeamId) teamIds.add(row.homeTeamId);
+      if (row.awayTeamId) teamIds.add(row.awayTeamId);
+    }
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    if (teamIds.size > 0) {
+      const teamRows = await this.db
+        .select({
+          id: schema.teams.id,
+          name: schema.teams.name,
+          logo: schema.teams.logo,
+        })
+        .from(schema.teams)
+        .where(
+          sql`${schema.teams.id} IN (${sql.join(
+            [...teamIds].map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        );
+
+      for (const t of teamRows) {
+        teamMap.set(t.id, { name: t.name, logo: t.logo });
+      }
+    }
+
+    // ── Shape response: group by fixture, pick best prediction ──────
+    const fixtureMap = new Map<number, any>();
+
+    for (const row of rows) {
+      const fId = row.fixtureId;
+
+      if (!fixtureMap.has(fId)) {
+        const homeTeam = teamMap.get(row.homeTeamId);
+        const awayTeam = teamMap.get(row.awayTeamId);
+
+        fixtureMap.set(fId, {
+          fixtureId: fId,
+          date: row.fixtureDate,
+          status: row.fixtureStatus,
+          statusLong: row.fixtureStatusLong,
+          league: {
+            id: row.leagueId,
+            name: row.leagueName,
+            country: row.leagueCountry,
+          },
+          homeTeam: homeTeam
+            ? { id: row.homeTeamId, ...homeTeam }
+            : { id: row.homeTeamId, name: null, logo: null },
+          awayTeam: awayTeam
+            ? { id: row.awayTeamId, ...awayTeam }
+            : { id: row.awayTeamId, name: null, logo: null },
+          goalsHome: row.goalsHome,
+          goalsAway: row.goalsAway,
+          prediction: null as any,
+          allPredictions: [] as any[],
+        });
+      }
+
+      const entry = fixtureMap.get(fId)!;
+      entry.allPredictions.push(row.prediction);
+    }
+
+    // Pick best prediction per fixture (pre_match > daily > on_demand)
+    const typePriority: Record<string, number> = {
+      pre_match: 0,
+      daily: 1,
+      on_demand: 2,
+    };
+
+    for (const entry of fixtureMap.values()) {
+      entry.allPredictions.sort(
+        (a: any, b: any) =>
+          (typePriority[a.predictionType] ?? 99) -
+          (typePriority[b.predictionType] ?? 99),
+      );
+      entry.prediction = entry.allPredictions[0] ?? null;
+    }
+
+    const data = Array.from(fixtureMap.values());
+
+    return {
+      data,
+      total: Number(countResult[0]?.count ?? 0),
+      page,
+      limit,
+      dateRange: {
+        from: fromDate.toISOString().split('T')[0],
+        to: toDate.toISOString().split('T')[0],
+      },
+    };
+  }
+
   async getPredictionByFixtureId(fixtureId: number): Promise<any[]> {
     const rows = await this.db
       .select()
@@ -602,6 +859,310 @@ export class AgentsService {
       accuracy: total > 0 ? correct / total : 0,
       avgBrierScore: Number(avgBrier.toFixed(6)),
       byType,
+    };
+  }
+
+  /**
+   * Get a detailed breakdown of prediction performance for a specific day.
+   *
+   * Returns:
+   * - Summary stats: total, correct, incorrect, pending (unresolved), accuracy
+   * - Each prediction with: match info, predicted vs actual result, correctness,
+   *   confidence, and a link to the Polymarket game (if one exists)
+   */
+  async getDailyBreakdown(date?: string): Promise<{
+    date: string;
+    summary: {
+      total: number;
+      resolved: number;
+      correct: number;
+      incorrect: number;
+      pending: number;
+      accuracy: number;
+      avgConfidence: number;
+      avgBrierScore: number | null;
+    };
+    byResult: {
+      home_win: { predicted: number; correct: number; accuracy: number };
+      draw: { predicted: number; correct: number; accuracy: number };
+      away_win: { predicted: number; correct: number; accuracy: number };
+    };
+    predictions: Array<{
+      predictionId: number;
+      fixtureId: number;
+      matchDate: Date;
+      matchStatus: string;
+      league: { id: number; name: string | null; country: string | null };
+      homeTeam: { id: number; name: string | null; logo: string | null };
+      awayTeam: { id: number; name: string | null; logo: string | null };
+      predicted: {
+        result: string;
+        homeWinProb: number;
+        drawProb: number;
+        awayWinProb: number;
+        homeGoals: number | null;
+        awayGoals: number | null;
+        confidence: number | null;
+      };
+      actual: {
+        result: string | null;
+        homeGoals: number | null;
+        awayGoals: number | null;
+      };
+      wasCorrect: boolean | null;
+      brierScore: number | null;
+      predictionType: string;
+      polymarketLink: string | null;
+      createdAt: Date;
+    }>;
+  }> {
+    const dateStr = date ?? new Date().toISOString().split('T')[0];
+    const startOfDay = new Date(`${dateStr}T00:00:00Z`);
+    const endOfDay = new Date(`${dateStr}T23:59:59Z`);
+
+    // Get all predictions for fixtures on this date
+    const rows = await this.db
+      .select({
+        prediction: schema.predictions,
+        fixtureId: schema.fixtures.id,
+        fixtureDate: schema.fixtures.date,
+        fixtureStatus: schema.fixtures.status,
+        leagueId: schema.fixtures.leagueId,
+        leagueName: schema.fixtures.leagueName,
+        leagueCountry: schema.fixtures.leagueCountry,
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+        goalsHome: schema.fixtures.goalsHome,
+        goalsAway: schema.fixtures.goalsAway,
+      })
+      .from(schema.predictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.predictions.fixtureId, schema.fixtures.id),
+      )
+      .where(
+        and(
+          gte(schema.fixtures.date, startOfDay),
+          lte(schema.fixtures.date, endOfDay),
+        ),
+      )
+      .orderBy(asc(schema.fixtures.date), desc(schema.predictions.createdAt));
+
+    // Deduplicate: keep best prediction per fixture (pre_match > daily > on_demand)
+    const typePriority: Record<string, number> = {
+      pre_match: 0,
+      daily: 1,
+      on_demand: 2,
+    };
+    const fixtureMap = new Map<number, (typeof rows)[0]>();
+    for (const row of rows) {
+      const existing = fixtureMap.get(row.fixtureId);
+      if (
+        !existing ||
+        (typePriority[row.prediction.predictionType] ?? 99) <
+          (typePriority[existing.prediction.predictionType] ?? 99)
+      ) {
+        fixtureMap.set(row.fixtureId, row);
+      }
+    }
+
+    const dedupedRows = Array.from(fixtureMap.values());
+
+    // Batch-fetch team names + logos
+    const teamIds = new Set<number>();
+    for (const row of dedupedRows) {
+      if (row.homeTeamId) teamIds.add(row.homeTeamId);
+      if (row.awayTeamId) teamIds.add(row.awayTeamId);
+    }
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    if (teamIds.size > 0) {
+      const teamRows = await this.db
+        .select({
+          id: schema.teams.id,
+          name: schema.teams.name,
+          logo: schema.teams.logo,
+        })
+        .from(schema.teams)
+        .where(
+          sql`${schema.teams.id} IN (${sql.join(
+            [...teamIds].map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        );
+      for (const t of teamRows) {
+        teamMap.set(t.id, { name: t.name, logo: t.logo });
+      }
+    }
+
+    // Batch-fetch Polymarket market links for these fixtures
+    const fixtureIds = dedupedRows.map((r) => r.fixtureId);
+    const polymarketMap = new Map<number, string>();
+    if (fixtureIds.length > 0) {
+      const marketRows = await this.db
+        .select({
+          fixtureId: schema.polymarketMarkets.fixtureId,
+          eventSlug: schema.polymarketMarkets.eventSlug,
+          slug: schema.polymarketMarkets.slug,
+        })
+        .from(schema.polymarketMarkets)
+        .where(
+          and(
+            sql`${schema.polymarketMarkets.fixtureId} IN (${sql.join(
+              fixtureIds.map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+            eq(schema.polymarketMarkets.marketType, 'match_outcome'),
+          ),
+        );
+
+      for (const m of marketRows) {
+        if (m.fixtureId && (m.eventSlug || m.slug)) {
+          const slug = m.eventSlug || m.slug;
+          polymarketMap.set(
+            m.fixtureId,
+            `https://polymarket.com/event/${slug}`,
+          );
+        }
+      }
+    }
+
+    // Build per-prediction results and compute summary
+    let totalResolved = 0;
+    let totalCorrect = 0;
+    let totalIncorrect = 0;
+    let totalPending = 0;
+    let totalConfidence = 0;
+    let confidenceCount = 0;
+    let brierSum = 0;
+    let brierCount = 0;
+
+    const byResult = {
+      home_win: { predicted: 0, correct: 0, accuracy: 0 },
+      draw: { predicted: 0, correct: 0, accuracy: 0 },
+      away_win: { predicted: 0, correct: 0, accuracy: 0 },
+    };
+
+    const predictionDetails = dedupedRows.map((row) => {
+      const p = row.prediction;
+      const homeProb = Number(p.homeWinProb);
+      const drawProb = Number(p.drawProb);
+      const awayProb = Number(p.awayWinProb);
+      const predictedResult = this.getPredictedResultFromProbs(
+        homeProb,
+        drawProb,
+        awayProb,
+      );
+
+      // Track predicted outcomes
+      if (
+        predictedResult === 'home_win' ||
+        predictedResult === 'draw' ||
+        predictedResult === 'away_win'
+      ) {
+        byResult[predictedResult].predicted++;
+      }
+
+      if (p.resolvedAt) {
+        totalResolved++;
+        if (p.wasCorrect === true) {
+          totalCorrect++;
+          if (
+            predictedResult === 'home_win' ||
+            predictedResult === 'draw' ||
+            predictedResult === 'away_win'
+          ) {
+            byResult[predictedResult].correct++;
+          }
+        } else if (p.wasCorrect === false) {
+          totalIncorrect++;
+        }
+      } else {
+        totalPending++;
+      }
+
+      if (p.confidence != null) {
+        totalConfidence += p.confidence;
+        confidenceCount++;
+      }
+
+      const brier = p.probabilityAccuracy
+        ? Number(p.probabilityAccuracy)
+        : null;
+      if (brier != null) {
+        brierSum += brier;
+        brierCount++;
+      }
+
+      const homeTeam = teamMap.get(row.homeTeamId) ?? {
+        name: null,
+        logo: null,
+      };
+      const awayTeam = teamMap.get(row.awayTeamId) ?? {
+        name: null,
+        logo: null,
+      };
+
+      return {
+        predictionId: p.id,
+        fixtureId: row.fixtureId,
+        matchDate: row.fixtureDate,
+        matchStatus: row.fixtureStatus,
+        league: {
+          id: row.leagueId,
+          name: row.leagueName,
+          country: row.leagueCountry,
+        },
+        homeTeam: { id: row.homeTeamId, ...homeTeam },
+        awayTeam: { id: row.awayTeamId, ...awayTeam },
+        predicted: {
+          result: predictedResult,
+          homeWinProb: homeProb,
+          drawProb,
+          awayWinProb: awayProb,
+          homeGoals: p.predictedHomeGoals ? Number(p.predictedHomeGoals) : null,
+          awayGoals: p.predictedAwayGoals ? Number(p.predictedAwayGoals) : null,
+          confidence: p.confidence,
+        },
+        actual: {
+          result: p.actualResult ?? null,
+          homeGoals: p.actualHomeGoals ?? null,
+          awayGoals: p.actualAwayGoals ?? null,
+        },
+        wasCorrect: p.wasCorrect ?? null,
+        brierScore: brier,
+        predictionType: p.predictionType,
+        polymarketLink: polymarketMap.get(row.fixtureId) ?? null,
+        createdAt: p.createdAt,
+      };
+    });
+
+    // Compute by-result accuracies
+    for (const key of Object.keys(byResult) as Array<keyof typeof byResult>) {
+      byResult[key].accuracy =
+        byResult[key].predicted > 0
+          ? byResult[key].correct / byResult[key].predicted
+          : 0;
+    }
+
+    return {
+      date: dateStr,
+      summary: {
+        total: dedupedRows.length,
+        resolved: totalResolved,
+        correct: totalCorrect,
+        incorrect: totalIncorrect,
+        pending: totalPending,
+        accuracy: totalResolved > 0 ? totalCorrect / totalResolved : 0,
+        avgConfidence:
+          confidenceCount > 0
+            ? Number((totalConfidence / confidenceCount).toFixed(1))
+            : 0,
+        avgBrierScore:
+          brierCount > 0 ? Number((brierSum / brierCount).toFixed(6)) : null,
+      },
+      byResult,
+      predictions: predictionDetails,
     };
   }
 
@@ -1114,6 +1675,75 @@ export class AgentsService {
     );
   }
 
+  // ─── Supermemory helpers ─────────────────────────────────────────────
+
+  /**
+   * Store a resolved prediction as a Supermemory memory.
+   * Fetches team names for readable memory content.
+   */
+  private async storeResolutionMemory(
+    prediction: any,
+    fixture: any,
+    resolution: {
+      predictedResult: string;
+      actualResult: string;
+      wasCorrect: boolean;
+      brierScore: number;
+      homeProb: number;
+      drawProb: number;
+      awayProb: number;
+    },
+  ): Promise<void> {
+    // Fetch team names
+    const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(Boolean);
+    const teamRows =
+      teamIds.length > 0
+        ? await this.db
+            .select({ id: schema.teams.id, name: schema.teams.name })
+            .from(schema.teams)
+            .where(
+              sql`${schema.teams.id} IN (${sql.join(
+                teamIds.map((id: number) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+        : [];
+
+    const teamMap = new Map<number, string>();
+    for (const t of teamRows) {
+      teamMap.set(t.id, t.name);
+    }
+
+    await this.predictionMemory.storeResolvedPrediction({
+      predictionId: prediction.id,
+      fixtureId: prediction.fixtureId,
+      homeTeamName:
+        teamMap.get(fixture.homeTeamId) ?? `Team ${fixture.homeTeamId}`,
+      awayTeamName:
+        teamMap.get(fixture.awayTeamId) ?? `Team ${fixture.awayTeamId}`,
+      homeTeamId: fixture.homeTeamId,
+      awayTeamId: fixture.awayTeamId,
+      leagueId: fixture.leagueId,
+      leagueName: fixture.leagueName ?? `League ${fixture.leagueId}`,
+      round: fixture.round,
+      matchDate: fixture.date,
+      predictedResult: resolution.predictedResult,
+      actualResult: resolution.actualResult,
+      wasCorrect: resolution.wasCorrect,
+      homeWinProb: resolution.homeProb,
+      drawProb: resolution.drawProb,
+      awayWinProb: resolution.awayProb,
+      predictedHomeGoals: Number(prediction.predictedHomeGoals),
+      predictedAwayGoals: Number(prediction.predictedAwayGoals),
+      actualHomeGoals: fixture.goalsHome,
+      actualAwayGoals: fixture.goalsAway,
+      confidence: prediction.confidence ?? 5,
+      brierScore: resolution.brierScore,
+      keyFactors: prediction.keyFactors,
+      riskFactors: prediction.riskFactors,
+    });
+  }
+
   // ─── Private helpers ────────────────────────────────────────────────
 
   /**
@@ -1370,14 +2000,36 @@ export class AgentsService {
     );
   }
 
+  /**
+   * Determine the predicted result from probabilities.
+   *
+   * Uses a draw-aware threshold instead of pure argmax, because:
+   * - In football, ~26% of matches end in draws
+   * - Draw probability rarely exceeds BOTH home and away in argmax
+   * - Pure argmax almost never predicts draws, missing ~26% of correct answers
+   *
+   * Strategy:
+   * - Predict draw when: drawProb >= DRAW_THRESHOLD AND the home/away
+   *   spread is tight (neither team is a clear favourite)
+   * - Otherwise, pick the higher of home or away
+   */
   private getPredictedResultFromProbs(
     homeProb: number,
     drawProb: number,
     awayProb: number,
   ): string {
-    if (homeProb >= drawProb && homeProb >= awayProb) return 'home_win';
-    if (awayProb >= homeProb && awayProb >= drawProb) return 'away_win';
-    return 'draw';
+    const DRAW_THRESHOLD = 0.27; // Slightly above typical base rate
+    const SPREAD_THRESHOLD = 0.1; // If home-away gap is < 10%, it's tight
+
+    // If draw probability is high and the match looks close, predict draw
+    const homeAwaySpread = Math.abs(homeProb - awayProb);
+    if (drawProb >= DRAW_THRESHOLD && homeAwaySpread < SPREAD_THRESHOLD) {
+      return 'draw';
+    }
+
+    // Otherwise pick the higher of home or away
+    if (homeProb >= awayProb) return 'home_win';
+    return 'away_win';
   }
 
   /**

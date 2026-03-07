@@ -27,7 +27,8 @@ export const polymarketMarkets = pgTable(
     eventId: varchar('event_id', { length: 255 }).notNull(), // Gamma event ID
     marketId: varchar('market_id', { length: 255 }).notNull(), // Gamma market ID
     conditionId: varchar('condition_id', { length: 255 }), // CTF condition ID
-    slug: varchar('slug', { length: 500 }),
+    slug: varchar('slug', { length: 500 }), // Market-level slug
+    eventSlug: varchar('event_slug', { length: 500 }), // Event-level slug (used for Polymarket URLs)
 
     // Market metadata
     eventTitle: text('event_title').notNull(),
@@ -245,6 +246,59 @@ export const polymarketBankroll = pgTable(
     index('idx_polymarket_bankroll_mode').on(table.mode),
     index('idx_polymarket_bankroll_snapshot').on(table.snapshotAt),
   ],
+);
+
+// ─── polymarket_config ─────────────────────────────────────────────────
+// Runtime-configurable trading parameters. DB values override env defaults.
+// Only one row per mode (paper / live).
+
+export const polymarketConfig = pgTable(
+  'polymarket_config',
+  {
+    id: serial('id').primaryKey(),
+
+    mode: varchar('mode', { length: 20 }).notNull(), // 'paper' | 'live'
+
+    // Trading gates
+    liveTradingEnabled: boolean('live_trading_enabled').default(false),
+    minEdge: numeric('min_edge', { precision: 5, scale: 4 }).default('0.05'), // 0.05 = 5%
+    minLiquidity: numeric('min_liquidity', { precision: 14, scale: 2 }).default(
+      '1000',
+    ),
+    minConfidence: integer('min_confidence').default(6), // 1-10
+
+    // Position sizing
+    kellyFraction: numeric('kelly_fraction', {
+      precision: 5,
+      scale: 4,
+    }).default('0.25'), // Quarter-Kelly
+    maxPositionPct: numeric('max_position_pct', {
+      precision: 5,
+      scale: 4,
+    }).default('0.10'), // 10% of bankroll
+
+    // Risk management
+    stopLossPct: numeric('stop_loss_pct', { precision: 5, scale: 4 }).default(
+      '0.30',
+    ), // Stop at 30% of budget
+    targetMultiplier: numeric('target_multiplier', {
+      precision: 5,
+      scale: 2,
+    }).default('3'), // 3x return target
+
+    // Consecutive loss stop
+    maxConsecutiveLosses: integer('max_consecutive_losses').default(5),
+
+    // Budget
+    defaultBudget: numeric('default_budget', {
+      precision: 14,
+      scale: 2,
+    }).default('500'),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [uniqueIndex('uq_polymarket_config_mode').on(table.mode)],
 );
 
 // ─── RELATIONS ─────────────────────────────────────────────────────────

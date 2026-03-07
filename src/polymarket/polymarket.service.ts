@@ -1,4 +1,10 @@
-import { Injectable, Inject, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Inject,
+  Logger,
+  OnModuleInit,
+  BadRequestException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   eq,
@@ -74,6 +80,325 @@ export class PolymarketService implements OnModuleInit {
         `Could not create partial unique index (may already exist or duplicates need cleanup): ${error.message}`,
       );
     }
+
+    // Auto-create polymarket_config table if it doesn't exist
+    try {
+      await this.db.execute(sql`
+        CREATE TABLE IF NOT EXISTS polymarket_config (
+          id SERIAL PRIMARY KEY,
+          mode VARCHAR(20) NOT NULL,
+          live_trading_enabled BOOLEAN DEFAULT false,
+          min_edge NUMERIC(5,4) DEFAULT '0.05',
+          min_liquidity NUMERIC(14,2) DEFAULT '1000',
+          min_confidence INTEGER DEFAULT 6,
+          kelly_fraction NUMERIC(5,4) DEFAULT '0.25',
+          max_position_pct NUMERIC(5,4) DEFAULT '0.10',
+          stop_loss_pct NUMERIC(5,4) DEFAULT '0.30',
+          target_multiplier NUMERIC(5,2) DEFAULT '3',
+          max_consecutive_losses INTEGER DEFAULT 5,
+          default_budget NUMERIC(14,2) DEFAULT '500',
+          created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+          updated_at TIMESTAMP DEFAULT NOW()
+        )
+      `);
+      await this.db.execute(sql`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_polymarket_config_mode
+        ON polymarket_config (mode)
+      `);
+      // Add max_consecutive_losses column if missing (table may already exist)
+      await this.db.execute(sql`
+        ALTER TABLE polymarket_config
+        ADD COLUMN IF NOT EXISTS max_consecutive_losses INTEGER DEFAULT 5
+      `);
+      this.logger.log('Ensured polymarket_config table exists');
+    } catch (error) {
+      this.logger.warn(
+        `Could not auto-create polymarket_config table: ${error.message}`,
+      );
+    }
+  }
+
+  // ─── Runtime config (DB first, env fallback) ─────────────────────────
+
+  /**
+   * Read-through config: DB row first, then env, then hardcoded default.
+   * Caches the DB row for the lifetime of a single request cycle.
+   */
+  private configCache: any | null = null;
+  private configCacheAt = 0;
+
+  async getTradingConfig(): Promise<{
+    liveTradingEnabled: boolean;
+    minEdge: number;
+    minLiquidity: number;
+    minConfidence: number;
+    kellyFraction: number;
+    maxPositionPct: number;
+    stopLossPct: number;
+    targetMultiplier: number;
+    maxConsecutiveLosses: number;
+    defaultBudget: number;
+  }> {
+    // Cache for 30s to avoid hammering DB on every call in a trading cycle
+    if (this.configCache && Date.now() - this.configCacheAt < 30_000) {
+      return this.configCache;
+    }
+
+    const envLive =
+      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+
+    // Try to read DB config. If the table doesn't exist yet (no db:push), fall back gracefully.
+    let dbRow: any = null;
+    try {
+      // Try both modes — prefer the one matching env, but if someone set liveTradingEnabled
+      // in DB, that's the source of truth
+      const mode = envLive ? 'live' : 'paper';
+      const rows = await this.db
+        .select()
+        .from(schema.polymarketConfig)
+        .where(eq(schema.polymarketConfig.mode, mode))
+        .limit(1);
+      dbRow = rows[0] ?? null;
+    } catch (error) {
+      // Table likely doesn't exist yet — fall back to env
+      this.logger.debug(
+        `polymarket_config table not available, using env defaults: ${error.message}`,
+      );
+    }
+
+    // Helper: use DB value if set (not null/undefined), otherwise env, otherwise hardcoded default
+    const pick = (dbVal: any, envVal: any, fallback: number): number => {
+      if (dbVal != null && dbVal !== '') return Number(dbVal);
+      if (envVal != null && envVal !== '' && envVal !== undefined)
+        return Number(envVal);
+      return fallback;
+    };
+
+    const result = {
+      liveTradingEnabled:
+        dbRow?.liveTradingEnabled != null ? dbRow.liveTradingEnabled : envLive,
+      minEdge: pick(
+        dbRow?.minEdge,
+        this.config.get('POLYMARKET_MIN_EDGE'),
+        0.05,
+      ),
+      minLiquidity: pick(
+        dbRow?.minLiquidity,
+        this.config.get('POLYMARKET_MIN_LIQUIDITY'),
+        1000,
+      ),
+      minConfidence: pick(
+        dbRow?.minConfidence,
+        this.config.get('POLYMARKET_MIN_CONFIDENCE'),
+        6,
+      ),
+      kellyFraction: pick(
+        dbRow?.kellyFraction,
+        this.config.get('POLYMARKET_KELLY_FRACTION'),
+        0.25,
+      ),
+      maxPositionPct: pick(
+        dbRow?.maxPositionPct,
+        this.config.get('POLYMARKET_MAX_POSITION_PCT'),
+        0.1,
+      ),
+      stopLossPct: pick(
+        dbRow?.stopLossPct,
+        this.config.get('POLYMARKET_STOP_LOSS_PCT'),
+        0.3,
+      ),
+      targetMultiplier: pick(
+        dbRow?.targetMultiplier,
+        this.config.get('POLYMARKET_TARGET_MULTIPLIER'),
+        3,
+      ),
+      maxConsecutiveLosses: pick(
+        dbRow?.maxConsecutiveLosses,
+        this.config.get('POLYMARKET_MAX_CONSECUTIVE_LOSSES'),
+        5,
+      ),
+      defaultBudget: pick(
+        dbRow?.defaultBudget,
+        this.config.get('POLYMARKET_BUDGET'),
+        500,
+      ),
+    };
+
+    this.configCache = result;
+    this.configCacheAt = Date.now();
+    return result;
+  }
+
+  /**
+   * Update trading config in DB (upsert by mode).
+   */
+  async updateTradingConfig(
+    updates: Partial<{
+      liveTradingEnabled: boolean;
+      minEdge: number;
+      minLiquidity: number;
+      minConfidence: number;
+      kellyFraction: number;
+      maxPositionPct: number;
+      stopLossPct: number;
+      targetMultiplier: number;
+      maxConsecutiveLosses: number;
+      defaultBudget: number;
+    }>,
+  ): Promise<any> {
+    // Read current config to get the mode (DB or env)
+    const current = await this.getTradingConfig();
+    const mode = current.liveTradingEnabled ? 'live' : 'paper';
+
+    // ── Validate defaultBudget against actual wallet balance ────────
+    if (updates.defaultBudget !== undefined && updates.defaultBudget > 0) {
+      const walletBalance = await this.clobService.getWalletBalance();
+
+      if (walletBalance !== null && updates.defaultBudget > walletBalance) {
+        throw new BadRequestException(
+          `Insufficient Polymarket wallet balance. ` +
+            `You want to set a budget of $${updates.defaultBudget.toFixed(2)}, ` +
+            `but your wallet only has $${walletBalance.toFixed(2)} USDC. ` +
+            `Please deposit more USDC to your Polymarket wallet or set a lower budget.`,
+        );
+      }
+
+      if (walletBalance === null) {
+        this.logger.warn(
+          `Could not verify wallet balance for budget of $${updates.defaultBudget}. ` +
+            `Proceeding without validation — check POLYMARKET credentials.`,
+        );
+      }
+    }
+
+    // Build a full row: start from current values, overlay updates
+    // This ensures the first insert has all fields populated
+    const fullValues: any = {
+      mode,
+      liveTradingEnabled:
+        updates.liveTradingEnabled ?? current.liveTradingEnabled,
+      minEdge: String(updates.minEdge ?? current.minEdge),
+      minLiquidity: String(updates.minLiquidity ?? current.minLiquidity),
+      minConfidence: updates.minConfidence ?? current.minConfidence,
+      kellyFraction: String(updates.kellyFraction ?? current.kellyFraction),
+      maxPositionPct: String(updates.maxPositionPct ?? current.maxPositionPct),
+      stopLossPct: String(updates.stopLossPct ?? current.stopLossPct),
+      targetMultiplier: String(
+        updates.targetMultiplier ?? current.targetMultiplier,
+      ),
+      maxConsecutiveLosses:
+        updates.maxConsecutiveLosses ?? current.maxConsecutiveLosses,
+      defaultBudget: String(updates.defaultBudget ?? current.defaultBudget),
+      updatedAt: new Date(),
+    };
+
+    // Build the set clause with only the fields that were explicitly updated
+    const setValues: any = { updatedAt: new Date() };
+    if (updates.liveTradingEnabled !== undefined)
+      setValues.liveTradingEnabled = updates.liveTradingEnabled;
+    if (updates.minEdge !== undefined)
+      setValues.minEdge = String(updates.minEdge);
+    if (updates.minLiquidity !== undefined)
+      setValues.minLiquidity = String(updates.minLiquidity);
+    if (updates.minConfidence !== undefined)
+      setValues.minConfidence = updates.minConfidence;
+    if (updates.kellyFraction !== undefined)
+      setValues.kellyFraction = String(updates.kellyFraction);
+    if (updates.maxPositionPct !== undefined)
+      setValues.maxPositionPct = String(updates.maxPositionPct);
+    if (updates.stopLossPct !== undefined)
+      setValues.stopLossPct = String(updates.stopLossPct);
+    if (updates.targetMultiplier !== undefined)
+      setValues.targetMultiplier = String(updates.targetMultiplier);
+    if (updates.maxConsecutiveLosses !== undefined)
+      setValues.maxConsecutiveLosses = updates.maxConsecutiveLosses;
+    if (updates.defaultBudget !== undefined)
+      setValues.defaultBudget = String(updates.defaultBudget);
+
+    await this.db
+      .insert(schema.polymarketConfig)
+      .values({ ...fullValues, createdAt: new Date() })
+      .onConflictDoUpdate({
+        target: [schema.polymarketConfig.mode],
+        set: setValues,
+      });
+
+    // Invalidate cache so next read picks up the new values
+    this.configCache = null;
+
+    // ── Sync defaultBudget to the active bankroll's initialBudget ───
+    // This makes budget changes take effect immediately for all trading
+    // decisions (position sizing, stop-loss, drawdown, etc.)
+    if (updates.defaultBudget !== undefined && updates.defaultBudget > 0) {
+      await this.syncBudgetToBankroll(updates.defaultBudget, mode);
+    }
+
+    return this.getTradingConfig();
+  }
+
+  /**
+   * Sync a new budget value to the active bankroll.
+   * Updates initialBudget, recalculates currentBalance, and resets
+   * peak/drawdown tracking relative to the new budget.
+   */
+  private async syncBudgetToBankroll(
+    newBudget: number,
+    mode: string,
+  ): Promise<void> {
+    const bankroll = await this.getOrCreateBankroll();
+    const oldBudget = Number(bankroll.initialBudget);
+
+    if (newBudget === oldBudget) return;
+
+    // currentBalance = initialBudget + realizedPnl - openPositionsValue
+    // When we change initialBudget, currentBalance shifts by the same delta.
+    const realizedPnl = Number(bankroll.realizedPnl ?? 0);
+    const openPositionsValue = Number(bankroll.openPositionsValue ?? 0);
+    const newCurrentBalance = newBudget + realizedPnl - openPositionsValue;
+    const totalPortfolioValue = newCurrentBalance + openPositionsValue;
+
+    // Reset peak to the higher of old peak (adjusted) or new portfolio value
+    const newPeakBalance = Math.max(totalPortfolioValue, newBudget);
+
+    // Recalculate drawdown from the new peak
+    const newDrawdownPct =
+      newPeakBalance > 0
+        ? Math.max(0, (newPeakBalance - totalPortfolioValue) / newPeakBalance)
+        : 0;
+
+    // Always clear stop-loss on budget change and let updateBankrollSnapshot()
+    // re-evaluate with the current three-check logic on the next cycle.
+    // This prevents stale stop-loss flags from old formulas blocking trading.
+    const updates: any = {
+      initialBudget: String(newBudget),
+      currentBalance: String(newCurrentBalance),
+      totalDeposited: String(newBudget),
+      peakBalance: String(newPeakBalance),
+      currentDrawdownPct: String(newDrawdownPct),
+      isStopped: false,
+      stoppedReason: null,
+      updatedAt: new Date(),
+    };
+
+    await this.db
+      .update(schema.polymarketBankroll)
+      .set(updates)
+      .where(eq(schema.polymarketBankroll.id, bankroll.id));
+
+    this.logger.log(
+      `Budget updated: $${oldBudget.toFixed(2)} → $${newBudget.toFixed(2)}. ` +
+        `Balance: $${newCurrentBalance.toFixed(2)}, ` +
+        `portfolio: $${totalPortfolioValue.toFixed(2)}, ` +
+        `peak: $${newPeakBalance.toFixed(2)}`,
+    );
+  }
+
+  /**
+   * Get the USDC balance of the Polymarket trading wallet.
+   * Passthrough to ClobService.
+   */
+  async getWalletBalance(): Promise<number | null> {
+    return this.clobService.getWalletBalance();
   }
 
   // ─── Main agent loop ────────────────────────────────────────────────
@@ -133,14 +458,29 @@ export class PolymarketService implements OnModuleInit {
     let tradesSkipped = 0;
 
     let bankroll = await this.getOrCreateBankroll();
-    const tradingBlocked = bankroll.isStopped;
 
-    if (tradingBlocked) {
+    // Use wallet balance (actual USDC on Polymarket) for the "can we trade?" check.
+    // currentBalance can be negative when open positions exceed budget — that doesn't
+    // mean we're broke, just that our money is deployed. Wallet balance is the truth.
+    const walletBalance = await this.clobService.getWalletBalance();
+    const availableCash =
+      walletBalance ?? Math.max(0, Number(bankroll.currentBalance));
+    const tradingBlocked = bankroll.isStopped || availableCash < 1;
+
+    if (bankroll.isStopped) {
       this.logger.warn(
         `Trading is STOPPED: ${bankroll.stoppedReason}. ` +
-          `Market scan completed (${events.length} events, ${matches.length} matched), but no trades will be placed.`,
+          `Market scan completed (${events.length} events, ${matches.length} matched), but no trades will be placed. No Anthropic credits used.`,
       );
       errors.push(`Trading stopped (no new trades): ${bankroll.stoppedReason}`);
+    } else if (availableCash < 1) {
+      this.logger.warn(
+        `Trading SKIPPED — available cash $${availableCash.toFixed(2)} too low. ` +
+          `Market scan completed (${events.length} events, ${matches.length} matched), but no Anthropic credits used for trade evaluation.`,
+      );
+      errors.push(
+        `Insufficient available cash ($${availableCash.toFixed(2)}). Skipped trade evaluation to save credits.`,
+      );
     }
 
     if (!tradingBlocked && candidates.length > 0) {
@@ -149,13 +489,21 @@ export class PolymarketService implements OnModuleInit {
 
       for (const candidate of candidates) {
         try {
-          // Re-fetch bankroll for accurate balance after each trade
+          // Re-fetch bankroll BEFORE calling Claude to avoid wasting credits
           bankroll = await this.getOrCreateBankroll();
           bankrollContext = await this.buildBankrollContext();
 
-          // Stop placing trades if budget is exhausted
-          if (Number(bankroll.currentBalance) <= 0) {
-            this.logger.warn('Budget exhausted — stopping trade placement');
+          // Stop if budget too low — saves Anthropic credits
+          if (Number(bankroll.currentBalance) < 1) {
+            this.logger.warn(
+              'Budget too low — skipping remaining outright candidates to save Anthropic credits',
+            );
+            break;
+          }
+          if (bankroll.isStopped) {
+            this.logger.warn(
+              'Stop-loss triggered — skipping remaining outright candidates to save Anthropic credits',
+            );
             break;
           }
 
@@ -166,22 +514,30 @@ export class PolymarketService implements OnModuleInit {
           );
 
           if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
-            await this.executeTrade(candidate, decision, bankroll);
-            tradesPlaced++;
+            const placed = await this.executeTrade(
+              candidate,
+              decision,
+              bankroll,
+            );
+            if (placed) {
+              tradesPlaced++;
 
-            // Update open positions for next evaluation
-            openPositions.push({
-              outcomeName: decision.outcomeName,
-              fixtureId:
-                candidate.type === 'fixture'
-                  ? candidate.match.fixtureId
-                  : undefined,
-              leagueId:
-                candidate.type === 'outright'
-                  ? candidate.match.leagueId
-                  : undefined,
-              positionSizeUsd: decision.positionSizeUsd,
-            });
+              // Update open positions for next evaluation
+              openPositions.push({
+                outcomeName: decision.outcomeName,
+                fixtureId:
+                  candidate.type === 'fixture'
+                    ? candidate.match.fixtureId
+                    : undefined,
+                leagueId:
+                  candidate.type === 'outright'
+                    ? candidate.match.leagueId
+                    : undefined,
+                positionSizeUsd: decision.positionSizeUsd,
+              });
+            } else {
+              tradesSkipped++;
+            }
           } else {
             await this.logSkippedTrade(candidate, decision);
             tradesSkipped++;
@@ -218,6 +574,395 @@ export class PolymarketService implements OnModuleInit {
     };
   }
 
+  // ─── Trading cycle (prediction-first: fast, no scanning) ─────────────
+
+  /**
+   * Prediction-first trading cycle.
+   *
+   * Instead of scanning thousands of markets and generating predictions,
+   * this starts from **existing predictions**, finds their Polymarket
+   * markets, calculates edge, and places trades immediately.
+   *
+   * Flow:
+   *   1. Query high-confidence predictions (soonest fixture first)
+   *   2. For each, find the matching Polymarket market in our DB
+   *   3. Get live CLOB pricing, calculate edge
+   *   4. If edge is good enough, evaluate with trading agent
+   *   5. Place trade **immediately** and persist to DB right away
+   *
+   * Typically completes in seconds, not hours.
+   */
+  async runTradingCycle(): Promise<{
+    predictionsChecked: number;
+    candidatesFound: number;
+    tradesPlaced: number;
+    tradesSkipped: number;
+    errors: string[];
+  }> {
+    const startTime = Date.now();
+    const errors: string[] = [];
+    let tradesPlaced = 0;
+    let tradesSkipped = 0;
+
+    const tradingConfig = await this.getTradingConfig();
+    const minEdge = tradingConfig.minEdge;
+    const minLiquidity = tradingConfig.minLiquidity;
+    const minConfidence = tradingConfig.minConfidence;
+
+    this.logger.log('Starting Polymarket trading cycle (prediction-first)');
+
+    // ── Step 1: Check bankroll — skip ENTIRE cycle if no funds ──
+    // This prevents wasting Anthropic credits on Claude trading agent calls
+    // when there's no money to trade with. Other tasks (scan, sync, predictions)
+    // are NOT affected — only the trading cycle is skipped.
+    const MIN_TRADE_BALANCE = 1; // $1 minimum to even attempt trading
+
+    // Re-evaluate stop-loss with current three-check logic BEFORE reading the flag.
+    // This ensures stale stop-loss flags from old formulas get cleared if conditions
+    // no longer warrant a stop.
+    await this.updateBankrollSnapshot();
+
+    let bankroll = await this.getOrCreateBankroll();
+    if (bankroll.isStopped) {
+      this.logger.warn(
+        `Polymarket trading SKIPPED — stopped: ${bankroll.stoppedReason}. No Anthropic credits used.`,
+      );
+      return {
+        predictionsChecked: 0,
+        candidatesFound: 0,
+        tradesPlaced: 0,
+        tradesSkipped: 0,
+        errors: [`Trading stopped: ${bankroll.stoppedReason}`],
+      };
+    }
+
+    // Use wallet balance (actual USDC on Polymarket) instead of currentBalance.
+    // currentBalance can go negative when open positions > budget — that's normal,
+    // it just means money is deployed in bets. Wallet balance is the real free cash.
+    const walletBal = await this.clobService.getWalletBalance();
+    const freeCash = walletBal ?? Math.max(0, Number(bankroll.currentBalance));
+
+    if (freeCash < MIN_TRADE_BALANCE) {
+      this.logger.warn(
+        `Polymarket trading SKIPPED — available cash $${freeCash.toFixed(2)} < $${MIN_TRADE_BALANCE} minimum. ` +
+          `No Anthropic credits used. Will retry next cycle when funds are available.`,
+      );
+      return {
+        predictionsChecked: 0,
+        candidatesFound: 0,
+        tradesPlaced: 0,
+        tradesSkipped: 0,
+        errors: [
+          `Insufficient available cash ($${freeCash.toFixed(2)}). Skipped to save Anthropic credits.`,
+        ],
+      };
+    }
+
+    // ── Step 2: Get high-confidence predictions with Polymarket markets ──
+    // One query: predictions + fixtures + teams + polymarket markets
+    // Ordered soonest fixture first, highest confidence first within same day
+    const rows = await this.db.execute(sql`
+      SELECT
+        p.id            AS prediction_id,
+        p.fixture_id,
+        p.confidence,
+        p.home_win_prob,
+        p.draw_prob,
+        p.away_win_prob,
+        p.predicted_home_goals,
+        p.predicted_away_goals,
+        p.key_factors,
+        p.risk_factors,
+        p.value_bets,
+        p.detailed_analysis,
+        f.date           AS fixture_date,
+        f.home_team_id,
+        f.away_team_id,
+        ht.name          AS home_team_name,
+        at.name          AS away_team_name,
+        pm.id            AS market_db_id,
+        pm.event_id,
+        pm.market_id,
+        pm.condition_id,
+        pm.slug,
+        pm.event_title,
+        pm.market_question,
+        pm.outcomes,
+        pm.clob_token_ids,
+        pm.outcome_prices,
+        pm.liquidity,
+        pm.volume,
+        pm.volume_24hr,
+        pm.active        AS market_active,
+        pm.closed        AS market_closed,
+        pm.accepting_orders,
+        pm.start_date    AS market_start_date,
+        pm.end_date      AS market_end_date,
+        pm.match_score,
+        pm.tags
+      FROM predictions p
+      INNER JOIN fixtures f        ON f.id = p.fixture_id
+      INNER JOIN teams ht          ON ht.id = f.home_team_id
+      INNER JOIN teams at          ON at.id = f.away_team_id
+      INNER JOIN polymarket_markets pm ON pm.fixture_id = p.fixture_id
+      WHERE p.resolved_at IS NULL
+        AND p.confidence >= ${minConfidence}
+        AND f.status = 'NS'
+        AND f.date > NOW()
+        AND pm.active = true
+        AND pm.closed = false
+        AND pm.accepting_orders = true
+        AND CAST(pm.liquidity AS numeric) >= ${minLiquidity}
+        -- Exclude fixtures that already have ANY open trade (prevents opposite-side and multi-market duplicates)
+        AND NOT EXISTS (
+          SELECT 1 FROM polymarket_trades pt2
+          WHERE pt2.fixture_id = f.id AND pt2.status = 'open'
+        )
+        -- Only moneyline markets — exclude types our model can't map
+        AND pm.market_question NOT LIKE '%Exact Score%'
+        AND pm.market_question NOT LIKE '%O/U%'
+        AND pm.market_question NOT LIKE '%Both Teams to Score%'
+        AND pm.market_question NOT LIKE '%Spread%'
+        AND pm.market_question NOT LIKE '%end in a draw%'
+        AND pm.market_question NOT LIKE '%halftime%'
+      ORDER BY f.date ASC, p.confidence DESC
+    `);
+
+    const candidates: Array<{
+      row: any;
+      candidate: FixtureTradingCandidate;
+    }> = [];
+
+    this.logger.log(
+      `Found ${(rows as any[]).length} prediction-market pairs to evaluate`,
+    );
+
+    // ── Step 3: For each row, get CLOB pricing + calculate edge ──
+    for (const row of rows as any[]) {
+      try {
+        const clobTokenIds = row.clob_token_ids ?? [];
+        const primaryTokenId = clobTokenIds[0];
+        if (!primaryTokenId) continue;
+
+        const pricing =
+          await this.clobService.getMarketPricingSnapshot(primaryTokenId);
+        if (!pricing) continue;
+
+        // Build a lightweight FixtureMarketMatch for the mapper
+        const liq = Number(row.liquidity ?? 0);
+        const vol = Number(row.volume ?? 0);
+        const vol24 = Number(row.volume_24hr ?? 0);
+        const prices = (row.outcome_prices ?? []).map(Number);
+
+        const parsedMarket = {
+          marketId: row.market_id,
+          question: row.market_question,
+          conditionId: row.condition_id ?? '',
+          slug: row.slug ?? '',
+          outcomes: row.outcomes ?? [],
+          outcomePrices: prices,
+          clobTokenIds: clobTokenIds,
+          volume: vol,
+          volume24hr: vol24,
+          liquidity: liq,
+          active: row.market_active ?? true,
+          closed: row.market_closed ?? false,
+          acceptingOrders: row.accepting_orders ?? true,
+        };
+
+        const match: FixtureMarketMatch = {
+          event: {
+            eventId: row.event_id,
+            title: row.event_title,
+            slug: row.slug ?? '',
+            description: '',
+            startDate: row.market_start_date?.toISOString?.() ?? null,
+            endDate: row.market_end_date?.toISOString?.() ?? null,
+            active: row.market_active ?? true,
+            closed: row.market_closed ?? false,
+            liquidity: liq,
+            volume: vol,
+            volume24hr: vol24,
+            markets: [parsedMarket],
+            negRisk: false,
+            seriesSlug: '',
+            polymarketTagSlug: undefined,
+            tags: (row.tags ?? []) as Array<{
+              id: string;
+              slug: string;
+              label: string;
+            }>,
+          },
+          market: parsedMarket,
+          marketType: 'match_outcome',
+          matchScore: Number(row.match_score ?? 0),
+          fixtureId: row.fixture_id,
+          homeTeamId: row.home_team_id,
+          awayTeamId: row.away_team_id,
+          homeTeamName: row.home_team_name,
+          awayTeamName: row.away_team_name,
+        };
+
+        // Map prediction to market outcome and calculate edge
+        const prediction = {
+          homeWinProb: row.home_win_prob,
+          drawProb: row.draw_prob,
+          awayWinProb: row.away_win_prob,
+        };
+
+        const { ensembleProb } = this.mapFixturePredictionToOutcome(
+          match,
+          prediction,
+        );
+        if (ensembleProb == null) continue;
+
+        const polymarketProb = pricing.midpoint;
+        const rawEdge = ensembleProb - polymarketProb;
+        const inverseEdge = 1 - ensembleProb - (1 - polymarketProb);
+
+        if (rawEdge < minEdge && inverseEdge < minEdge) continue;
+
+        // Check inverse pricing if betting No
+        let pricingNo: MarketPricingSnapshot | undefined;
+        const secondTokenId = clobTokenIds[1];
+        if (inverseEdge > rawEdge && secondTokenId) {
+          const noSnapshot =
+            await this.clobService.getMarketPricingSnapshot(secondTokenId);
+          if (noSnapshot) pricingNo = noSnapshot;
+        }
+
+        const bestEdge = Math.max(rawEdge, inverseEdge);
+        const bestPricing =
+          inverseEdge > rawEdge && pricingNo ? pricingNo : pricing;
+        const bestEnsembleProb =
+          inverseEdge > rawEdge ? 1 - ensembleProb : ensembleProb;
+        const bestPolymarketProb =
+          inverseEdge > rawEdge ? 1 - polymarketProb : polymarketProb;
+
+        const fixtureCandidate: FixtureTradingCandidate = {
+          type: 'fixture',
+          match,
+          pricing: bestPricing,
+          pricingNo: inverseEdge > rawEdge ? undefined : pricingNo,
+          prediction: {
+            id: row.prediction_id,
+            homeWinProb: Number(row.home_win_prob),
+            drawProb: Number(row.draw_prob),
+            awayWinProb: Number(row.away_win_prob),
+            predictedHomeGoals: Number(row.predicted_home_goals ?? 0),
+            predictedAwayGoals: Number(row.predicted_away_goals ?? 0),
+            confidence: row.confidence ?? 5,
+            keyFactors: (row.key_factors as string[]) ?? [],
+            riskFactors: (row.risk_factors as string[]) ?? [],
+            valueBets: (row.value_bets as any[]) ?? [],
+            detailedAnalysis: row.detailed_analysis ?? '',
+          },
+          ensembleProbability: bestEnsembleProb,
+          polymarketProbability: bestPolymarketProb,
+          rawEdge: bestEdge,
+        };
+
+        candidates.push({ row, candidate: fixtureCandidate });
+
+        this.logger.log(
+          `Candidate: ${row.home_team_name} vs ${row.away_team_name} ` +
+            `(${new Date(row.fixture_date).toISOString().split('T')[0]}) ` +
+            `edge=${(bestEdge * 100).toFixed(1)}% conf=${row.confidence}`,
+        );
+      } catch (err: any) {
+        this.logger.warn(
+          `Error evaluating prediction #${row.prediction_id}: ${err.message}`,
+        );
+        errors.push(err.message);
+      }
+    }
+
+    this.logger.log(
+      `${candidates.length} candidates with edge >= ${(minEdge * 100).toFixed(0)}% from ${(rows as any[]).length} prediction-market pairs`,
+    );
+
+    // ── Step 4: Evaluate each candidate and place trades IMMEDIATELY ──
+    const openPositions = await this.getOpenPositionsSummary();
+
+    for (const { candidate } of candidates) {
+      try {
+        // Re-fetch bankroll BEFORE calling Claude to avoid wasting credits
+        bankroll = await this.getOrCreateBankroll();
+
+        // Check actual wallet balance, not currentBalance (which can be negative
+        // when open positions exceed budget — that's normal, not broke)
+        const loopWalletBal = await this.clobService.getWalletBalance();
+        const loopFreeCash =
+          loopWalletBal ?? Math.max(0, Number(bankroll.currentBalance));
+
+        if (loopFreeCash < MIN_TRADE_BALANCE) {
+          this.logger.warn(
+            `Available cash too low ($${loopFreeCash.toFixed(2)}) — skipping remaining candidates to save Anthropic credits`,
+          );
+          break;
+        }
+        if (bankroll.isStopped) {
+          this.logger.warn(
+            'Stop-loss triggered — skipping remaining candidates to save Anthropic credits',
+          );
+          break;
+        }
+
+        const bankrollContext = await this.buildBankrollContext();
+        const decision = await this.tradingAgent.evaluate(
+          candidate,
+          bankrollContext,
+          openPositions,
+        );
+
+        if (decision.action === 'bet' && decision.positionSizeUsd > 0) {
+          // Place and persist to DB right away — not batched
+          const placed = await this.executeTrade(candidate, decision, bankroll);
+          if (placed) {
+            tradesPlaced++;
+            openPositions.push({
+              outcomeName: decision.outcomeName,
+              fixtureId: candidate.match.fixtureId,
+              positionSizeUsd: decision.positionSizeUsd,
+            });
+            this.logger.log(
+              `TRADE PLACED: ${candidate.match.homeTeamName} vs ${candidate.match.awayTeamName} — ` +
+                `${decision.outcomeName} $${decision.positionSizeUsd.toFixed(2)} @ ${decision.entryPrice.toFixed(3)}`,
+            );
+          } else {
+            tradesSkipped++;
+          }
+        } else {
+          await this.logSkippedTrade(candidate, decision);
+          tradesSkipped++;
+        }
+      } catch (err: any) {
+        this.logger.error(
+          `Failed to trade on fixture ${candidate.match.fixtureId}: ${err.message}`,
+        );
+        errors.push(err.message);
+      }
+    }
+
+    // ── Step 5: Update bankroll snapshot ──
+    await this.updateBankrollSnapshot();
+
+    const duration = Date.now() - startTime;
+    this.logger.log(
+      `Trading cycle complete in ${duration}ms: ` +
+        `${(rows as any[]).length} checked, ${candidates.length} candidates, ` +
+        `${tradesPlaced} placed, ${tradesSkipped} skipped`,
+    );
+
+    return {
+      predictionsChecked: (rows as any[]).length,
+      candidatesFound: candidates.length,
+      tradesPlaced,
+      tradesSkipped,
+      errors,
+    };
+  }
+
   // ─── Candidate building ─────────────────────────────────────────────
 
   /**
@@ -227,9 +972,9 @@ export class PolymarketService implements OnModuleInit {
   private async buildTradingCandidates(
     matches: MarketMatch[],
   ): Promise<TradingCandidate[]> {
-    const minEdge = this.config.get<number>('POLYMARKET_MIN_EDGE') || 0.05;
-    const minLiquidity =
-      this.config.get<number>('POLYMARKET_MIN_LIQUIDITY') || 1000;
+    const tradingConfig = await this.getTradingConfig();
+    const minEdge = tradingConfig.minEdge;
+    const minLiquidity = tradingConfig.minLiquidity;
 
     const candidates: TradingCandidate[] = [];
 
@@ -237,7 +982,7 @@ export class PolymarketService implements OnModuleInit {
       // Skip low-liquidity markets
       if (Number(match.event.liquidity) < minLiquidity) continue;
 
-      // Check if we already have an open trade for this market
+      // Check if we already have an open trade for this market or fixture
       const existingTrades = await this.db
         .select({ id: schema.polymarketTrades.id })
         .from(schema.polymarketTrades)
@@ -257,6 +1002,24 @@ export class PolymarketService implements OnModuleInit {
         .limit(1);
 
       if (existingTrades.length > 0) continue;
+
+      // Also check by fixture to prevent duplicate exposure across different markets for the same match
+      const matchFixtureId =
+        'fixtureId' in match ? (match as any).fixtureId : null;
+      if (matchFixtureId) {
+        const existingFixtureTrades = await this.db
+          .select({ id: schema.polymarketTrades.id })
+          .from(schema.polymarketTrades)
+          .where(
+            and(
+              eq(schema.polymarketTrades.fixtureId, matchFixtureId),
+              eq(schema.polymarketTrades.status, 'open'),
+            ),
+          )
+          .limit(1);
+
+        if (existingFixtureTrades.length > 0) continue;
+      }
 
       if (match.marketType === 'match_outcome') {
         const candidate = await this.buildFixtureCandidate(
@@ -725,8 +1488,8 @@ export class PolymarketService implements OnModuleInit {
     match: FixtureMarketMatch,
     minEdge: number,
   ): Promise<FixtureTradingCandidate | null> {
-    const minConfidence =
-      this.config.get<number>('POLYMARKET_MIN_CONFIDENCE') || 6;
+    const tradingCfg = await this.getTradingConfig();
+    const minConfidence = tradingCfg.minConfidence;
 
     // Get our prediction for this fixture
     const [prediction] = await this.db
@@ -807,6 +1570,145 @@ export class PolymarketService implements OnModuleInit {
    * Map fixture prediction probabilities to the market's outcome.
    * (Same logic as before — for "Will X beat Y?" markets)
    */
+  // ─── Team name normalization & matching ──────────────────────────────
+
+  /** Common suffixes to strip from team names for matching */
+  private static readonly TEAM_SUFFIXES =
+    /\b(fc|sc|afc|cf|jk|sk|fk|bk|if|ssc|as|us|rc|ac|cd|ud|rcd|sd|ca|se|fbc|club|saudi club|de la unam)\b/gi;
+
+  /**
+   * Known aliases: market name → our DB name (both lowercased, normalized).
+   * Only needed for cases where names are fundamentally different.
+   */
+  private static readonly TEAM_ALIASES: Record<string, string[]> = {
+    wolves: ['wolverhampton wanderers', 'wolverhampton'],
+    'wolverhampton wanderers': ['wolves'],
+    'paris saint germain': ['paris saint germain', 'psg'],
+    besiktas: ['beşiktaş', 'besiktas'],
+    beşiktaş: ['besiktas'],
+    'al ahli jeddah': ['al ahli saudi', 'al ahli'],
+    'al ahli saudi': ['al ahli jeddah', 'al ahli'],
+    'al ittihad': ['al ittihad saudi', 'al ittihad el iskandary'],
+    'al ittihad saudi': ['al ittihad'],
+    'al hilal saudi': ['al hilal saudi', 'al hilal'],
+    'al masry': ['el masry'],
+    'el masry': ['al masry'],
+    'celta vigo': ['celta de vigo', 'rc celta de vigo', 'rc celta'],
+    cadiz: ['cádiz'],
+    leon: ['club león', 'club leon'],
+    ajax: ['afc ajax'],
+    'afc ajax': ['ajax'],
+    'newcastle jets': ['newcastle united jets'],
+    'newcastle united jets': ['newcastle jets'],
+    'dc united': ['d.c. united'],
+    'd.c. united': ['dc united'],
+    famalicao: ['famalicão'],
+    'codm meknes': ['cod meknès', 'cod meknes', 'codm meknès'],
+    'ittihad tanger': ['ir tanger'],
+    'ir tanger': ['ittihad tanger'],
+    'fus rabat': ['fath union sport'],
+    'fath union sport': ['fus rabat'],
+    'u.n.a.m.   pumas': ['pumas de la unam', 'pumas unam'],
+    'pumas unam': ['u.n.a.m.   pumas', 'pumas de la unam'],
+    'sporting cp': ['sporting cp'],
+    monaco: ['as monaco'],
+    'as monaco': ['monaco'],
+    marseille: ['olympique de marseille', 'olympique marseille'],
+    'olympique de marseille': ['marseille'],
+    barcelona: ['fc barcelona'],
+    'fc barcelona': ['barcelona'],
+    nantes: ['fc nantes'],
+    'fc nantes': ['nantes'],
+    angers: ['angers sco', 'sco angers'],
+    'el gouna': ['el gouna'],
+  };
+
+  /**
+   * Normalize a team name for comparison:
+   * - Lowercase, strip diacritics, remove hyphens/dots/punctuation
+   * - Remove common suffixes (FC, SC, AFC, etc.)
+   * - Collapse whitespace
+   */
+  private normalizeTeamName(name: string): string {
+    return name
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // Strip diacritics (ş→s, é→e, á→a)
+      .replace(/[-.']/g, ' ') // Hyphens, dots, apostrophes → spaces
+      .replace(PolymarketService.TEAM_SUFFIXES, '') // Strip common suffixes
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /**
+   * Check if a team name matches a text snippet using normalized fuzzy matching.
+   */
+  private teamMatchesText(teamName: string, text: string): boolean {
+    const teamNorm = this.normalizeTeamName(teamName);
+    const textNorm = text
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[-.']/g, ' ');
+
+    // Direct normalized match
+    if (textNorm.includes(teamNorm)) return true;
+
+    // Extract the team from "Will X win on YYYY-MM-DD?" or "Will X win on YYYY MM DD?"
+    // (hyphens may have been stripped by normalization)
+    const willWinMatch = textNorm.match(
+      /will\s+(.+?)\s+win\s+on\s+\d{4}[\s-]\d{2}[\s-]\d{2}/,
+    );
+    const marketTeamRaw = willWinMatch?.[1]?.trim();
+    const marketTeamNorm = marketTeamRaw
+      ? this.normalizeTeamName(marketTeamRaw)
+      : null;
+
+    if (marketTeamNorm) {
+      // Exact normalized match
+      if (teamNorm === marketTeamNorm) return true;
+
+      // Prefix match (e.g., "psv" matches "psv eindhoven")
+      if (
+        teamNorm.startsWith(marketTeamNorm + ' ') ||
+        marketTeamNorm.startsWith(teamNorm + ' ')
+      )
+        return true;
+
+      // Token overlap: if >= 60% of significant tokens match
+      const teamTokens = teamNorm.split(/\s+/).filter((t) => t.length > 2);
+      const marketTokens = marketTeamNorm
+        .split(/\s+/)
+        .filter((t) => t.length > 2);
+      if (teamTokens.length > 0 && marketTokens.length > 0) {
+        const overlap = marketTokens.filter((mt) =>
+          teamTokens.some(
+            (tt) => tt === mt || tt.startsWith(mt) || mt.startsWith(tt),
+          ),
+        ).length;
+        const minLen = Math.min(teamTokens.length, marketTokens.length);
+        if (overlap >= minLen && overlap > 0) return true;
+      }
+
+      // Known aliases
+      const aliases =
+        PolymarketService.TEAM_ALIASES[teamNorm] ??
+        PolymarketService.TEAM_ALIASES[teamName.toLowerCase()] ??
+        [];
+      for (const alias of aliases) {
+        const aliasNorm = this.normalizeTeamName(alias);
+        if (
+          marketTeamNorm === aliasNorm ||
+          marketTeamNorm.includes(aliasNorm) ||
+          aliasNorm.includes(marketTeamNorm)
+        )
+          return true;
+      }
+    }
+
+    return false;
+  }
+
   private mapFixturePredictionToOutcome(
     match: FixtureMarketMatch,
     prediction: any,
@@ -815,17 +1717,26 @@ export class PolymarketService implements OnModuleInit {
     const title = match.event.title.toLowerCase();
     const text = `${question} ${title}`;
 
-    const homeTeamNorm = match.homeTeamName.toLowerCase();
-    const awayTeamNorm = match.awayTeamName.toLowerCase();
+    const homeMatches = this.teamMatchesText(match.homeTeamName, text);
+    const awayMatches = this.teamMatchesText(match.awayTeamName, text);
 
+    // "Will X beat Y?" or "Will X win?" style
     if (
-      text.includes(homeTeamNorm) &&
+      homeMatches &&
       (text.includes('beat') || text.includes('win') || text.includes('defeat'))
     ) {
-      if (
-        text.includes(awayTeamNorm) &&
-        text.indexOf(homeTeamNorm) < text.indexOf(awayTeamNorm)
-      ) {
+      if (awayMatches) {
+        // Both teams mentioned — the first one is the subject
+        const homeIdx = text.indexOf(match.homeTeamName.toLowerCase());
+        const awayIdx = text.indexOf(match.awayTeamName.toLowerCase());
+        if (homeIdx >= 0 && awayIdx >= 0 && homeIdx < awayIdx) {
+          return {
+            ensembleProb: Number(prediction.homeWinProb),
+            outcomeDescription: `${match.homeTeamName} Win`,
+          };
+        }
+      } else {
+        // Only home team mentioned
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
@@ -834,13 +1745,10 @@ export class PolymarketService implements OnModuleInit {
     }
 
     if (
-      text.includes(awayTeamNorm) &&
+      awayMatches &&
       (text.includes('beat') || text.includes('win') || text.includes('defeat'))
     ) {
-      if (
-        text.includes(homeTeamNorm) &&
-        text.indexOf(awayTeamNorm) < text.indexOf(homeTeamNorm)
-      ) {
+      if (!homeMatches) {
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
@@ -848,15 +1756,16 @@ export class PolymarketService implements OnModuleInit {
       }
     }
 
+    // Yes/No outcomes — single team mentioned
     const outcomes = match.market.outcomes.map((o) => o.toLowerCase());
     if (outcomes.includes('yes') && outcomes.includes('no')) {
-      if (text.includes(homeTeamNorm) && !text.includes(awayTeamNorm)) {
+      if (homeMatches && !awayMatches) {
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
         };
       }
-      if (text.includes(awayTeamNorm) && !text.includes(homeTeamNorm)) {
+      if (awayMatches && !homeMatches) {
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
@@ -864,14 +1773,15 @@ export class PolymarketService implements OnModuleInit {
       }
     }
 
+    // Check outcome names for team references
     for (let i = 0; i < outcomes.length; i++) {
-      if (outcomes[i].includes(homeTeamNorm)) {
+      if (this.teamMatchesText(match.homeTeamName, outcomes[i])) {
         return {
           ensembleProb: Number(prediction.homeWinProb),
           outcomeDescription: `${match.homeTeamName} Win`,
         };
       }
-      if (outcomes[i].includes(awayTeamNorm)) {
+      if (this.teamMatchesText(match.awayTeamName, outcomes[i])) {
         return {
           ensembleProb: Number(prediction.awayWinProb),
           outcomeDescription: `${match.awayTeamName} Win`,
@@ -889,20 +1799,20 @@ export class PolymarketService implements OnModuleInit {
 
   /**
    * Execute a trade — either paper or live.
+   * Returns true if the trade was actually placed and persisted, false otherwise.
    */
   private async executeTrade(
     candidate: TradingCandidate,
     decision: TradingDecision,
     bankroll: any,
-  ): Promise<void> {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+  ): Promise<boolean> {
+    const tradingConfig = await this.getTradingConfig();
+    const isLive = tradingConfig.liveTradingEnabled;
     const mode = isLive ? 'live' : 'paper';
 
     // ── Budget guard: never exceed initial budget ─────────────────────
     const currentBalance = Number(bankroll.currentBalance);
-    const maxPositionPct =
-      this.config.get<number>('POLYMARKET_MAX_POSITION_PCT') || 0.1;
+    const maxPositionPct = tradingConfig.maxPositionPct;
     const maxPositionSize = currentBalance * maxPositionPct;
     const minTradeSize = 1; // $1 minimum to be worth placing
 
@@ -910,7 +1820,7 @@ export class PolymarketService implements OnModuleInit {
       this.logger.warn(
         `Budget exhausted ($${currentBalance.toFixed(2)} remaining) — skipping trade`,
       );
-      return;
+      return false;
     }
 
     // Cap position size to: min(agent suggestion, max position %, remaining balance)
@@ -924,7 +1834,7 @@ export class PolymarketService implements OnModuleInit {
       this.logger.warn(
         `Position size $${positionSizeUsd.toFixed(2)} below minimum $${minTradeSize} — skipping trade`,
       );
-      return;
+      return false;
     }
 
     if (positionSizeUsd < decision.positionSizeUsd) {
@@ -949,7 +1859,7 @@ export class PolymarketService implements OnModuleInit {
         this.logger.error(
           'No token ID for outcome index — skipping live trade',
         );
-        return;
+        return false;
       }
 
       const tokensToReceive = decision.positionSizeUsd / decision.entryPrice;
@@ -958,11 +1868,13 @@ export class PolymarketService implements OnModuleInit {
         side: 'BUY',
         price: decision.entryPrice,
         size: tokensToReceive,
+        conditionId: candidate.match.market.conditionId,
+        negRisk: candidate.match.event.negRisk,
       });
 
       if (!result) {
-        this.logger.error('Live order placement failed');
-        return;
+        this.logger.error('Live order placement failed — CLOB returned null');
+        return false;
       }
 
       orderId = result.orderId;
@@ -1020,24 +1932,47 @@ export class PolymarketService implements OnModuleInit {
       tradeValues.predictionId = candidate.prediction.id;
     }
 
-    // ── Duplicate guard: check right before insert (race condition defense) ──
-    const existingOpen = await this.db
+    // ── Duplicate guard: prevent any duplicate exposure on the same fixture or market ──
+    // Check 1: Same market (any outcome — prevents opposite-side betting Yes+No)
+    const existingMarketTrade = await this.db
       .select({ id: schema.polymarketTrades.id })
       .from(schema.polymarketTrades)
       .where(
         and(
           eq(schema.polymarketTrades.polymarketMarketId, marketRecord.id),
-          eq(schema.polymarketTrades.outcomeIndex, decision.outcomeIndex),
           eq(schema.polymarketTrades.status, 'open'),
         ),
       )
       .limit(1);
 
-    if (existingOpen.length > 0) {
+    if (existingMarketTrade.length > 0) {
       this.logger.warn(
-        `Duplicate guard: open trade #${existingOpen[0].id} already exists for market ${marketRecord.id} outcome ${decision.outcomeIndex} — skipping`,
+        `Duplicate guard: open trade #${existingMarketTrade[0].id} already exists for market ${marketRecord.id} — skipping`,
       );
-      return;
+      return false;
+    }
+
+    // Check 2: Same fixture via different market (prevents multi-market duplicate exposure)
+    const fixtureId =
+      candidate.type === 'fixture' ? candidate.match.fixtureId : null;
+    if (fixtureId) {
+      const existingFixtureTrade = await this.db
+        .select({ id: schema.polymarketTrades.id })
+        .from(schema.polymarketTrades)
+        .where(
+          and(
+            eq(schema.polymarketTrades.fixtureId, fixtureId),
+            eq(schema.polymarketTrades.status, 'open'),
+          ),
+        )
+        .limit(1);
+
+      if (existingFixtureTrade.length > 0) {
+        this.logger.warn(
+          `Duplicate guard: open trade #${existingFixtureTrade[0].id} already exists for fixture ${fixtureId} — skipping`,
+        );
+        return false;
+      }
     }
 
     await this.db.insert(schema.polymarketTrades).values(tradeValues);
@@ -1067,6 +2002,194 @@ export class PolymarketService implements OnModuleInit {
         `$${decision.positionSizeUsd.toFixed(2)} @ ${decision.entryPrice.toFixed(3)} ` +
         `(edge: ${decision.edgePercent.toFixed(1)}%, Kelly: ${decision.kellyFraction.toFixed(3)})`,
     );
+
+    return true;
+  }
+
+  /**
+   * Manually place a trade on a Polymarket market — bypasses the AI agent,
+   * edge calculation, and all automated gates. Used for admin overrides.
+   */
+  async placeManualTrade(params: {
+    marketId: number;
+    outcomeIndex: number;
+    outcomeName: string;
+    positionSizeUsd: number;
+    reasoning?: string;
+  }): Promise<any> {
+    // 1. Look up the market record
+    const [market] = await this.db
+      .select()
+      .from(schema.polymarketMarkets)
+      .where(eq(schema.polymarketMarkets.id, params.marketId))
+      .limit(1);
+
+    if (!market) {
+      throw new Error(`Market with id=${params.marketId} not found`);
+    }
+
+    // 2. Get bankroll
+    const bankroll = await this.getOrCreateBankroll();
+    const currentBalance = Number(bankroll.currentBalance);
+
+    if (currentBalance <= 0) {
+      throw new Error(
+        `Bankroll balance is $${currentBalance.toFixed(2)} — cannot place trade`,
+      );
+    }
+
+    const positionSizeUsd = Math.min(params.positionSizeUsd, currentBalance);
+    if (positionSizeUsd < 1) {
+      throw new Error(
+        `Position size $${positionSizeUsd.toFixed(2)} below $1 minimum`,
+      );
+    }
+
+    // 3. Get current pricing from CLOB
+    const tokenIds: string[] = market.clobTokenIds ?? [];
+    const tokenId = tokenIds[params.outcomeIndex];
+    let entryPrice = 0.5; // fallback
+
+    if (tokenId) {
+      try {
+        const pricing =
+          await this.clobService.getMarketPricingSnapshot(tokenId);
+        if (pricing) {
+          entryPrice = pricing.midpoint || pricing.buyPrice || 0.5;
+        }
+      } catch {
+        // Use outcome price from last sync as fallback
+        const prices: string[] = market.outcomePrices ?? [];
+        if (prices[params.outcomeIndex]) {
+          entryPrice = Number(prices[params.outcomeIndex]);
+        }
+      }
+    } else {
+      const prices: string[] = market.outcomePrices ?? [];
+      if (prices[params.outcomeIndex]) {
+        entryPrice = Number(prices[params.outcomeIndex]);
+      }
+    }
+
+    if (entryPrice <= 0 || entryPrice >= 1) {
+      entryPrice = 0.5; // safety fallback
+    }
+
+    // 4. Check for duplicates
+    const existingOpen = await this.db
+      .select({ id: schema.polymarketTrades.id })
+      .from(schema.polymarketTrades)
+      .where(
+        and(
+          eq(schema.polymarketTrades.polymarketMarketId, params.marketId),
+          eq(schema.polymarketTrades.outcomeIndex, params.outcomeIndex),
+          eq(schema.polymarketTrades.status, 'open'),
+        ),
+      )
+      .limit(1);
+
+    if (existingOpen.length > 0) {
+      throw new Error(
+        `Open trade #${existingOpen[0].id} already exists for this market+outcome`,
+      );
+    }
+
+    // 5. Determine mode
+    const tradingCfg = await this.getTradingConfig();
+    const isLive = tradingCfg.liveTradingEnabled;
+    const mode = isLive ? 'live' : 'paper';
+
+    // 6. Place live order if applicable
+    let orderId: string | null = null;
+    let orderStatus = 'filled';
+
+    if (isLive && tokenId) {
+      const tokensToReceive = positionSizeUsd / entryPrice;
+      const result = await this.clobService.placeLimitOrder({
+        tokenId,
+        side: 'BUY',
+        price: entryPrice,
+        size: tokensToReceive,
+        conditionId: market.conditionId ?? undefined,
+      });
+
+      if (!result) {
+        throw new Error('Live order placement failed');
+      }
+
+      orderId = result.orderId;
+      orderStatus = result.status;
+    }
+
+    // 7. Insert trade
+    const tokenQuantity = positionSizeUsd / entryPrice;
+
+    const [trade] = await this.db
+      .insert(schema.polymarketTrades)
+      .values({
+        polymarketMarketId: params.marketId,
+        fixtureId: market.fixtureId,
+        leagueId: market.leagueId,
+        teamId: market.teamId,
+        mode,
+        side: 'buy',
+        outcomeIndex: params.outcomeIndex,
+        outcomeName: params.outcomeName,
+        entryPrice: String(entryPrice),
+        positionSizeUsd: String(positionSizeUsd),
+        tokenQuantity: String(tokenQuantity),
+        ensembleProbability: '0', // manual — no model probability
+        polymarketProbability: String(entryPrice), // price ≈ implied probability
+        edgePercent: '0', // manual — no edge calculation
+        kellyFraction: '0',
+        confidenceAtEntry: 0,
+        agentReasoning: params.reasoning || 'Manual trade placed by admin',
+        riskAssessment: 'Manual override — no automated risk assessment',
+        bankrollAtEntry: String(currentBalance),
+        openPositionsCount: bankroll.openPositionsCount,
+        orderId,
+        orderStatus,
+        fillPrice: isLive ? null : String(entryPrice),
+        fillTimestamp: isLive ? null : new Date(),
+        status: 'open',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    // 8. Update bankroll
+    const newBalance = currentBalance - positionSizeUsd;
+    await this.db
+      .update(schema.polymarketBankroll)
+      .set({
+        currentBalance: String(newBalance),
+        openPositionsCount: bankroll.openPositionsCount + 1,
+        openPositionsValue: String(
+          Number(bankroll.openPositionsValue) + positionSizeUsd,
+        ),
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.polymarketBankroll.id, bankroll.id));
+
+    this.logger.log(
+      `[${mode.toUpperCase()}] Manual trade placed: ${params.outcomeName} ` +
+        `$${positionSizeUsd.toFixed(2)} @ ${entryPrice.toFixed(3)} on "${market.eventTitle}"`,
+    );
+
+    return {
+      trade,
+      market: {
+        id: market.id,
+        eventTitle: market.eventTitle,
+        marketQuestion: market.marketQuestion,
+        outcomes: market.outcomes,
+      },
+      entryPrice,
+      positionSizeUsd,
+      tokenQuantity,
+      mode,
+      newBalance,
+    };
   }
 
   private async logSkippedTrade(
@@ -1342,8 +2465,8 @@ export class PolymarketService implements OnModuleInit {
   // ─── Bankroll management ────────────────────────────────────────────
 
   async getOrCreateBankroll(): Promise<any> {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
+    const tradingConfig = await this.getTradingConfig();
+    const isLive = tradingConfig.liveTradingEnabled;
     const mode = isLive ? 'live' : 'paper';
 
     const existing = await this.db
@@ -1355,7 +2478,7 @@ export class PolymarketService implements OnModuleInit {
 
     if (existing.length > 0) return existing[0];
 
-    const budget = this.config.get<number>('POLYMARKET_BUDGET') || 500;
+    const budget = tradingConfig.defaultBudget;
 
     const [created] = await this.db
       .insert(schema.polymarketBankroll)
@@ -1440,13 +2563,12 @@ export class PolymarketService implements OnModuleInit {
 
   async buildBankrollContext(): Promise<BankrollContext> {
     const bankroll = await this.getOrCreateBankroll();
-    const targetMultiplier =
-      this.config.get<number>('POLYMARKET_TARGET_MULTIPLIER') || 3;
+    const tradingConfig = await this.getTradingConfig();
 
     return {
       initialBudget: Number(bankroll.initialBudget),
       currentBalance: Number(bankroll.currentBalance),
-      targetMultiplier,
+      targetMultiplier: tradingConfig.targetMultiplier,
       realizedPnl: Number(bankroll.realizedPnl),
       openPositionsCount: bankroll.openPositionsCount ?? 0,
       openPositionsValue: Number(bankroll.openPositionsValue ?? 0),
@@ -1455,13 +2577,16 @@ export class PolymarketService implements OnModuleInit {
       currentDrawdownPct: Number(bankroll.currentDrawdownPct ?? 0),
       maxDrawdownPct: Number(bankroll.maxDrawdownPct ?? 0),
       peakBalance: Number(bankroll.peakBalance ?? bankroll.initialBudget),
+      kellyFraction: tradingConfig.kellyFraction,
+      maxPositionPct: tradingConfig.maxPositionPct,
+      stopLossPct: tradingConfig.stopLossPct,
     };
   }
 
   async updateBankrollSnapshot(): Promise<void> {
     const bankroll = await this.getOrCreateBankroll();
-    const stopLossPct =
-      this.config.get<number>('POLYMARKET_STOP_LOSS_PCT') || 0.3;
+    const tradingConfig = await this.getTradingConfig();
+    const stopLossPct = tradingConfig.stopLossPct;
 
     const resolvedTrades = await this.db
       .select()
@@ -1509,23 +2634,108 @@ export class PolymarketService implements OnModuleInit {
     );
 
     const initialBudget = Number(bankroll.initialBudget);
+
+    // ── Portfolio valuation ──────────────────────────────────────────
+    //
+    // currentBalance = cash available (budget + realized P&L - money locked in open positions)
+    // totalPortfolioValue = cash + open positions (what the portfolio is actually worth)
+    //
+    // The old stop-loss only looked at currentBalance, which penalizes
+    // money that's simply locked in open bets. A proper stop-loss should
+    // consider the total portfolio value.
+
     const currentBalance = initialBudget + realizedPnl - openPositionsValue;
+    const totalPortfolioValue = currentBalance + openPositionsValue;
+
+    // ── Peak & drawdown tracking (based on total portfolio value) ────
     const peakBalance = Math.max(
       Number(bankroll.peakBalance ?? initialBudget),
-      currentBalance,
+      totalPortfolioValue,
     );
     const currentDrawdownPct =
-      peakBalance > 0 ? (peakBalance - currentBalance) / peakBalance : 0;
+      peakBalance > 0 ? (peakBalance - totalPortfolioValue) / peakBalance : 0;
     const maxDrawdownPct = Math.max(
       Number(bankroll.maxDrawdownPct ?? 0),
       currentDrawdownPct,
     );
 
-    const balanceRatio = currentBalance / initialBudget;
-    const isStopped = balanceRatio < stopLossPct;
-    const stoppedReason = isStopped
-      ? `Bankroll dropped to ${(balanceRatio * 100).toFixed(1)}% of initial budget (stop-loss at ${(stopLossPct * 100).toFixed(0)}%)`
-      : null;
+    // ── Stop-loss evaluation ─────────────────────────────────────────
+    //
+    // Three independent checks — ANY one triggers a stop:
+    //
+    // 1. REALIZED LOSS STOP: If confirmed losses (resolved trades) have
+    //    eaten through too much of the budget. This is money that's
+    //    actually gone — no chance of recovery.
+    //    Trigger: realizedPnl loss exceeds (1 - stopLossPct) of budget.
+    //
+    // 2. PORTFOLIO DRAWDOWN STOP: If the total portfolio value
+    //    (cash + open positions) drops below the threshold relative to
+    //    the peak. This is the standard peak-to-trough drawdown used
+    //    in professional trading.
+    //    Trigger: drawdown from peak exceeds (1 - stopLossPct).
+    //
+    // 3. CONSECUTIVE LOSS STOP: If the last N resolved trades are all
+    //    losses, the model may be fundamentally broken. Stop to prevent
+    //    further damage while the model is reviewed.
+    //    Trigger: maxConsecutiveLosses+ consecutive losses (configurable, default 5).
+    //    Set to 0 to disable this check.
+
+    const realizedLossRatio =
+      initialBudget > 0
+        ? Math.abs(Math.min(0, realizedPnl)) / initialBudget
+        : 0;
+    const maxAllowedLoss = 1 - stopLossPct; // e.g. stopLossPct=0.30 → max 70% loss
+
+    // Check 1: Realized loss stop
+    const realizedLossTriggered = realizedLossRatio > maxAllowedLoss;
+
+    // Check 2: Portfolio drawdown from peak
+    const portfolioRatio =
+      initialBudget > 0 ? totalPortfolioValue / initialBudget : 1;
+    const drawdownTriggered = portfolioRatio < stopLossPct;
+
+    // Check 3: Consecutive loss streak
+    const recentResolved = resolvedTrades
+      .sort(
+        (a: any, b: any) =>
+          new Date(b.resolvedAt).getTime() - new Date(a.resolvedAt).getTime(),
+      )
+      .slice(0, 10); // Last 10 resolved trades
+    let consecutiveLosses = 0;
+    for (const t of recentResolved) {
+      if ((t as any).resolutionOutcome === 'loss') {
+        consecutiveLosses++;
+      } else {
+        break;
+      }
+    }
+    const maxConsecLosses = tradingConfig.maxConsecutiveLosses;
+    const consecutiveLossTriggered =
+      maxConsecLosses > 0 && consecutiveLosses >= maxConsecLosses;
+
+    const isStopped =
+      realizedLossTriggered || drawdownTriggered || consecutiveLossTriggered;
+
+    let stoppedReason: string | null = null;
+    if (isStopped) {
+      const reasons: string[] = [];
+      if (realizedLossTriggered) {
+        reasons.push(
+          `Realized losses ($${Math.abs(realizedPnl).toFixed(2)}) exceeded ${(maxAllowedLoss * 100).toFixed(0)}% of budget`,
+        );
+      }
+      if (drawdownTriggered) {
+        reasons.push(
+          `Portfolio value ($${totalPortfolioValue.toFixed(2)}) dropped to ${(portfolioRatio * 100).toFixed(1)}% of budget (stop-loss at ${(stopLossPct * 100).toFixed(0)}%)`,
+        );
+      }
+      if (consecutiveLossTriggered) {
+        reasons.push(
+          `${consecutiveLosses} consecutive losing trades — model may need review`,
+        );
+      }
+      stoppedReason = reasons.join('; ');
+    }
 
     await this.db
       .update(schema.polymarketBankroll)
@@ -1551,6 +2761,14 @@ export class PolymarketService implements OnModuleInit {
 
     if (isStopped) {
       this.logger.warn(`STOP-LOSS TRIGGERED: ${stoppedReason}`);
+    } else {
+      this.logger.log(
+        `Bankroll snapshot: portfolio=$${totalPortfolioValue.toFixed(2)} ` +
+          `(cash=$${currentBalance.toFixed(2)} + open=$${openPositionsValue.toFixed(2)}), ` +
+          `realized P&L=$${realizedPnl.toFixed(2)}, drawdown=${(currentDrawdownPct * 100).toFixed(1)}%, ` +
+          `record=${winningTrades}W/${losingTrades}L` +
+          `${consecutiveLosses > 0 ? `, streak=${consecutiveLosses}L` : ''}`,
+      );
     }
   }
 
@@ -1565,6 +2783,7 @@ export class PolymarketService implements OnModuleInit {
         marketId: market.marketId,
         conditionId: market.conditionId,
         slug: market.slug,
+        eventSlug: match.event.slug,
         eventTitle: match.event.title,
         marketQuestion: market.question,
         outcomes: market.outcomes,
@@ -1607,6 +2826,7 @@ export class PolymarketService implements OnModuleInit {
         .onConflictDoUpdate({
           target: schema.polymarketMarkets.marketId,
           set: {
+            eventSlug: match.event.slug,
             outcomePrices: market.outcomePrices.map(String),
             liquidity: String(match.event.liquidity),
             volume: String(match.event.volume),
@@ -1653,17 +2873,37 @@ export class PolymarketService implements OnModuleInit {
 
   // ─── Query helpers ──────────────────────────────────────────────────
 
-  async getOpenPositionsSummary(): Promise<
+  async getOpenPositionsSummary(filters?: { date?: string }): Promise<
     Array<{
       outcomeName: string;
       fixtureId?: number;
       leagueId?: number;
       positionSizeUsd: number;
+      polymarketUrl?: string;
+      fixtureDate?: string;
+      homeTeamName?: string;
+      awayTeamName?: string;
+      entryPrice?: number;
+      edgePercent?: number;
+      confidence?: number;
+      createdAt?: Date;
     }>
   > {
-    const isLive =
-      this.config.get<string>('POLYMARKET_LIVE_TRADING') === 'true';
-    const mode = isLive ? 'live' : 'paper';
+    const tradingCfg = await this.getTradingConfig();
+    const mode = tradingCfg.liveTradingEnabled ? 'live' : 'paper';
+
+    const conditions: any[] = [
+      eq(schema.polymarketTrades.mode, mode),
+      eq(schema.polymarketTrades.status, 'open'),
+    ];
+
+    // Date filter on fixture match date
+    if (filters?.date) {
+      const startOfDay = new Date(`${filters.date}T00:00:00Z`);
+      const endOfDay = new Date(`${filters.date}T23:59:59Z`);
+      conditions.push(gte(schema.fixtures.date, startOfDay));
+      conditions.push(lte(schema.fixtures.date, endOfDay));
+    }
 
     const trades = await this.db
       .select({
@@ -1671,20 +2911,70 @@ export class PolymarketService implements OnModuleInit {
         fixtureId: schema.polymarketTrades.fixtureId,
         leagueId: schema.polymarketTrades.leagueId,
         positionSizeUsd: schema.polymarketTrades.positionSizeUsd,
+        entryPrice: schema.polymarketTrades.entryPrice,
+        edgePercent: schema.polymarketTrades.edgePercent,
+        confidenceAtEntry: schema.polymarketTrades.confidenceAtEntry,
+        createdAt: schema.polymarketTrades.createdAt,
+        eventSlug: schema.polymarketMarkets.eventSlug,
+        fixtureDate: schema.fixtures.date,
+        homeTeamName: schema.teams.name,
       })
       .from(schema.polymarketTrades)
-      .where(
-        and(
-          eq(schema.polymarketTrades.mode, mode),
-          eq(schema.polymarketTrades.status, 'open'),
+      .innerJoin(
+        schema.polymarketMarkets,
+        eq(
+          schema.polymarketTrades.polymarketMarketId,
+          schema.polymarketMarkets.id,
         ),
-      );
+      )
+      .leftJoin(
+        schema.fixtures,
+        eq(schema.polymarketTrades.fixtureId, schema.fixtures.id),
+      )
+      .leftJoin(schema.teams, eq(schema.fixtures.homeTeamId, schema.teams.id))
+      .where(and(...conditions));
+
+    // Need away team name too — get it in a second pass to avoid double join on teams
+    const fixtureIds: number[] = [
+      ...new Set(
+        trades.map((t: any) => t.fixtureId).filter(Boolean) as number[],
+      ),
+    ];
+
+    const awayTeamMap = new Map<number, string>();
+    if (fixtureIds.length > 0) {
+      const awayRows = await this.db
+        .select({
+          fixtureId: schema.fixtures.id,
+          awayTeamName: schema.teams.name,
+        })
+        .from(schema.fixtures)
+        .innerJoin(
+          schema.teams,
+          eq(schema.fixtures.awayTeamId, schema.teams.id),
+        )
+        .where(inArray(schema.fixtures.id, fixtureIds));
+
+      for (const row of awayRows) {
+        awayTeamMap.set(row.fixtureId, row.awayTeamName);
+      }
+    }
 
     return trades.map((t: any) => ({
       outcomeName: t.outcomeName,
       fixtureId: t.fixtureId ?? undefined,
       leagueId: t.leagueId ?? undefined,
       positionSizeUsd: Number(t.positionSizeUsd),
+      entryPrice: t.entryPrice ? Number(t.entryPrice) : undefined,
+      edgePercent: t.edgePercent ? Number(t.edgePercent) : undefined,
+      confidence: t.confidenceAtEntry ?? undefined,
+      fixtureDate: t.fixtureDate?.toISOString?.() ?? undefined,
+      homeTeamName: t.homeTeamName ?? undefined,
+      awayTeamName: t.fixtureId ? awayTeamMap.get(t.fixtureId) : undefined,
+      createdAt: t.createdAt ?? undefined,
+      polymarketUrl: t.eventSlug
+        ? `https://polymarket.com/event/${t.eventSlug}`
+        : undefined,
     }));
   }
 
@@ -1745,15 +3035,53 @@ export class PolymarketService implements OnModuleInit {
   }
 
   async getMarkets(filters?: {
+    // State
     active?: boolean;
+    closed?: boolean;
+    acceptingOrders?: boolean;
     matched?: boolean;
+    hasTradeOnly?: boolean;
+    // Classification
+    marketType?: string;
+    leagueId?: number;
+    leagueName?: string;
+    teamId?: number;
+    teamName?: string;
+    season?: number;
+    fixtureId?: number;
+    // Dates
+    month?: number;
+    year?: number;
+    startFrom?: string;
+    startTo?: string;
+    // Liquidity / volume
+    minLiquidity?: number;
+    minVolume?: number;
+    // Text search
+    search?: string;
+    eventId?: string;
+    slug?: string;
+    // Sorting & pagination
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
     limit?: number;
+    offset?: number;
   }): Promise<any[]> {
     const limit = filters?.limit ?? 50;
+    const offset = filters?.offset ?? 0;
     const conditions: any[] = [];
 
+    // ── State filters ─────────────────────────────────────────────
     if (filters?.active !== undefined) {
       conditions.push(eq(schema.polymarketMarkets.active, filters.active));
+    }
+    if (filters?.closed !== undefined) {
+      conditions.push(eq(schema.polymarketMarkets.closed, filters.closed));
+    }
+    if (filters?.acceptingOrders !== undefined) {
+      conditions.push(
+        eq(schema.polymarketMarkets.acceptingOrders, filters.acceptingOrders),
+      );
     }
     if (filters?.matched === true) {
       conditions.push(
@@ -1765,14 +3093,136 @@ export class PolymarketService implements OnModuleInit {
       conditions.push(isNull(schema.polymarketMarkets.teamId));
     }
 
+    // ── Classification filters ────────────────────────────────────
+    if (filters?.marketType) {
+      conditions.push(
+        eq(schema.polymarketMarkets.marketType, filters.marketType),
+      );
+    }
+    if (filters?.leagueId) {
+      conditions.push(eq(schema.polymarketMarkets.leagueId, filters.leagueId));
+    }
+    if (filters?.leagueName) {
+      conditions.push(
+        sql`LOWER(${schema.polymarketMarkets.leagueName}) LIKE ${`%${filters.leagueName.toLowerCase()}%`}`,
+      );
+    }
+    if (filters?.teamId) {
+      conditions.push(eq(schema.polymarketMarkets.teamId, filters.teamId));
+    }
+    if (filters?.teamName) {
+      conditions.push(
+        sql`LOWER(${schema.polymarketMarkets.teamName}) LIKE ${`%${filters.teamName.toLowerCase()}%`}`,
+      );
+    }
+    if (filters?.season) {
+      conditions.push(eq(schema.polymarketMarkets.season, filters.season));
+    }
+    if (filters?.fixtureId) {
+      conditions.push(
+        eq(schema.polymarketMarkets.fixtureId, filters.fixtureId),
+      );
+    }
+
+    // ── Date filters ──────────────────────────────────────────────
+    if (filters?.month && filters?.year) {
+      const monthStart = new Date(filters.year, filters.month - 1, 1);
+      const monthEnd = new Date(filters.year, filters.month, 1);
+      conditions.push(gte(schema.polymarketMarkets.startDate, monthStart));
+      conditions.push(lte(schema.polymarketMarkets.startDate, monthEnd));
+    } else if (filters?.year) {
+      const yearStart = new Date(filters.year, 0, 1);
+      const yearEnd = new Date(filters.year + 1, 0, 1);
+      conditions.push(gte(schema.polymarketMarkets.startDate, yearStart));
+      conditions.push(lte(schema.polymarketMarkets.startDate, yearEnd));
+    }
+    if (filters?.startFrom) {
+      conditions.push(
+        gte(schema.polymarketMarkets.startDate, new Date(filters.startFrom)),
+      );
+    }
+    if (filters?.startTo) {
+      conditions.push(
+        lte(schema.polymarketMarkets.startDate, new Date(filters.startTo)),
+      );
+    }
+
+    // ── Liquidity / volume filters ────────────────────────────────
+    if (filters?.minLiquidity) {
+      conditions.push(
+        gte(schema.polymarketMarkets.liquidity, String(filters.minLiquidity)),
+      );
+    }
+    if (filters?.minVolume) {
+      conditions.push(
+        gte(schema.polymarketMarkets.volume, String(filters.minVolume)),
+      );
+    }
+
+    // ── Text search ───────────────────────────────────────────────
+    if (filters?.search) {
+      const term = `%${filters.search.toLowerCase()}%`;
+      conditions.push(
+        sql`(LOWER(${schema.polymarketMarkets.eventTitle}) LIKE ${term} OR LOWER(${schema.polymarketMarkets.marketQuestion}) LIKE ${term})`,
+      );
+    }
+    if (filters?.eventId) {
+      conditions.push(eq(schema.polymarketMarkets.eventId, filters.eventId));
+    }
+    if (filters?.slug) {
+      conditions.push(
+        sql`LOWER(${schema.polymarketMarkets.slug}) LIKE ${`%${filters.slug.toLowerCase()}%`}`,
+      );
+    }
+
+    // ── Build WHERE clause ────────────────────────────────────────
     const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // ── Sorting ───────────────────────────────────────────────────
+    const sortDirection = filters?.sortOrder === 'asc' ? asc : desc;
+    const sortColumnMap: Record<string, any> = {
+      lastSyncedAt: schema.polymarketMarkets.lastSyncedAt,
+      volume: schema.polymarketMarkets.volume,
+      liquidity: schema.polymarketMarkets.liquidity,
+      volume24hr: schema.polymarketMarkets.volume24hr,
+      startDate: schema.polymarketMarkets.startDate,
+      createdAt: schema.polymarketMarkets.createdAt,
+      matchScore: schema.polymarketMarkets.matchScore,
+    };
+    const sortColumn =
+      sortColumnMap[filters?.sortBy ?? ''] ??
+      schema.polymarketMarkets.lastSyncedAt;
+    const orderBy = sortDirection(sortColumn);
+
+    // ── If hasTradeOnly, join with trades table ───────────────────
+    if (filters?.hasTradeOnly) {
+      const rows = await this.db
+        .selectDistinctOn([schema.polymarketMarkets.id], {
+          market: schema.polymarketMarkets,
+        })
+        .from(schema.polymarketMarkets)
+        .innerJoin(
+          schema.polymarketTrades,
+          eq(
+            schema.polymarketTrades.polymarketMarketId,
+            schema.polymarketMarkets.id,
+          ),
+        )
+        .where(where)
+        .orderBy(schema.polymarketMarkets.id, orderBy)
+        .limit(limit)
+        .offset(offset);
+
+      return rows.map((r: any) => r.market);
+    }
 
     return this.db
       .select()
       .from(schema.polymarketMarkets)
       .where(where)
-      .orderBy(desc(schema.polymarketMarkets.lastSyncedAt))
-      .limit(limit);
+      .orderBy(orderBy)
+      .limit(limit)
+      .offset(offset);
   }
 
   // ─── Trades by month ────────────────────────────────────────────────
@@ -1868,17 +3318,23 @@ export class PolymarketService implements OnModuleInit {
   // ─── Deduplication ───────────────────────────────────────────────────
 
   /**
-   * Find and remove duplicate open trades.
+   * Find and remove duplicate/conflicting open trades.
    *
-   * A duplicate is defined as: same polymarket_market_id + same outcome_index + same status('open').
-   * Keeps the oldest trade (lowest ID) and deletes the rest.
+   * Catches three types of problems:
+   *   1. Same market + same outcome (exact duplicates)
+   *   2. Same market + opposite outcome (betting Yes AND No — guaranteed loss)
+   *   3. Same fixture across different markets (duplicate exposure)
+   *
+   * For each group, keeps the trade with the highest edge (best value).
    * Freed position value is returned to the bankroll.
    */
   async deduplicateTrades(): Promise<{
     duplicatesFound: number;
     deleted: number;
+    cancelledOrders: number;
     freedAmount: number;
     details: Array<{
+      reason: string;
       keptTradeId: number;
       deletedTradeIds: number[];
       outcomeName: string;
@@ -1886,8 +3342,6 @@ export class PolymarketService implements OnModuleInit {
       freedAmount: number;
     }>;
   }> {
-    // Find all open trades grouped by (polymarket_market_id, outcome_index)
-    // where count > 1
     const allOpenTrades = await this.db
       .select({
         trade: schema.polymarketTrades,
@@ -1902,27 +3356,13 @@ export class PolymarketService implements OnModuleInit {
         ),
       )
       .where(eq(schema.polymarketTrades.status, 'open'))
-      .orderBy(
-        asc(schema.polymarketTrades.polymarketMarketId),
-        asc(schema.polymarketTrades.outcomeIndex),
-        asc(schema.polymarketTrades.id), // Oldest first
-      );
+      .orderBy(asc(schema.polymarketTrades.id));
 
-    // Group by (polymarket_market_id, outcome_index)
-    const groups = new Map<string, Array<{ trade: any; market: any }>>();
+    // Track which trade IDs have already been marked for deletion
+    const toDelete = new Set<number>();
 
-    for (const row of allOpenTrades) {
-      const key = `${row.trade.polymarketMarketId}_${row.trade.outcomeIndex}`;
-      if (!groups.has(key)) {
-        groups.set(key, []);
-      }
-      groups.get(key)!.push(row);
-    }
-
-    let duplicatesFound = 0;
-    let deleted = 0;
-    let totalFreed = 0;
     const details: Array<{
+      reason: string;
       keptTradeId: number;
       deletedTradeIds: number[];
       outcomeName: string;
@@ -1933,48 +3373,140 @@ export class PolymarketService implements OnModuleInit {
     // Track freed amount per bankroll mode
     const freedByMode: Record<string, number> = {};
 
-    for (const [, rows] of groups) {
-      if (rows.length <= 1) continue;
-
-      duplicatesFound += rows.length - 1;
-
-      // Keep the first (oldest by ID), delete the rest
-      const keep = rows[0];
-      const dupes = rows.slice(1);
-
+    const markForDeletion = (
+      keep: { trade: any; market: any },
+      dupes: Array<{ trade: any; market: any }>,
+      reason: string,
+    ) => {
       let groupFreed = 0;
       const deletedIds: number[] = [];
 
       for (const dupe of dupes) {
+        if (toDelete.has(dupe.trade.id)) continue; // Already scheduled
+        toDelete.add(dupe.trade.id);
+
         const posSize = Number(dupe.trade.positionSizeUsd);
         groupFreed += posSize;
+        deletedIds.push(dupe.trade.id);
 
         const dupeMode = dupe.trade.mode;
         freedByMode[dupeMode] = (freedByMode[dupeMode] || 0) + posSize;
-
-        await this.db
-          .delete(schema.polymarketTrades)
-          .where(eq(schema.polymarketTrades.id, dupe.trade.id));
-
-        deletedIds.push(dupe.trade.id);
-        deleted++;
       }
 
-      totalFreed += groupFreed;
+      if (deletedIds.length > 0) {
+        details.push({
+          reason,
+          keptTradeId: keep.trade.id,
+          deletedTradeIds: deletedIds,
+          outcomeName: keep.trade.outcomeName,
+          marketQuestion: keep.market.marketQuestion,
+          freedAmount: Number(groupFreed.toFixed(2)),
+        });
+      }
+    };
 
-      details.push({
-        keptTradeId: keep.trade.id,
-        deletedTradeIds: deletedIds,
-        outcomeName: keep.trade.outcomeName,
-        marketQuestion: keep.market.marketQuestion,
-        freedAmount: Number(groupFreed.toFixed(2)),
-      });
-
-      this.logger.log(
-        `Dedup: kept trade #${keep.trade.id}, deleted ${deletedIds.join(', ')} ` +
-          `(${keep.trade.outcomeName}) — freed $${groupFreed.toFixed(2)}`,
-      );
+    // ── Pass 1: Same market, same outcome (exact duplicates) ──
+    const byMarketOutcome = new Map<
+      string,
+      Array<{ trade: any; market: any }>
+    >();
+    for (const row of allOpenTrades) {
+      const key = `${row.trade.polymarketMarketId}_${row.trade.outcomeIndex}`;
+      if (!byMarketOutcome.has(key)) byMarketOutcome.set(key, []);
+      byMarketOutcome.get(key)!.push(row);
     }
+
+    for (const [, rows] of byMarketOutcome) {
+      if (rows.length <= 1) continue;
+      // Keep highest edge
+      rows.sort(
+        (a, b) =>
+          Number(b.trade.edgePercent ?? 0) - Number(a.trade.edgePercent ?? 0),
+      );
+      markForDeletion(rows[0], rows.slice(1), 'exact_duplicate');
+    }
+
+    // ── Pass 2: Same market, opposite outcome (Yes + No) ──
+    const byMarket = new Map<string, Array<{ trade: any; market: any }>>();
+    for (const row of allOpenTrades) {
+      if (toDelete.has(row.trade.id)) continue;
+      const key = `${row.trade.polymarketMarketId}`;
+      if (!byMarket.has(key)) byMarket.set(key, []);
+      byMarket.get(key)!.push(row);
+    }
+
+    for (const [, rows] of byMarket) {
+      if (rows.length <= 1) continue;
+      // Multiple outcomes on the same market — keep highest edge, delete others
+      rows.sort(
+        (a, b) =>
+          Number(b.trade.edgePercent ?? 0) - Number(a.trade.edgePercent ?? 0),
+      );
+      markForDeletion(rows[0], rows.slice(1), 'opposite_side');
+    }
+
+    // ── Pass 3: Same fixture, different markets (multi-market exposure) ──
+    const byFixture = new Map<number, Array<{ trade: any; market: any }>>();
+    for (const row of allOpenTrades) {
+      if (toDelete.has(row.trade.id)) continue;
+      const fId = row.trade.fixtureId;
+      if (!fId) continue;
+      if (!byFixture.has(fId)) byFixture.set(fId, []);
+      byFixture.get(fId)!.push(row);
+    }
+
+    for (const [, rows] of byFixture) {
+      if (rows.length <= 1) continue;
+      // Multiple markets for the same fixture — keep highest edge, delete others
+      rows.sort(
+        (a, b) =>
+          Number(b.trade.edgePercent ?? 0) - Number(a.trade.edgePercent ?? 0),
+      );
+      markForDeletion(rows[0], rows.slice(1), 'multi_market_fixture');
+    }
+
+    // ── Execute deletions ──
+    // For live trades with a CLOB order, attempt to cancel the order first.
+    // If the order already filled, the tokens remain in the wallet — we log
+    // a warning but still remove the DB record to fix the bookkeeping.
+    let deleted = 0;
+    let cancelledOrders = 0;
+    let totalFreed = 0;
+
+    for (const id of toDelete) {
+      const tradeRow = allOpenTrades.find((r) => r.trade.id === id);
+
+      if (tradeRow?.trade.mode === 'live' && tradeRow.trade.orderId) {
+        try {
+          const cancelled = await this.clobService.cancelOrder(
+            tradeRow.trade.orderId,
+          );
+          if (cancelled) {
+            cancelledOrders++;
+            this.logger.log(
+              `Cancelled CLOB order ${tradeRow.trade.orderId} for trade #${id}`,
+            );
+          } else {
+            this.logger.warn(
+              `Could not cancel CLOB order ${tradeRow.trade.orderId} for trade #${id} — may already be filled. ` +
+                `Tokens may remain in wallet. Removing DB record anyway.`,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Error cancelling CLOB order ${tradeRow.trade.orderId} for trade #${id}: ${error.message}. ` +
+              `Removing DB record anyway.`,
+          );
+        }
+      }
+
+      await this.db
+        .delete(schema.polymarketTrades)
+        .where(eq(schema.polymarketTrades.id, id));
+      deleted++;
+    }
+
+    totalFreed = Object.values(freedByMode).reduce((sum, val) => sum + val, 0);
 
     // Return freed amounts to bankrolls
     for (const [mode, freed] of Object.entries(freedByMode)) {
@@ -1983,14 +3515,18 @@ export class PolymarketService implements OnModuleInit {
           ? await this.getOrCreateLiveBankroll()
           : await this.getOrCreateBankroll();
 
+      // Count how many deleted trades belong to this mode
+      const deletedCountForMode = allOpenTrades.filter(
+        (row) => toDelete.has(row.trade.id) && row.trade.mode === mode,
+      ).length;
+
       await this.db
         .update(schema.polymarketBankroll)
         .set({
           currentBalance: String(Number(bankroll.currentBalance) + freed),
           openPositionsCount: Math.max(
             0,
-            bankroll.openPositionsCount -
-              details.reduce((sum, d) => sum + d.deletedTradeIds.length, 0),
+            bankroll.openPositionsCount - deletedCountForMode,
           ),
           openPositionsValue: String(
             Math.max(0, Number(bankroll.openPositionsValue) - freed),
@@ -2002,15 +3538,16 @@ export class PolymarketService implements OnModuleInit {
 
     if (deleted > 0) {
       this.logger.log(
-        `Deduplication complete: ${deleted} duplicates deleted, $${totalFreed.toFixed(2)} freed`,
+        `Deduplication complete: ${deleted} trades deleted, $${totalFreed.toFixed(2)} freed`,
       );
     } else {
-      this.logger.log('No duplicates found');
+      this.logger.log('No duplicates or conflicts found');
     }
 
     return {
-      duplicatesFound,
+      duplicatesFound: toDelete.size,
       deleted,
+      cancelledOrders,
       freedAmount: Number(totalFreed.toFixed(2)),
       details,
     };
@@ -2909,6 +4446,7 @@ export class PolymarketService implements OnModuleInit {
           side: 'BUY',
           price: limitPrice,
           size: tokensToReceive,
+          conditionId: market.conditionId ?? undefined,
         });
 
         if (!orderResult) {
@@ -3172,7 +4710,8 @@ export class PolymarketService implements OnModuleInit {
 
     if (existing.length > 0) return existing[0];
 
-    const budget = this.config.get<number>('POLYMARKET_BUDGET') || 500;
+    const tradingCfg = await this.getTradingConfig();
+    const budget = tradingCfg.defaultBudget;
 
     const [created] = await this.db
       .insert(schema.polymarketBankroll)

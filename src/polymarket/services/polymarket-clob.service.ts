@@ -1,21 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
+import { Wallet } from 'ethers';
 import axios, { AxiosInstance } from 'axios';
 
 export interface ClobPrice {
   tokenId: string;
   buy: number;
   sell: number;
-}
-
-export interface ClobMidpoint {
-  tokenId: string;
-  mid: number;
-}
-
-export interface ClobSpread {
-  tokenId: string;
-  spread: number;
 }
 
 export interface OrderBookLevel {
@@ -56,42 +48,143 @@ export interface MarketPricingSnapshot {
  * PolymarketClobService
  *
  * Client for Polymarket's CLOB API — prices, orderbook, and order placement.
- * Read-only operations require no authentication.
- * Order placement requires API key/secret/passphrase.
+ * Read-only operations use direct HTTP (no auth needed).
+ * Order placement uses the official @polymarket/clob-client SDK with wallet signing.
+ *
+ * Required env vars for live trading:
+ * - POLYMARKET_PRIVATE_KEY: Hex private key of the trading wallet
+ * - POLYMARKET_API_KEY: API key (from createOrDeriveApiKey)
+ * - POLYMARKET_API_SECRET: API secret
+ * - POLYMARKET_API_PASSPHRASE: API passphrase
+ * - POLYMARKET_FUNDER_ADDRESS: The Polymarket proxy wallet address (funder)
+ * - POLYMARKET_SIGNATURE_TYPE: 0 (EOA), 1 (POLY_PROXY), or 2 (GNOSIS_SAFE) — default 2
  */
 @Injectable()
-export class PolymarketClobService {
+export class PolymarketClobService implements OnModuleInit {
   private readonly logger = new Logger(PolymarketClobService.name);
-  private readonly client: AxiosInstance;
-  private readonly hasCredentials: boolean;
+
+  /** Direct HTTP client for read-only endpoints (no auth) */
+  private readonly httpClient: AxiosInstance;
+
+  /** Official SDK client for authenticated trading */
+  private clobClient: ClobClient | null = null;
+  private hasCredentials = false;
+  private initPromise: Promise<void> | null = null;
+
+  private readonly host: string;
+  private readonly chainId = 137; // Polygon mainnet
 
   constructor(private readonly config: ConfigService) {
-    const baseURL =
+    this.host =
       this.config.get<string>('POLYMARKET_CLOB_URL') ||
       'https://clob.polymarket.com';
 
-    this.client = axios.create({
-      baseURL,
+    this.httpClient = axios.create({
+      baseURL: this.host,
       timeout: 10_000,
       headers: { 'Content-Type': 'application/json' },
     });
+  }
 
-    this.hasCredentials = !!(
-      this.config.get<string>('POLYMARKET_API_KEY') &&
-      this.config.get<string>('POLYMARKET_API_SECRET') &&
-      this.config.get<string>('POLYMARKET_API_PASSPHRASE')
+  async onModuleInit() {
+    await this.initializeClobClient();
+  }
+
+  /**
+   * Ensures the CLOB client is initialized before use.
+   * Handles the case where the service is constructed outside NestJS DI
+   * (e.g. Trigger.dev workers) where onModuleInit is never called.
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.clobClient) return; // Already initialized
+    if (this.initPromise) return this.initPromise; // Init in progress
+    this.initPromise = this.initializeClobClient();
+    await this.initPromise;
+  }
+
+  /**
+   * Initialize the authenticated ClobClient using the official SDK.
+   * Called once on NestJS module init, and must be called manually
+   * when constructing the service outside NestJS DI (e.g. Trigger.dev workers).
+   */
+  async initializeClobClient(): Promise<void> {
+    const privateKey = this.config.get<string>('POLYMARKET_PRIVATE_KEY');
+    const apiKey = this.config.get<string>('POLYMARKET_API_KEY');
+    const apiSecret = this.config.get<string>('POLYMARKET_API_SECRET');
+    const passphrase = this.config.get<string>('POLYMARKET_API_PASSPHRASE');
+    const funderAddress = this.config.get<string>('POLYMARKET_FUNDER_ADDRESS');
+    const sigType = Number(
+      this.config.get<string>('POLYMARKET_SIGNATURE_TYPE') ?? '2',
     );
 
-    if (this.hasCredentials) {
-      this.logger.log('CLOB API credentials detected — live trading available');
-    } else {
+    if (!privateKey) {
       this.logger.log(
-        'No CLOB API credentials — read-only mode (paper trading)',
+        'No POLYMARKET_PRIVATE_KEY — read-only mode (paper trading only)',
       );
+      return;
+    }
+
+    try {
+      const signer = new Wallet(privateKey);
+
+      if (apiKey && apiSecret && passphrase) {
+        // Use existing API credentials
+        // SDK's ApiKeyCreds uses "key" not "apiKey"
+        this.clobClient = new ClobClient(
+          this.host,
+          this.chainId,
+          signer,
+          { key: apiKey, secret: apiSecret, passphrase },
+          sigType,
+          funderAddress || signer.address,
+        );
+        this.hasCredentials = true;
+        this.logger.log(
+          `CLOB client initialized with existing credentials (sigType=${sigType}, funder=${funderAddress || signer.address})`,
+        );
+      } else {
+        // Derive API credentials from private key
+        this.logger.log('Deriving API credentials from private key...');
+        const tempClient = new ClobClient(this.host, this.chainId, signer);
+        // createOrDeriveApiKey returns { apiKey, secret, passphrase } at runtime
+        // but the TS types say ApiKeyCreds { key, secret, passphrase }
+        const rawCreds: any = await tempClient.createOrDeriveApiKey();
+        const derivedKey = rawCreds.apiKey ?? rawCreds.key;
+
+        const creds = {
+          key: derivedKey,
+          secret: rawCreds.secret,
+          passphrase: rawCreds.passphrase,
+        };
+
+        this.clobClient = new ClobClient(
+          this.host,
+          this.chainId,
+          signer,
+          creds,
+          sigType,
+          funderAddress || signer.address,
+        );
+        this.hasCredentials = true;
+
+        this.logger.log(
+          `CLOB client initialized with derived credentials — ` +
+            `apiKey=${derivedKey}, sigType=${sigType}`,
+        );
+        this.logger.log(
+          `Save these to .env to skip derivation next time:\n` +
+            `  POLYMARKET_API_KEY=${derivedKey}\n` +
+            `  POLYMARKET_API_SECRET=${rawCreds.secret}\n` +
+            `  POLYMARKET_API_PASSPHRASE=${rawCreds.passphrase}`,
+        );
+      }
+    } catch (error) {
+      this.logger.error(`Failed to initialize CLOB client: ${error.message}`);
+      this.logger.warn('Falling back to read-only mode');
     }
   }
 
-  // ─── Read-only endpoints (no auth) ──────────────────────────────────
+  // ─── Read-only endpoints (no auth, direct HTTP) ─────────────────────
 
   /**
    * Get current buy/sell prices for a token.
@@ -99,10 +192,10 @@ export class PolymarketClobService {
   async getPrice(tokenId: string): Promise<ClobPrice | null> {
     try {
       const [buyRes, sellRes] = await Promise.all([
-        this.client.get('/price', {
+        this.httpClient.get('/price', {
           params: { token_id: tokenId, side: 'buy' },
         }),
-        this.client.get('/price', {
+        this.httpClient.get('/price', {
           params: { token_id: tokenId, side: 'sell' },
         }),
       ]);
@@ -121,11 +214,11 @@ export class PolymarketClobService {
   }
 
   /**
-   * Get midpoint price (average of best bid and ask) — the most accurate probability estimate.
+   * Get midpoint price (average of best bid and ask).
    */
   async getMidpoint(tokenId: string): Promise<number | null> {
     try {
-      const response = await this.client.get('/midpoint', {
+      const response = await this.httpClient.get('/midpoint', {
         params: { token_id: tokenId },
       });
       return Number(response.data?.mid) || null;
@@ -138,11 +231,11 @@ export class PolymarketClobService {
   }
 
   /**
-   * Get bid-ask spread — indicator of liquidity quality.
+   * Get bid-ask spread.
    */
   async getSpread(tokenId: string): Promise<number | null> {
     try {
-      const response = await this.client.get('/spread', {
+      const response = await this.httpClient.get('/spread', {
         params: { token_id: tokenId },
       });
       return Number(response.data?.spread) || null;
@@ -159,7 +252,7 @@ export class PolymarketClobService {
    */
   async getOrderBook(tokenId: string): Promise<ClobOrderBook | null> {
     try {
-      const response = await this.client.get('/book', {
+      const response = await this.httpClient.get('/book', {
         params: { token_id: tokenId },
       });
 
@@ -187,7 +280,7 @@ export class PolymarketClobService {
     fidelity: 1 | 5 | 15 | 60 | 1440 = 60,
   ): Promise<PriceHistoryPoint[]> {
     try {
-      const response = await this.client.get('/prices-history', {
+      const response = await this.httpClient.get('/prices-history', {
         params: { market: conditionId, interval, fidelity },
       });
       return response.data?.history ?? [];
@@ -200,8 +293,7 @@ export class PolymarketClobService {
   }
 
   /**
-   * Get a complete pricing snapshot for a market — everything needed for a trading decision.
-   * Fetches midpoint, prices, spread, and order book in parallel.
+   * Get a complete pricing snapshot for a market.
    */
   async getMarketPricingSnapshot(
     tokenId: string,
@@ -219,13 +311,11 @@ export class PolymarketClobService {
       const sprd = spread.status === 'fulfilled' ? spread.value : null;
       const bookData = book.status === 'fulfilled' ? book.value : null;
 
-      // Need at least a midpoint to be useful
       if (mid == null && priceData == null) return null;
 
       const effectiveMid =
         mid ?? (priceData ? (priceData.buy + priceData.sell) / 2 : 0);
 
-      // Calculate book depth
       const totalBidSize = bookData
         ? bookData.bids.reduce((sum, b) => sum + Number(b.size), 0)
         : 0;
@@ -270,7 +360,6 @@ export class PolymarketClobService {
   ): Promise<Map<string, MarketPricingSnapshot>> {
     const results = new Map<string, MarketPricingSnapshot>();
 
-    // Process in batches of 10 to avoid overwhelming the API
     const batchSize = 10;
     for (let i = 0; i < tokenIds.length; i += batchSize) {
       const batch = tokenIds.slice(i, i + batchSize);
@@ -289,74 +378,86 @@ export class PolymarketClobService {
     return results;
   }
 
-  // ─── Authenticated endpoints (for live trading) ─────────────────────
+  // ─── Authenticated endpoints (via official SDK) ─────────────────────
 
   /**
-   * Get authentication headers for CLOB API requests.
-   * Uses HMAC-based auth with API key/secret/passphrase.
-   */
-  private getAuthHeaders(): Record<string, string> {
-    const apiKey = this.config.get<string>('POLYMARKET_API_KEY');
-    const apiSecret = this.config.get<string>('POLYMARKET_API_SECRET');
-    const passphrase = this.config.get<string>('POLYMARKET_API_PASSPHRASE');
-
-    if (!apiKey || !apiSecret || !passphrase) {
-      throw new Error(
-        'Polymarket API credentials not configured — cannot place orders',
-      );
-    }
-
-    // The Polymarket CLOB API uses these headers for authentication
-    return {
-      POLY_API_KEY: apiKey,
-      POLY_SECRET: apiSecret,
-      POLY_PASSPHRASE: passphrase,
-    };
-  }
-
-  /**
-   * Place a limit order on the CLOB.
-   * Only works in live trading mode with valid credentials.
+   * Place a limit order on the CLOB using the official SDK.
+   * Handles order signing, tick size, and negRisk automatically.
    */
   async placeLimitOrder(params: {
     tokenId: string;
     side: 'BUY' | 'SELL';
     price: number; // 0-1
     size: number; // Number of tokens
+    conditionId?: string; // Needed to look up tick size + negRisk
+    negRisk?: boolean;
   }): Promise<{ orderId: string; status: string } | null> {
-    if (!this.hasCredentials) {
-      this.logger.warn('Cannot place order — no API credentials configured');
+    // Lazy-initialize if running outside NestJS DI (e.g. Trigger.dev worker)
+    await this.ensureInitialized();
+
+    if (!this.clobClient || !this.hasCredentials) {
+      this.logger.warn(
+        'Cannot place order — CLOB client not initialized (missing POLYMARKET_PRIVATE_KEY)',
+      );
       return null;
     }
 
     try {
-      const response = await this.client.post(
-        '/order',
+      // Get tick size and negRisk from the market if conditionId provided
+      let tickSize = '0.01';
+      let negRisk = params.negRisk ?? false;
+
+      if (params.conditionId) {
+        try {
+          const market = await this.clobClient.getMarket(params.conditionId);
+          if (market) {
+            tickSize = String((market as any).minimum_tick_size || '0.01');
+            negRisk = (market as any).neg_risk ?? negRisk;
+          }
+        } catch {
+          // Fall back to defaults
+          this.logger.debug(
+            `Could not fetch market details for ${params.conditionId} — using tick_size=${tickSize}`,
+          );
+        }
+      }
+
+      // Round price to tick size
+      const tickNum = Number(tickSize);
+      const roundedPrice = Math.round(params.price / tickNum) * tickNum;
+
+      this.logger.log(
+        `Placing order: ${params.side} ${params.size.toFixed(2)} tokens @ ${roundedPrice.toFixed(4)} ` +
+          `(tickSize=${tickSize}, negRisk=${negRisk})`,
+      );
+
+      const response = await this.clobClient.createAndPostOrder(
         {
           tokenID: params.tokenId,
-          side: params.side,
-          price: params.price.toFixed(2),
-          size: params.size.toFixed(2),
-          type: 'GTC', // Good Till Cancelled
+          price: roundedPrice,
+          size: params.size,
+          side: params.side === 'BUY' ? Side.BUY : Side.SELL,
         },
         {
-          headers: this.getAuthHeaders(),
+          tickSize: tickSize as any,
+          negRisk,
         },
+        OrderType.GTC,
       );
 
-      const data = response.data;
+      const orderId = (response as any)?.orderID ?? '';
+      const status = (response as any)?.status ?? 'unknown';
+
       this.logger.log(
-        `Order placed: ${params.side} ${params.size} tokens @ ${params.price} — ID: ${data?.orderID}`,
+        `Order placed: ${params.side} ${params.size.toFixed(2)} tokens @ ${roundedPrice.toFixed(4)} — ` +
+          `ID: ${orderId}, status: ${status}`,
       );
 
-      return {
-        orderId: data?.orderID ?? '',
-        status: data?.status ?? 'unknown',
-      };
+      return { orderId, status };
     } catch (error) {
       this.logger.error(
         `Failed to place order: ${error.message}`,
-        error.response?.data,
+        error.response?.data ?? error.stack,
       );
       return null;
     }
@@ -366,12 +467,11 @@ export class PolymarketClobService {
    * Cancel an existing order.
    */
   async cancelOrder(orderId: string): Promise<boolean> {
-    if (!this.hasCredentials) return false;
+    await this.ensureInitialized();
+    if (!this.clobClient || !this.hasCredentials) return false;
 
     try {
-      await this.client.delete(`/order/${orderId}`, {
-        headers: this.getAuthHeaders(),
-      });
+      await this.clobClient.cancelOrder({ orderID: orderId });
       this.logger.log(`Order cancelled: ${orderId}`);
       return true;
     } catch (error) {
@@ -384,17 +484,52 @@ export class PolymarketClobService {
    * Get open orders for the authenticated user.
    */
   async getOpenOrders(): Promise<any[]> {
-    if (!this.hasCredentials) return [];
+    await this.ensureInitialized();
+    if (!this.clobClient || !this.hasCredentials) return [];
 
     try {
-      const response = await this.client.get('/orders', {
-        headers: this.getAuthHeaders(),
-        params: { status: 'live' },
-      });
-      return response.data ?? [];
+      const orders = await this.clobClient.getOpenOrders();
+      return orders ?? [];
     } catch (error) {
       this.logger.warn(`Failed to get open orders: ${error.message}`);
       return [];
+    }
+  }
+
+  /**
+   * Get the USDC collateral balance on Polymarket via the CLOB SDK.
+   * Uses the authenticated getBalanceAllowance endpoint — no raw RPC needed.
+   * Returns the balance in USD, or null if not authenticated.
+   */
+  async getWalletBalance(): Promise<number | null> {
+    await this.ensureInitialized();
+
+    if (!this.clobClient || !this.hasCredentials) {
+      this.logger.warn(
+        'Cannot check wallet balance — CLOB client not initialized (missing credentials)',
+      );
+      return null;
+    }
+
+    try {
+      const result = await this.clobClient.getBalanceAllowance({
+        asset_type: 'COLLATERAL' as any,
+      });
+
+      const rawBalance = Number(result?.balance ?? 0);
+
+      // Polymarket API returns balance in raw USDC units (6 decimals).
+      // If the value is suspiciously large (> 100k), it's in micro-units.
+      // Otherwise, it's already human-readable.
+      const balance = rawBalance > 100_000 ? rawBalance / 1e6 : rawBalance;
+
+      this.logger.log(
+        `Polymarket USDC balance: $${balance.toFixed(2)} (raw: ${rawBalance})`,
+      );
+      return balance;
+    } catch (error) {
+      this.logger.error(`Failed to get Polymarket balance: ${error.message}`);
+      return null;
     }
   }
 }

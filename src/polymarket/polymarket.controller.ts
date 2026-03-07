@@ -1,4 +1,12 @@
-import { Controller, Get, Post, Query, Body, Logger } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Patch,
+  Query,
+  Body,
+  Logger,
+} from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
@@ -8,7 +16,10 @@ import {
 } from '@nestjs/swagger';
 import { Roles } from '../auth/roles.decorator';
 import { PolymarketService } from './polymarket.service';
-import { polymarketScanTask } from '../trigger/polymarket-scan';
+import {
+  polymarketScanTask,
+  polymarketTradeTask,
+} from '../trigger/polymarket-scan';
 
 @ApiTags('Polymarket Trading Agent')
 @ApiBearerAuth('firebase-auth')
@@ -27,8 +38,120 @@ export class PolymarketController {
     return this.polymarketService.getPerformanceSummary();
   }
 
+  @Get('config')
+  @ApiOperation({
+    summary: 'Get current Polymarket trading configuration',
+    description:
+      'Returns all trading parameters (DB values override env defaults). ' +
+      'Includes edge thresholds, position sizing, risk management, budget settings, and wallet balance.',
+  })
+  async getConfig() {
+    const [config, walletBalance] = await Promise.all([
+      this.polymarketService.getTradingConfig(),
+      this.polymarketService.getWalletBalance(),
+    ]);
+    return {
+      ...config,
+      walletBalance,
+      walletBalanceFormatted:
+        walletBalance !== null ? `$${walletBalance.toFixed(2)} USDC` : null,
+    };
+  }
+
+  @Roles('admin')
+  @Patch('config')
+  @ApiOperation({
+    summary: '[Admin] Update Polymarket trading configuration',
+    description:
+      'Partially update trading parameters. Only provided fields are changed. ' +
+      'Values are persisted to the database and take effect immediately (overrides env vars).',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        liveTradingEnabled: {
+          type: 'boolean',
+          description:
+            'Enable/disable live trading (true = real CLOB orders, false = paper mode)',
+          example: true,
+        },
+        minEdge: {
+          type: 'number',
+          description:
+            'Minimum edge (as decimal) required to consider a trade. 0.05 = 5%',
+          example: 0.05,
+        },
+        minLiquidity: {
+          type: 'number',
+          description: 'Minimum market liquidity in USD to consider trading',
+          example: 1000,
+        },
+        minConfidence: {
+          type: 'integer',
+          description: 'Minimum prediction confidence (1-10) required to trade',
+          example: 6,
+        },
+        kellyFraction: {
+          type: 'number',
+          description:
+            'Kelly criterion fraction for position sizing. 0.25 = quarter-Kelly (conservative)',
+          example: 0.25,
+        },
+        maxPositionPct: {
+          type: 'number',
+          description:
+            'Maximum position size as fraction of bankroll. 0.10 = 10% max per trade',
+          example: 0.1,
+        },
+        stopLossPct: {
+          type: 'number',
+          description:
+            'Stop-loss threshold as fraction of initial budget. 0.30 = stop when balance drops to 30%',
+          example: 0.3,
+        },
+        targetMultiplier: {
+          type: 'number',
+          description:
+            'Target return multiplier on initial budget. 3 = aim for 3x return',
+          example: 3,
+        },
+        maxConsecutiveLosses: {
+          type: 'integer',
+          description:
+            'Stop trading after this many consecutive losing trades. Set to 0 to disable. Default: 5',
+          example: 10,
+        },
+        defaultBudget: {
+          type: 'number',
+          description:
+            'Budget in USD for the trading agent. Updates the active bankroll immediately.',
+          example: 500,
+        },
+      },
+    },
+  })
+  async updateConfig(
+    @Body()
+    body: Partial<{
+      liveTradingEnabled: boolean;
+      minEdge: number;
+      minLiquidity: number;
+      minConfidence: number;
+      kellyFraction: number;
+      maxPositionPct: number;
+      stopLossPct: number;
+      targetMultiplier: number;
+      maxConsecutiveLosses: number;
+      defaultBudget: number;
+    }>,
+  ) {
+    return this.polymarketService.updateTradingConfig(body);
+  }
+
   @Get('markets')
   @ApiOperation({ summary: 'Get discovered Polymarket soccer markets' })
+  // ── State filters ───────────────────────────────────────────────
   @ApiQuery({
     name: 'active',
     required: false,
@@ -36,10 +159,144 @@ export class PolymarketController {
     description: 'Filter by active markets',
   })
   @ApiQuery({
+    name: 'closed',
+    required: false,
+    type: Boolean,
+    description: 'Filter by closed/open markets',
+  })
+  @ApiQuery({
+    name: 'acceptingOrders',
+    required: false,
+    type: Boolean,
+    description: 'Filter by markets currently accepting orders',
+  })
+  @ApiQuery({
     name: 'matched',
     required: false,
     type: Boolean,
-    description: 'Filter by matched/unmatched to fixtures',
+    description: 'Filter by matched/unmatched to internal data',
+  })
+  @ApiQuery({
+    name: 'hasTradeOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only return markets that have at least one trade placed',
+  })
+  // ── Classification filters ──────────────────────────────────────
+  @ApiQuery({
+    name: 'marketType',
+    required: false,
+    type: String,
+    description:
+      'Market type: match_outcome, league_winner, tournament_winner, qualification, top_4, player_prop, other',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by API-Football league ID (e.g. 39 = Premier League)',
+  })
+  @ApiQuery({
+    name: 'leagueName',
+    required: false,
+    type: String,
+    description: 'Filter by league name (partial match, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'teamId',
+    required: false,
+    type: Number,
+    description: 'Filter by internal team ID',
+  })
+  @ApiQuery({
+    name: 'teamName',
+    required: false,
+    type: String,
+    description: 'Filter by team name (partial match, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'season',
+    required: false,
+    type: Number,
+    description: 'Filter by season year (e.g. 2025)',
+  })
+  @ApiQuery({
+    name: 'fixtureId',
+    required: false,
+    type: Number,
+    description: 'Filter by linked fixture ID',
+  })
+  // ── Date filters ────────────────────────────────────────────────
+  @ApiQuery({
+    name: 'month',
+    required: false,
+    type: Number,
+    description: 'Filter by market start date month (1-12)',
+  })
+  @ApiQuery({
+    name: 'year',
+    required: false,
+    type: Number,
+    description: 'Filter by market start date year (e.g. 2026)',
+  })
+  @ApiQuery({
+    name: 'startFrom',
+    required: false,
+    type: String,
+    description: 'Markets starting from this date (ISO 8601, e.g. 2026-03-01)',
+  })
+  @ApiQuery({
+    name: 'startTo',
+    required: false,
+    type: String,
+    description:
+      'Markets starting before this date (ISO 8601, e.g. 2026-03-31)',
+  })
+  // ── Liquidity / volume filters ──────────────────────────────────
+  @ApiQuery({
+    name: 'minLiquidity',
+    required: false,
+    type: Number,
+    description: 'Minimum liquidity in USD',
+  })
+  @ApiQuery({
+    name: 'minVolume',
+    required: false,
+    type: Number,
+    description: 'Minimum total volume in USD',
+  })
+  // ── Text search ─────────────────────────────────────────────────
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    type: String,
+    description: 'Search event title and market question (case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'eventId',
+    required: false,
+    type: String,
+    description: 'Filter by Polymarket event ID',
+  })
+  @ApiQuery({
+    name: 'slug',
+    required: false,
+    type: String,
+    description: 'Filter by market slug (partial match)',
+  })
+  // ── Sorting & pagination ────────────────────────────────────────
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    type: String,
+    description:
+      'Sort field: lastSyncedAt (default), volume, liquidity, volume24hr, startDate, createdAt, matchScore',
+  })
+  @ApiQuery({
+    name: 'sortOrder',
+    required: false,
+    type: String,
+    description: 'Sort direction: desc (default) or asc',
   })
   @ApiQuery({
     name: 'limit',
@@ -47,15 +304,78 @@ export class PolymarketController {
     type: Number,
     description: 'Max markets to return (default: 50)',
   })
+  @ApiQuery({
+    name: 'offset',
+    required: false,
+    type: Number,
+    description: 'Offset for pagination (default: 0)',
+  })
   async getMarkets(
+    // State
     @Query('active') active?: string,
+    @Query('closed') closed?: string,
+    @Query('acceptingOrders') acceptingOrders?: string,
     @Query('matched') matched?: string,
+    @Query('hasTradeOnly') hasTradeOnly?: string,
+    // Classification
+    @Query('marketType') marketType?: string,
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('teamId') teamId?: string,
+    @Query('teamName') teamName?: string,
+    @Query('season') season?: string,
+    @Query('fixtureId') fixtureId?: string,
+    // Dates
+    @Query('month') month?: string,
+    @Query('year') year?: string,
+    @Query('startFrom') startFrom?: string,
+    @Query('startTo') startTo?: string,
+    // Liquidity / volume
+    @Query('minLiquidity') minLiquidity?: string,
+    @Query('minVolume') minVolume?: string,
+    // Text search
+    @Query('search') search?: string,
+    @Query('eventId') eventId?: string,
+    @Query('slug') slug?: string,
+    // Sorting & pagination
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: string,
     @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
   ) {
     const markets = await this.polymarketService.getMarkets({
+      // State
       active: active !== undefined ? active === 'true' : undefined,
+      closed: closed !== undefined ? closed === 'true' : undefined,
+      acceptingOrders:
+        acceptingOrders !== undefined ? acceptingOrders === 'true' : undefined,
       matched: matched !== undefined ? matched === 'true' : undefined,
+      hasTradeOnly: hasTradeOnly === 'true' || undefined,
+      // Classification
+      marketType: marketType || undefined,
+      leagueId: leagueId ? Number(leagueId) : undefined,
+      leagueName: leagueName || undefined,
+      teamId: teamId ? Number(teamId) : undefined,
+      teamName: teamName || undefined,
+      season: season ? Number(season) : undefined,
+      fixtureId: fixtureId ? Number(fixtureId) : undefined,
+      // Dates
+      month: month ? Number(month) : undefined,
+      year: year ? Number(year) : undefined,
+      startFrom: startFrom || undefined,
+      startTo: startTo || undefined,
+      // Liquidity / volume
+      minLiquidity: minLiquidity ? Number(minLiquidity) : undefined,
+      minVolume: minVolume ? Number(minVolume) : undefined,
+      // Text search
+      search: search || undefined,
+      eventId: eventId || undefined,
+      slug: slug || undefined,
+      // Sorting & pagination
+      sortBy: sortBy || undefined,
+      sortOrder: (sortOrder as 'asc' | 'desc') || undefined,
       limit: limit ? Number(limit) : undefined,
+      offset: offset ? Number(offset) : undefined,
     });
 
     return {
@@ -93,9 +413,22 @@ export class PolymarketController {
   }
 
   @Get('open-positions')
-  @ApiOperation({ summary: 'Get current open positions' })
-  async getOpenPositions() {
-    const positions = await this.polymarketService.getOpenPositionsSummary();
+  @ApiOperation({
+    summary: 'Get current open positions',
+    description:
+      'Returns all open trades. Optionally filter by fixture match date.',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    type: String,
+    description:
+      'Filter by fixture match date (YYYY-MM-DD). If omitted, returns all open positions.',
+  })
+  async getOpenPositions(@Query('date') date?: string) {
+    const positions = await this.polymarketService.getOpenPositionsSummary({
+      date: date || undefined,
+    });
     return {
       data: positions,
       count: positions.length,
@@ -120,6 +453,37 @@ export class PolymarketController {
     };
   }
 
+  @Post('trade')
+  @ApiOperation({
+    summary:
+      '[Admin] Trigger a Polymarket trading cycle — prediction-first, runs in-process',
+  })
+  @ApiQuery({
+    name: 'async',
+    required: false,
+    description:
+      'If true, dispatches to Trigger.dev worker and returns immediately. Default: false (runs in-process).',
+  })
+  async triggerTrade(@Query('async') async?: string) {
+    this.logger.log('Triggering Polymarket trading cycle via API');
+
+    if (async === 'true') {
+      const handle = await polymarketTradeTask.trigger(undefined as void);
+      return {
+        message: 'Polymarket trading cycle dispatched to Trigger.dev (async)',
+        taskRunId: handle.id,
+      };
+    }
+
+    // Run in-process for immediate feedback
+    const result = await this.polymarketService.runTradingCycle();
+
+    return {
+      message: 'Polymarket trading cycle complete',
+      ...result,
+    };
+  }
+
   @Roles('admin')
   @Post('resolve')
   @ApiOperation({
@@ -132,6 +496,64 @@ export class PolymarketController {
 
     return {
       message: `Resolved ${result.resolved} trades`,
+      ...result,
+    };
+  }
+
+  @Roles('admin')
+  @Post('trades/manual')
+  @ApiOperation({
+    summary:
+      '[Admin] Manually place a trade on a Polymarket market — bypasses AI agent and all gates',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['marketId', 'outcomeIndex', 'outcomeName', 'positionSizeUsd'],
+      properties: {
+        marketId: {
+          type: 'number',
+          description:
+            'Our internal polymarket_markets.id (NOT the Polymarket market ID string)',
+        },
+        outcomeIndex: {
+          type: 'number',
+          description: 'Outcome index (0 or 1 for binary, 0-2 for moneyline)',
+        },
+        outcomeName: {
+          type: 'string',
+          description:
+            'Outcome name (e.g. "Yes", "No", "Arsenal", "Draw", "SC Braga")',
+        },
+        positionSizeUsd: {
+          type: 'number',
+          description: 'Position size in USD',
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Optional: your reasoning for this trade',
+        },
+      },
+    },
+  })
+  async placeManualTrade(
+    @Body()
+    body: {
+      marketId: number;
+      outcomeIndex: number;
+      outcomeName: string;
+      positionSizeUsd: number;
+      reasoning?: string;
+    },
+  ) {
+    this.logger.log(
+      `Manual trade: market=${body.marketId} outcome=${body.outcomeName} $${body.positionSizeUsd}`,
+    );
+
+    const result = await this.polymarketService.placeManualTrade(body);
+
+    return {
+      message: `Trade placed: ${body.outcomeName} $${body.positionSizeUsd}`,
       ...result,
     };
   }

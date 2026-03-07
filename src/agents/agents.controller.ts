@@ -24,6 +24,7 @@ import {
   resolvePredictionsTask,
   syncCompletedFixturesAndResolveTask,
 } from '../trigger/sync-and-resolve';
+import { rerunPredictionsTask } from '../trigger/rerun-predictions';
 
 @ApiTags('Predictions')
 @ApiBearerAuth('firebase-auth')
@@ -114,6 +115,260 @@ export class AgentsController {
       };
     }
     return feedback;
+  }
+
+  @Get('daily-breakdown')
+  @ApiOperation({
+    summary:
+      'Get a detailed breakdown of prediction performance for today or a given day',
+    description:
+      'Returns summary stats (total, correct, incorrect, pending, accuracy, avg confidence, avg Brier score), ' +
+      'a breakdown by predicted result (home_win, draw, away_win), and each individual prediction with ' +
+      'match info, predicted vs actual result, correctness, and a link to the Polymarket game if one exists.',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    type: String,
+    description: 'Date to get breakdown for (YYYY-MM-DD). Defaults to today.',
+  })
+  @ApiQuery({
+    name: 'day',
+    required: false,
+    type: String,
+    description: 'Alias for date (YYYY-MM-DD). Defaults to today.',
+  })
+  async getDailyBreakdown(
+    @Query('date') date?: string,
+    @Query('day') day?: string,
+  ) {
+    const target = date || day || undefined;
+    return this.agentsService.getDailyBreakdown(target);
+  }
+
+  @Get('today')
+  @ApiOperation({
+    summary: "Get predictions for today's football matches",
+    description:
+      'Returns predictions joined with fixture data, filtered by the actual match date (today). ' +
+      'Supports league, confidence, and resolution filters. ' +
+      'Each result includes the fixture, both teams, and the best prediction.',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by league ID',
+  })
+  @ApiQuery({
+    name: 'leagueName',
+    required: false,
+    type: String,
+    description: 'Filter by league name (partial, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'minConfidence',
+    required: false,
+    type: Number,
+    description: 'Minimum confidence threshold (1-10)',
+  })
+  @ApiQuery({
+    name: 'unresolved',
+    required: false,
+    type: String,
+    description: 'Only show unresolved predictions (true/false)',
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 50, max: 100)',
+  })
+  async getTodayPredictions(
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('minConfidence') minConfidence?: string,
+    @Query('unresolved') unresolved?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.agentsService.getPredictionsByMatchDate({
+      leagueId: leagueId ? Number(leagueId) : undefined,
+      leagueName: leagueName || undefined,
+      minConfidence: minConfidence ? Number(minConfidence) : undefined,
+      unresolved: unresolved === 'true',
+      page: page ? Number(page) : 1,
+      limit: limit ? Math.min(Number(limit), 100) : 50,
+    });
+  }
+
+  @Get('upcoming')
+  @ApiOperation({
+    summary: 'Get predictions for upcoming football matches',
+    description:
+      'Returns predictions for matches within a date range. Use `days` for a quick window ' +
+      '(e.g. days=2 = today + next 2 days), or `from`/`to` for a custom range. ' +
+      'Defaults to the next 7 days if no date params are provided.',
+  })
+  @ApiQuery({
+    name: 'days',
+    required: false,
+    type: Number,
+    description:
+      'Number of days ahead from today (e.g. 2 = today through 2 days from now). ' +
+      'Overridden by from/to if both are provided.',
+  })
+  @ApiQuery({
+    name: 'from',
+    required: false,
+    type: String,
+    description: 'Start date (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'to',
+    required: false,
+    type: String,
+    description: 'End date (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    type: String,
+    description: 'Single date (YYYY-MM-DD). Overridden by from/to or days.',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by league ID',
+  })
+  @ApiQuery({
+    name: 'leagueName',
+    required: false,
+    type: String,
+    description: 'Filter by league name (partial, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'minConfidence',
+    required: false,
+    type: Number,
+    description: 'Minimum confidence threshold (1-10)',
+  })
+  @ApiQuery({
+    name: 'unresolved',
+    required: false,
+    type: String,
+    description: 'Only show unresolved predictions (true/false)',
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 50, max: 100)',
+  })
+  async getUpcomingPredictions(
+    @Query('days') days?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('date') date?: string,
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('minConfidence') minConfidence?: string,
+    @Query('unresolved') unresolved?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.agentsService.getPredictionsByMatchDate({
+      days: days ? Number(days) : from || to || date ? undefined : 7,
+      from: from || undefined,
+      to: to || undefined,
+      date: date || undefined,
+      leagueId: leagueId ? Number(leagueId) : undefined,
+      leagueName: leagueName || undefined,
+      minConfidence: minConfidence ? Number(minConfidence) : undefined,
+      unresolved: unresolved === 'true',
+      page: page ? Number(page) : 1,
+      limit: limit ? Math.min(Number(limit), 100) : 50,
+    });
+  }
+
+  @Roles('admin')
+  @Post('rerun')
+  @ApiOperation({
+    summary:
+      '[Admin] Re-run predictions for all fixtures on a given date (overwrites existing predictions)',
+    description:
+      'Clears resolution data on existing predictions, then re-generates predictions ' +
+      'for every fixture on the specified date. Uses the upsert behaviour to overwrite. ' +
+      'Optionally scope to specific fixture IDs or a different prediction type.',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: true,
+    type: String,
+    description: 'Date to re-run predictions for (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['daily', 'pre_match', 'on_demand'],
+    description: 'Which prediction type to overwrite (defaults to daily)',
+  })
+  @ApiQuery({
+    name: 'fixtureIds',
+    required: false,
+    type: String,
+    description:
+      'Comma-separated fixture IDs to scope the re-run (e.g. 123,456). If omitted, all fixtures on the date are re-run.',
+  })
+  async rerunPredictions(
+    @Query('date') date: string,
+    @Query('type') type?: string,
+    @Query('fixtureIds') fixtureIds?: string,
+  ) {
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return {
+        error: 'A valid date query parameter is required (YYYY-MM-DD)',
+      };
+    }
+
+    const predictionType = (type as PredictionType) || 'daily';
+    const parsedFixtureIds = fixtureIds
+      ? fixtureIds
+          .split(',')
+          .map((id) => Number(id.trim()))
+          .filter((id) => !isNaN(id))
+      : undefined;
+
+    this.logger.log(
+      `Triggering prediction re-run for ${date} (type: ${predictionType}, fixtures: ${parsedFixtureIds?.length ?? 'all'})`,
+    );
+
+    const handle = await rerunPredictionsTask.trigger({
+      date,
+      predictionType,
+      fixtureIds: parsedFixtureIds,
+    });
+
+    return {
+      message: `Prediction re-run triggered for ${date}`,
+      taskRunId: handle.id,
+      date,
+      predictionType,
+      fixtureIds: parsedFixtureIds ?? 'all',
+    };
   }
 
   @Get(':fixtureId')
