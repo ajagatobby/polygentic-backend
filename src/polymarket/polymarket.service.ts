@@ -349,28 +349,19 @@ export class PolymarketService implements OnModuleInit {
         ? Math.max(0, (newPeakBalance - totalPortfolioValue) / newPeakBalance)
         : 0;
 
-    // If the budget change means we're above the stop-loss threshold, clear the stop
-    const tradingConfig = await this.getTradingConfig();
-    const portfolioRatio = newBudget > 0 ? totalPortfolioValue / newBudget : 1;
-    const shouldClearStop =
-      bankroll.isStopped && portfolioRatio >= tradingConfig.stopLossPct;
-
+    // Always clear stop-loss on budget change and let updateBankrollSnapshot()
+    // re-evaluate with the current three-check logic on the next cycle.
+    // This prevents stale stop-loss flags from old formulas blocking trading.
     const updates: any = {
       initialBudget: String(newBudget),
       currentBalance: String(newCurrentBalance),
       totalDeposited: String(newBudget),
       peakBalance: String(newPeakBalance),
       currentDrawdownPct: String(newDrawdownPct),
+      isStopped: false,
+      stoppedReason: null,
       updatedAt: new Date(),
     };
-
-    if (shouldClearStop) {
-      updates.isStopped = false;
-      updates.stoppedReason = null;
-      this.logger.log(
-        `Budget change cleared stop-loss (portfolio at ${(portfolioRatio * 100).toFixed(1)}% of new budget)`,
-      );
-    }
 
     await this.db
       .update(schema.polymarketBankroll)
