@@ -116,6 +116,164 @@ export class AgentsController {
     return feedback;
   }
 
+  @Get('today')
+  @ApiOperation({
+    summary: "Get predictions for today's football matches",
+    description:
+      'Returns predictions joined with fixture data, filtered by the actual match date (today). ' +
+      'Supports league, confidence, and resolution filters. ' +
+      'Each result includes the fixture, both teams, and the best prediction.',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by league ID',
+  })
+  @ApiQuery({
+    name: 'leagueName',
+    required: false,
+    type: String,
+    description: 'Filter by league name (partial, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'minConfidence',
+    required: false,
+    type: Number,
+    description: 'Minimum confidence threshold (1-10)',
+  })
+  @ApiQuery({
+    name: 'unresolved',
+    required: false,
+    type: String,
+    description: 'Only show unresolved predictions (true/false)',
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 50, max: 100)',
+  })
+  async getTodayPredictions(
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('minConfidence') minConfidence?: string,
+    @Query('unresolved') unresolved?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.agentsService.getPredictionsByMatchDate({
+      leagueId: leagueId ? Number(leagueId) : undefined,
+      leagueName: leagueName || undefined,
+      minConfidence: minConfidence ? Number(minConfidence) : undefined,
+      unresolved: unresolved === 'true',
+      page: page ? Number(page) : 1,
+      limit: limit ? Math.min(Number(limit), 100) : 50,
+    });
+  }
+
+  @Get('upcoming')
+  @ApiOperation({
+    summary: 'Get predictions for upcoming football matches',
+    description:
+      'Returns predictions for matches within a date range. Use `days` for a quick window ' +
+      '(e.g. days=2 = today + next 2 days), or `from`/`to` for a custom range. ' +
+      'Defaults to the next 7 days if no date params are provided.',
+  })
+  @ApiQuery({
+    name: 'days',
+    required: false,
+    type: Number,
+    description:
+      'Number of days ahead from today (e.g. 2 = today through 2 days from now). ' +
+      'Overridden by from/to if both are provided.',
+  })
+  @ApiQuery({
+    name: 'from',
+    required: false,
+    type: String,
+    description: 'Start date (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'to',
+    required: false,
+    type: String,
+    description: 'End date (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'date',
+    required: false,
+    type: String,
+    description: 'Single date (YYYY-MM-DD). Overridden by from/to or days.',
+  })
+  @ApiQuery({
+    name: 'leagueId',
+    required: false,
+    type: Number,
+    description: 'Filter by league ID',
+  })
+  @ApiQuery({
+    name: 'leagueName',
+    required: false,
+    type: String,
+    description: 'Filter by league name (partial, case-insensitive)',
+  })
+  @ApiQuery({
+    name: 'minConfidence',
+    required: false,
+    type: Number,
+    description: 'Minimum confidence threshold (1-10)',
+  })
+  @ApiQuery({
+    name: 'unresolved',
+    required: false,
+    type: String,
+    description: 'Only show unresolved predictions (true/false)',
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 50, max: 100)',
+  })
+  async getUpcomingPredictions(
+    @Query('days') days?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('date') date?: string,
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('minConfidence') minConfidence?: string,
+    @Query('unresolved') unresolved?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.agentsService.getPredictionsByMatchDate({
+      days: days ? Number(days) : from || to || date ? undefined : 7,
+      from: from || undefined,
+      to: to || undefined,
+      date: date || undefined,
+      leagueId: leagueId ? Number(leagueId) : undefined,
+      leagueName: leagueName || undefined,
+      minConfidence: minConfidence ? Number(minConfidence) : undefined,
+      unresolved: unresolved === 'true',
+      page: page ? Number(page) : 1,
+      limit: limit ? Math.min(Number(limit), 100) : 50,
+    });
+  }
+
   @Get(':fixtureId')
   @ApiOperation({ summary: 'Get predictions for a specific fixture' })
   @ApiParam({ name: 'fixtureId', type: Number })

@@ -542,6 +542,220 @@ export class AgentsService {
     };
   }
 
+  /**
+   * Get predictions for football fixtures by match date.
+   *
+   * Unlike `getPredictions` (which filters on `predictions.created_at`),
+   * this joins with `fixtures` and filters on the actual **match date**.
+   *
+   * Supports:
+   *  - Single date: `date` (YYYY-MM-DD, defaults to today)
+   *  - Date range:  `from` + `to` (YYYY-MM-DD)
+   *  - Shorthand:   `days` (e.g. 2 = today + next 2 days)
+   *
+   * For each fixture, picks the "best" prediction by priority:
+   * pre_match > daily > on_demand.
+   */
+  async getPredictionsByMatchDate(filters: {
+    date?: string;
+    from?: string;
+    to?: string;
+    days?: number;
+    leagueId?: number;
+    leagueName?: string;
+    minConfidence?: number;
+    unresolved?: boolean;
+    page?: number;
+    limit?: number;
+  }): Promise<{
+    data: any[];
+    total: number;
+    page: number;
+    limit: number;
+    dateRange: { from: string; to: string };
+  }> {
+    const page = filters.page || 1;
+    const limit = filters.limit || 50;
+    const offset = (page - 1) * limit;
+
+    // ── Resolve date range ──────────────────────────────────────────
+    let fromDate: Date;
+    let toDate: Date;
+
+    if (filters.from && filters.to) {
+      fromDate = new Date(`${filters.from}T00:00:00Z`);
+      toDate = new Date(`${filters.to}T23:59:59Z`);
+    } else if (filters.days != null) {
+      fromDate = new Date();
+      fromDate.setUTCHours(0, 0, 0, 0);
+      toDate = new Date(fromDate);
+      toDate.setUTCDate(toDate.getUTCDate() + filters.days);
+      toDate.setUTCHours(23, 59, 59, 999);
+    } else {
+      const dateStr = filters.date ?? new Date().toISOString().split('T')[0];
+      fromDate = new Date(`${dateStr}T00:00:00Z`);
+      toDate = new Date(`${dateStr}T23:59:59Z`);
+    }
+
+    // ── Build conditions ────────────────────────────────────────────
+    const conditions: any[] = [
+      gte(schema.fixtures.date, fromDate),
+      lte(schema.fixtures.date, toDate),
+    ];
+
+    if (filters.leagueId) {
+      conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+
+    if (filters.leagueName) {
+      conditions.push(
+        sql`${schema.fixtures.leagueName} ILIKE ${'%' + filters.leagueName + '%'}`,
+      );
+    }
+
+    if (filters.minConfidence) {
+      conditions.push(
+        sql`${schema.predictions.confidence} >= ${filters.minConfidence}`,
+      );
+    }
+
+    if (filters.unresolved) {
+      conditions.push(isNull(schema.predictions.resolvedAt));
+    }
+
+    const whereClause = and(...conditions);
+
+    // ── Query: predictions joined with fixtures and teams ───────────
+    const [rows, countResult] = await Promise.all([
+      this.db
+        .select({
+          prediction: schema.predictions,
+          fixtureId: schema.fixtures.id,
+          fixtureDate: schema.fixtures.date,
+          fixtureStatus: schema.fixtures.status,
+          fixtureStatusLong: schema.fixtures.statusLong,
+          leagueId: schema.fixtures.leagueId,
+          leagueName: schema.fixtures.leagueName,
+          leagueCountry: schema.fixtures.leagueCountry,
+          homeTeamId: schema.fixtures.homeTeamId,
+          awayTeamId: schema.fixtures.awayTeamId,
+          goalsHome: schema.fixtures.goalsHome,
+          goalsAway: schema.fixtures.goalsAway,
+        })
+        .from(schema.predictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.predictions.fixtureId, schema.fixtures.id),
+        )
+        .where(whereClause)
+        .orderBy(asc(schema.fixtures.date), desc(schema.predictions.createdAt))
+        .limit(limit)
+        .offset(offset),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.predictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.predictions.fixtureId, schema.fixtures.id),
+        )
+        .where(whereClause),
+    ]);
+
+    // ── Batch-fetch team names ──────────────────────────────────────
+    const teamIds = new Set<number>();
+    for (const row of rows) {
+      if (row.homeTeamId) teamIds.add(row.homeTeamId);
+      if (row.awayTeamId) teamIds.add(row.awayTeamId);
+    }
+
+    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    if (teamIds.size > 0) {
+      const teamRows = await this.db
+        .select({
+          id: schema.teams.id,
+          name: schema.teams.name,
+          logo: schema.teams.logo,
+        })
+        .from(schema.teams)
+        .where(
+          sql`${schema.teams.id} IN (${sql.join(
+            [...teamIds].map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        );
+
+      for (const t of teamRows) {
+        teamMap.set(t.id, { name: t.name, logo: t.logo });
+      }
+    }
+
+    // ── Shape response: group by fixture, pick best prediction ──────
+    const fixtureMap = new Map<number, any>();
+
+    for (const row of rows) {
+      const fId = row.fixtureId;
+
+      if (!fixtureMap.has(fId)) {
+        const homeTeam = teamMap.get(row.homeTeamId);
+        const awayTeam = teamMap.get(row.awayTeamId);
+
+        fixtureMap.set(fId, {
+          fixtureId: fId,
+          date: row.fixtureDate,
+          status: row.fixtureStatus,
+          statusLong: row.fixtureStatusLong,
+          league: {
+            id: row.leagueId,
+            name: row.leagueName,
+            country: row.leagueCountry,
+          },
+          homeTeam: homeTeam
+            ? { id: row.homeTeamId, ...homeTeam }
+            : { id: row.homeTeamId, name: null, logo: null },
+          awayTeam: awayTeam
+            ? { id: row.awayTeamId, ...awayTeam }
+            : { id: row.awayTeamId, name: null, logo: null },
+          goalsHome: row.goalsHome,
+          goalsAway: row.goalsAway,
+          prediction: null as any,
+          allPredictions: [] as any[],
+        });
+      }
+
+      const entry = fixtureMap.get(fId)!;
+      entry.allPredictions.push(row.prediction);
+    }
+
+    // Pick best prediction per fixture (pre_match > daily > on_demand)
+    const typePriority: Record<string, number> = {
+      pre_match: 0,
+      daily: 1,
+      on_demand: 2,
+    };
+
+    for (const entry of fixtureMap.values()) {
+      entry.allPredictions.sort(
+        (a: any, b: any) =>
+          (typePriority[a.predictionType] ?? 99) -
+          (typePriority[b.predictionType] ?? 99),
+      );
+      entry.prediction = entry.allPredictions[0] ?? null;
+    }
+
+    const data = Array.from(fixtureMap.values());
+
+    return {
+      data,
+      total: Number(countResult[0]?.count ?? 0),
+      page,
+      limit,
+      dateRange: {
+        from: fromDate.toISOString().split('T')[0],
+        to: toDate.toISOString().split('T')[0],
+      },
+    };
+  }
+
   async getPredictionByFixtureId(fixtureId: number): Promise<any[]> {
     const rows = await this.db
       .select()
