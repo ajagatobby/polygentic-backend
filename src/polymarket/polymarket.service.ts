@@ -362,8 +362,6 @@ export class PolymarketService implements OnModuleInit {
       INNER JOIN teams ht          ON ht.id = f.home_team_id
       INNER JOIN teams at          ON at.id = f.away_team_id
       INNER JOIN polymarket_markets pm ON pm.fixture_id = p.fixture_id
-      LEFT  JOIN polymarket_trades pt
-        ON pt.polymarket_market_id = pm.id AND pt.status = 'open'
       WHERE p.resolved_at IS NULL
         AND p.confidence >= ${minConfidence}
         AND f.status = 'NS'
@@ -372,7 +370,11 @@ export class PolymarketService implements OnModuleInit {
         AND pm.closed = false
         AND pm.accepting_orders = true
         AND CAST(pm.liquidity AS numeric) >= ${minLiquidity}
-        AND pt.id IS NULL
+        -- Exclude fixtures that already have ANY open trade (prevents opposite-side and multi-market duplicates)
+        AND NOT EXISTS (
+          SELECT 1 FROM polymarket_trades pt2
+          WHERE pt2.fixture_id = f.id AND pt2.status = 'open'
+        )
         -- Only moneyline markets — exclude types our model can't map
         AND pm.market_question NOT LIKE '%Exact Score%'
         AND pm.market_question NOT LIKE '%O/U%'
@@ -631,7 +633,7 @@ export class PolymarketService implements OnModuleInit {
       // Skip low-liquidity markets
       if (Number(match.event.liquidity) < minLiquidity) continue;
 
-      // Check if we already have an open trade for this market
+      // Check if we already have an open trade for this market or fixture
       const existingTrades = await this.db
         .select({ id: schema.polymarketTrades.id })
         .from(schema.polymarketTrades)
@@ -651,6 +653,24 @@ export class PolymarketService implements OnModuleInit {
         .limit(1);
 
       if (existingTrades.length > 0) continue;
+
+      // Also check by fixture to prevent duplicate exposure across different markets for the same match
+      const matchFixtureId =
+        'fixtureId' in match ? (match as any).fixtureId : null;
+      if (matchFixtureId) {
+        const existingFixtureTrades = await this.db
+          .select({ id: schema.polymarketTrades.id })
+          .from(schema.polymarketTrades)
+          .where(
+            and(
+              eq(schema.polymarketTrades.fixtureId, matchFixtureId),
+              eq(schema.polymarketTrades.status, 'open'),
+            ),
+          )
+          .limit(1);
+
+        if (existingFixtureTrades.length > 0) continue;
+      }
 
       if (match.marketType === 'match_outcome') {
         const candidate = await this.buildFixtureCandidate(
@@ -1564,24 +1584,47 @@ export class PolymarketService implements OnModuleInit {
       tradeValues.predictionId = candidate.prediction.id;
     }
 
-    // ── Duplicate guard: check right before insert (race condition defense) ──
-    const existingOpen = await this.db
+    // ── Duplicate guard: prevent any duplicate exposure on the same fixture or market ──
+    // Check 1: Same market (any outcome — prevents opposite-side betting Yes+No)
+    const existingMarketTrade = await this.db
       .select({ id: schema.polymarketTrades.id })
       .from(schema.polymarketTrades)
       .where(
         and(
           eq(schema.polymarketTrades.polymarketMarketId, marketRecord.id),
-          eq(schema.polymarketTrades.outcomeIndex, decision.outcomeIndex),
           eq(schema.polymarketTrades.status, 'open'),
         ),
       )
       .limit(1);
 
-    if (existingOpen.length > 0) {
+    if (existingMarketTrade.length > 0) {
       this.logger.warn(
-        `Duplicate guard: open trade #${existingOpen[0].id} already exists for market ${marketRecord.id} outcome ${decision.outcomeIndex} — skipping`,
+        `Duplicate guard: open trade #${existingMarketTrade[0].id} already exists for market ${marketRecord.id} — skipping`,
       );
       return false;
+    }
+
+    // Check 2: Same fixture via different market (prevents multi-market duplicate exposure)
+    const fixtureId =
+      candidate.type === 'fixture' ? candidate.match.fixtureId : null;
+    if (fixtureId) {
+      const existingFixtureTrade = await this.db
+        .select({ id: schema.polymarketTrades.id })
+        .from(schema.polymarketTrades)
+        .where(
+          and(
+            eq(schema.polymarketTrades.fixtureId, fixtureId),
+            eq(schema.polymarketTrades.status, 'open'),
+          ),
+        )
+        .limit(1);
+
+      if (existingFixtureTrade.length > 0) {
+        this.logger.warn(
+          `Duplicate guard: open trade #${existingFixtureTrade[0].id} already exists for fixture ${fixtureId} — skipping`,
+        );
+        return false;
+      }
     }
 
     await this.db.insert(schema.polymarketTrades).values(tradeValues);
