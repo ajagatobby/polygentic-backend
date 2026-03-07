@@ -1,4 +1,10 @@
-import { Injectable, Inject, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Inject,
+  Logger,
+  OnModuleInit,
+  BadRequestException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   eq,
@@ -231,6 +237,27 @@ export class PolymarketService implements OnModuleInit {
     const current = await this.getTradingConfig();
     const mode = current.liveTradingEnabled ? 'live' : 'paper';
 
+    // ── Validate defaultBudget against actual wallet balance ────────
+    if (updates.defaultBudget !== undefined && updates.defaultBudget > 0) {
+      const walletBalance = await this.clobService.getWalletBalance();
+
+      if (walletBalance === null) {
+        throw new BadRequestException(
+          'Unable to verify your Polymarket wallet balance. ' +
+            'Make sure POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS are configured correctly.',
+        );
+      }
+
+      if (updates.defaultBudget > walletBalance) {
+        throw new BadRequestException(
+          `Insufficient Polymarket wallet balance. ` +
+            `You want to set a budget of $${updates.defaultBudget.toFixed(2)}, ` +
+            `but your wallet only has $${walletBalance.toFixed(2)} USDC. ` +
+            `Please deposit more USDC to your Polymarket wallet or set a lower budget.`,
+        );
+      }
+    }
+
     // Build a full row: start from current values, overlay updates
     // This ensures the first insert has all fields populated
     const fullValues: any = {
@@ -283,6 +310,14 @@ export class PolymarketService implements OnModuleInit {
     this.configCache = null;
 
     return this.getTradingConfig();
+  }
+
+  /**
+   * Get the USDC balance of the Polymarket trading wallet.
+   * Passthrough to ClobService.
+   */
+  async getWalletBalance(): Promise<number | null> {
+    return this.clobService.getWalletBalance();
   }
 
   // ─── Main agent loop ────────────────────────────────────────────────

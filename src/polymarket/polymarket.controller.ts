@@ -43,10 +43,19 @@ export class PolymarketController {
     summary: 'Get current Polymarket trading configuration',
     description:
       'Returns all trading parameters (DB values override env defaults). ' +
-      'Includes edge thresholds, position sizing, risk management, and budget settings.',
+      'Includes edge thresholds, position sizing, risk management, budget settings, and wallet balance.',
   })
   async getConfig() {
-    return this.polymarketService.getTradingConfig();
+    const [config, walletBalance] = await Promise.all([
+      this.polymarketService.getTradingConfig(),
+      this.polymarketService.getWalletBalance(),
+    ]);
+    return {
+      ...config,
+      walletBalance,
+      walletBalanceFormatted:
+        walletBalance !== null ? `$${walletBalance.toFixed(2)} USDC` : null,
+    };
   }
 
   @Roles('admin')
