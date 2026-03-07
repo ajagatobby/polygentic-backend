@@ -599,6 +599,12 @@ export class PolymarketService implements OnModuleInit {
     // when there's no money to trade with. Other tasks (scan, sync, predictions)
     // are NOT affected — only the trading cycle is skipped.
     const MIN_TRADE_BALANCE = 1; // $1 minimum to even attempt trading
+
+    // Re-evaluate stop-loss with current three-check logic BEFORE reading the flag.
+    // This ensures stale stop-loss flags from old formulas get cleared if conditions
+    // no longer warrant a stop.
+    await this.updateBankrollSnapshot();
+
     let bankroll = await this.getOrCreateBankroll();
     if (bankroll.isStopped) {
       this.logger.warn(
