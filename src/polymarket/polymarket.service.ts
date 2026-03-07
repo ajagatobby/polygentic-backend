@@ -2493,23 +2493,105 @@ export class PolymarketService implements OnModuleInit {
     );
 
     const initialBudget = Number(bankroll.initialBudget);
+
+    // ── Portfolio valuation ──────────────────────────────────────────
+    //
+    // currentBalance = cash available (budget + realized P&L - money locked in open positions)
+    // totalPortfolioValue = cash + open positions (what the portfolio is actually worth)
+    //
+    // The old stop-loss only looked at currentBalance, which penalizes
+    // money that's simply locked in open bets. A proper stop-loss should
+    // consider the total portfolio value.
+
     const currentBalance = initialBudget + realizedPnl - openPositionsValue;
+    const totalPortfolioValue = currentBalance + openPositionsValue;
+
+    // ── Peak & drawdown tracking (based on total portfolio value) ────
     const peakBalance = Math.max(
       Number(bankroll.peakBalance ?? initialBudget),
-      currentBalance,
+      totalPortfolioValue,
     );
     const currentDrawdownPct =
-      peakBalance > 0 ? (peakBalance - currentBalance) / peakBalance : 0;
+      peakBalance > 0 ? (peakBalance - totalPortfolioValue) / peakBalance : 0;
     const maxDrawdownPct = Math.max(
       Number(bankroll.maxDrawdownPct ?? 0),
       currentDrawdownPct,
     );
 
-    const balanceRatio = currentBalance / initialBudget;
-    const isStopped = balanceRatio < stopLossPct;
-    const stoppedReason = isStopped
-      ? `Bankroll dropped to ${(balanceRatio * 100).toFixed(1)}% of initial budget (stop-loss at ${(stopLossPct * 100).toFixed(0)}%)`
-      : null;
+    // ── Stop-loss evaluation ─────────────────────────────────────────
+    //
+    // Three independent checks — ANY one triggers a stop:
+    //
+    // 1. REALIZED LOSS STOP: If confirmed losses (resolved trades) have
+    //    eaten through too much of the budget. This is money that's
+    //    actually gone — no chance of recovery.
+    //    Trigger: realizedPnl loss exceeds (1 - stopLossPct) of budget.
+    //
+    // 2. PORTFOLIO DRAWDOWN STOP: If the total portfolio value
+    //    (cash + open positions) drops below the threshold relative to
+    //    the peak. This is the standard peak-to-trough drawdown used
+    //    in professional trading.
+    //    Trigger: drawdown from peak exceeds (1 - stopLossPct).
+    //
+    // 3. CONSECUTIVE LOSS STOP: If the last N resolved trades are all
+    //    losses, the model may be fundamentally broken. Stop to prevent
+    //    further damage while the model is reviewed.
+    //    Trigger: 5+ consecutive losses.
+
+    const realizedLossRatio =
+      initialBudget > 0
+        ? Math.abs(Math.min(0, realizedPnl)) / initialBudget
+        : 0;
+    const maxAllowedLoss = 1 - stopLossPct; // e.g. stopLossPct=0.30 → max 70% loss
+
+    // Check 1: Realized loss stop
+    const realizedLossTriggered = realizedLossRatio > maxAllowedLoss;
+
+    // Check 2: Portfolio drawdown from peak
+    const portfolioRatio =
+      initialBudget > 0 ? totalPortfolioValue / initialBudget : 1;
+    const drawdownTriggered = portfolioRatio < stopLossPct;
+
+    // Check 3: Consecutive loss streak
+    const recentResolved = resolvedTrades
+      .sort(
+        (a: any, b: any) =>
+          new Date(b.resolvedAt).getTime() - new Date(a.resolvedAt).getTime(),
+      )
+      .slice(0, 10); // Last 10 resolved trades
+    let consecutiveLosses = 0;
+    for (const t of recentResolved) {
+      if ((t as any).resolutionOutcome === 'loss') {
+        consecutiveLosses++;
+      } else {
+        break;
+      }
+    }
+    const consecutiveLossTriggered = consecutiveLosses >= 5;
+
+    const isStopped =
+      realizedLossTriggered || drawdownTriggered || consecutiveLossTriggered;
+
+    let stoppedReason: string | null = null;
+    if (isStopped) {
+      const reasons: string[] = [];
+      if (realizedLossTriggered) {
+        reasons.push(
+          `Realized losses ($${Math.abs(realizedPnl).toFixed(2)}) exceeded ${(maxAllowedLoss * 100).toFixed(0)}% of budget`,
+        );
+      }
+      if (drawdownTriggered) {
+        reasons.push(
+          `Portfolio value ($${totalPortfolioValue.toFixed(2)}) dropped to ${(portfolioRatio * 100).toFixed(1)}% of budget (stop-loss at ${(stopLossPct * 100).toFixed(0)}%)`,
+        );
+      }
+      if (consecutiveLossTriggered) {
+        reasons.push(
+          `${consecutiveLosses} consecutive losing trades — model may need review`,
+        );
+      }
+      stoppedReason = reasons.join('; ');
+    }
 
     await this.db
       .update(schema.polymarketBankroll)
@@ -2535,6 +2617,14 @@ export class PolymarketService implements OnModuleInit {
 
     if (isStopped) {
       this.logger.warn(`STOP-LOSS TRIGGERED: ${stoppedReason}`);
+    } else {
+      this.logger.log(
+        `Bankroll snapshot: portfolio=$${totalPortfolioValue.toFixed(2)} ` +
+          `(cash=$${currentBalance.toFixed(2)} + open=$${openPositionsValue.toFixed(2)}), ` +
+          `realized P&L=$${realizedPnl.toFixed(2)}, drawdown=${(currentDrawdownPct * 100).toFixed(1)}%, ` +
+          `record=${winningTrades}W/${losingTrades}L` +
+          `${consecutiveLosses > 0 ? `, streak=${consecutiveLosses}L` : ''}`,
+      );
     }
   }
 
