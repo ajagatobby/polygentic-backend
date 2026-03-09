@@ -2204,29 +2204,15 @@ export class AgentsService {
     drawProb: number,
     awayProb: number,
   ): string {
-    const homeAwaySpread = Math.abs(homeProb - awayProb);
-
-    // Layer 1: Draw is the argmax — always respect it
+    // Simple argmax: the outcome with the highest probability wins.
+    // This is the most honest representation of what the model actually predicted.
+    //
+    // Previous logic had aggressive draw-bias thresholds (drawProb >= 0.30 → draw)
+    // that overrode cases where another outcome was clearly higher (e.g. away 37%
+    // vs draw 32%), causing correct predictions to be marked as wrong.
     if (drawProb >= homeProb && drawProb >= awayProb) {
       return 'draw';
     }
-
-    // Layer 2: Strong draw signal (>= 30%) — predict draw regardless of spread
-    if (drawProb >= 0.3) {
-      return 'draw';
-    }
-
-    // Layer 3: Good draw signal (>= 0.28) AND match is reasonably close
-    if (drawProb >= 0.28 && homeAwaySpread < 0.15) {
-      return 'draw';
-    }
-
-    // Layer 4: Moderate draw signal (>= 0.24) AND match is very tight
-    if (drawProb >= 0.24 && homeAwaySpread < 0.08) {
-      return 'draw';
-    }
-
-    // Layer 5: Pick the higher of home or away
     if (homeProb >= awayProb) return 'home_win';
     return 'away_win';
   }
