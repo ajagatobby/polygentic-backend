@@ -1212,6 +1212,7 @@ export class FootballService {
             .select({
               id: schema.teams.id,
               name: schema.teams.name,
+              shortName: schema.teams.shortName,
               logo: schema.teams.logo,
             })
             .from(schema.teams)
@@ -1232,6 +1233,7 @@ export class FootballService {
           coachName: schema.fixtureLineups.coachName,
           startXI: schema.fixtureLineups.startXI,
           substitutes: schema.fixtureLineups.substitutes,
+          teamColors: schema.fixtureLineups.teamColors,
         })
         .from(schema.fixtureLineups)
         .leftJoin(
@@ -1258,9 +1260,16 @@ export class FootballService {
         : [],
     ]);
 
-    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    const teamMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamRows) {
-      teamMap.set(t.id, { name: t.name, logo: t.logo });
+      teamMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     const lineupsByFixture = new Map<number, any[]>();
@@ -1284,12 +1293,22 @@ export class FootballService {
       const homeInjuries = injuriesByTeam.get(fixture.homeTeamId) ?? [];
       const awayInjuries = injuriesByTeam.get(fixture.awayTeamId) ?? [];
 
+      // Extract team colors from lineups if available
+      const homeLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.homeTeamId,
+      );
+      const awayLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.awayTeamId,
+      );
+
       return {
         ...fixture,
         homeTeam: {
           id: fixture.homeTeamId,
           name: homeTeam?.name ?? null,
+          shortName: homeTeam?.shortName ?? null,
           logo: homeTeam?.logo ?? null,
+          teamColors: homeLineup?.teamColors ?? null,
           injuries: homeInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1300,7 +1319,9 @@ export class FootballService {
         awayTeam: {
           id: fixture.awayTeamId,
           name: awayTeam?.name ?? null,
+          shortName: awayTeam?.shortName ?? null,
           logo: awayTeam?.logo ?? null,
+          teamColors: awayLineup?.teamColors ?? null,
           injuries: awayInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1475,6 +1496,7 @@ export class FootballService {
             .select({
               id: schema.teams.id,
               name: schema.teams.name,
+              shortName: schema.teams.shortName,
               logo: schema.teams.logo,
             })
             .from(schema.teams)
@@ -1528,9 +1550,16 @@ export class FootballService {
         : [],
     ]);
 
-    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    const teamMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamRows) {
-      teamMap.set(t.id, { name: t.name, logo: t.logo });
+      teamMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     // Group lineups by fixture ID
@@ -1566,6 +1595,14 @@ export class FootballService {
       const homeInjuries = injuriesByTeam.get(fixture.homeTeamId) ?? [];
       const awayInjuries = injuriesByTeam.get(fixture.awayTeamId) ?? [];
 
+      // Extract team colors from lineups if available
+      const homeLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.homeTeamId,
+      );
+      const awayLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.awayTeamId,
+      );
+
       // Pick the best prediction: prefer pre_match, then daily, then on_demand
       const bestPrediction =
         fixturePredictions.find((p: any) => p.predictionType === 'pre_match') ??
@@ -1594,7 +1631,9 @@ export class FootballService {
         homeTeam: {
           id: fixture.homeTeamId,
           name: homeTeam?.name ?? null,
+          shortName: homeTeam?.shortName ?? null,
           logo: homeTeam?.logo ?? null,
+          teamColors: homeLineup?.teamColors ?? null,
           injuries: homeInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1605,7 +1644,9 @@ export class FootballService {
         awayTeam: {
           id: fixture.awayTeamId,
           name: awayTeam?.name ?? null,
+          shortName: awayTeam?.shortName ?? null,
           logo: awayTeam?.logo ?? null,
+          teamColors: awayLineup?.teamColors ?? null,
           injuries: awayInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1735,6 +1776,7 @@ export class FootballService {
             .select({
               id: schema.teams.id,
               name: schema.teams.name,
+              shortName: schema.teams.shortName,
               logo: schema.teams.logo,
             })
             .from(schema.teams)
@@ -1760,13 +1802,28 @@ export class FootballService {
         : [],
     ]);
 
-    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    const teamMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamRows) {
-      teamMap.set(t.id, { name: t.name, logo: t.logo });
+      teamMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     const homeTeam = teamMap.get(fixture.homeTeamId);
     const awayTeam = teamMap.get(fixture.awayTeamId);
+
+    // Extract team colors from lineups if available
+    const homeLineup = lineups.find(
+      (l: any) => l.teamId === fixture.homeTeamId,
+    );
+    const awayLineup = lineups.find(
+      (l: any) => l.teamId === fixture.awayTeamId,
+    );
 
     // Split injuries by team
     const homeInjuries = injuries.filter(
@@ -1808,7 +1865,9 @@ export class FootballService {
       homeTeam: {
         id: fixture.homeTeamId,
         name: homeTeam?.name ?? null,
+        shortName: homeTeam?.shortName ?? null,
         logo: homeTeam?.logo ?? null,
+        teamColors: homeLineup?.teamColors ?? null,
         injuries: homeInjuries.map((inj: any) => ({
           playerId: inj.playerId,
           playerName: inj.playerName,
@@ -1819,7 +1878,9 @@ export class FootballService {
       awayTeam: {
         id: fixture.awayTeamId,
         name: awayTeam?.name ?? null,
+        shortName: awayTeam?.shortName ?? null,
         logo: awayTeam?.logo ?? null,
+        teamColors: awayLineup?.teamColors ?? null,
         injuries: awayInjuries.map((inj: any) => ({
           playerId: inj.playerId,
           playerName: inj.playerName,
@@ -2013,6 +2074,7 @@ export class FootballService {
       .select({
         id: schema.teams.id,
         name: schema.teams.name,
+        shortName: schema.teams.shortName,
         logo: schema.teams.logo,
       })
       .from(schema.teams)
@@ -2023,9 +2085,16 @@ export class FootballService {
         )})`,
       );
 
-    const nameMap = new Map<number, { name: string; logo: string | null }>();
+    const nameMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamNames) {
-      nameMap.set(t.id, { name: t.name, logo: t.logo });
+      nameMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     // Assemble match history

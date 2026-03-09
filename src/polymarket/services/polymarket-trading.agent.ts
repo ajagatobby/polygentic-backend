@@ -273,7 +273,7 @@ export class PolymarketTradingAgent {
       apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
     });
     this.model =
-      this.config.get<string>('PREDICTION_MODEL') || 'claude-sonnet-4-20250514';
+      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
   }
 
   /**
