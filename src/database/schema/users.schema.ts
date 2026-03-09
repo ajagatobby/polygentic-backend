@@ -13,6 +13,21 @@ import {
 
 export const userRoleEnum = pgEnum('user_role', ['user', 'admin']);
 
+// ─── Subscription enums ────────────────────────────────────────────────
+
+export const subscriptionTierEnum = pgEnum('subscription_tier', [
+  'free',
+  'pro',
+]);
+
+export const subscriptionStatusEnum = pgEnum('subscription_status', [
+  'none',
+  'active',
+  'canceled',
+  'past_due',
+  'trialing',
+]);
+
 // ─── users ─────────────────────────────────────────────────────────────
 
 export const users = pgTable(
@@ -34,6 +49,17 @@ export const users = pgTable(
 
     /** Tracks whether the account has been disabled by an admin */
     disabled: boolean('disabled').default(false).notNull(),
+
+    /** Subscription / billing */
+    subscriptionTier: subscriptionTierEnum('subscription_tier')
+      .default('free')
+      .notNull(),
+    stripeCustomerId: varchar('stripe_customer_id', { length: 255 }),
+    stripeSubscriptionId: varchar('stripe_subscription_id', { length: 255 }),
+    subscriptionStatus: subscriptionStatusEnum('subscription_status')
+      .default('none')
+      .notNull(),
+    subscriptionPeriodEnd: timestamp('subscription_period_end'),
 
     /** Usage tracking */
     requestCount: integer('request_count').default(0).notNull(),
