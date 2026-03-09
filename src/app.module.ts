@@ -13,6 +13,7 @@ import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
 import { UserThrottlerGuard } from './auth/user-throttler.guard';
 import { PolymarketModule } from './polymarket/polymarket.module';
+import { BillingModule } from './billing/billing.module';
 
 @Module({
   imports: [
@@ -51,6 +52,7 @@ import { PolymarketModule } from './polymarket/polymarket.module';
     SyncModule,
     HealthModule,
     PolymarketModule,
+    BillingModule,
   ],
   providers: [
     // Apply per-user rate limiting globally
