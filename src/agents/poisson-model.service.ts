@@ -39,14 +39,16 @@ export class PoissonModelService {
       const dataPoints = homeStats.matchCount + awayStats.matchCount;
 
       if (dataPoints < 6) {
-        // Not enough data for reliable Poisson model
+        // Not enough data for reliable Poisson model.
+        // Use league base rates (major European leagues average):
+        //   Home Win: ~45%, Draw: ~26%, Away Win: ~29%
         return {
-          homeWinProb: 0.4,
-          drawProb: 0.27,
-          awayWinProb: 0.33,
-          expectedHomeGoals: 1.3,
+          homeWinProb: 0.45,
+          drawProb: 0.26,
+          awayWinProb: 0.29,
+          expectedHomeGoals: 1.4,
           expectedAwayGoals: 1.1,
-          confidence: 0.1,
+          confidence: 0.15,
           dataPoints,
         };
       }
@@ -117,10 +119,19 @@ export class PoissonModelService {
       awayWinProb = awayWinProb / total;
 
       // Confidence based on data quality
-      // More matches + xG data available = higher confidence
-      const xgAvailable = homeStats.hasXG && awayStats.hasXG ? 0.3 : 0.0;
-      const matchCountFactor = Math.min(0.5, (dataPoints / 30) * 0.5);
-      const confidence = Math.min(0.9, xgAvailable + matchCountFactor + 0.1);
+      // Previous formula produced max ~0.45 for typical data, making Poisson
+      // nearly irrelevant in the ensemble. New formula is more generous
+      // because even limited xG data is more reliable than LLM guessing.
+      //
+      // Components (each 0-1 scale):
+      // - xG availability: 0.35 if both teams have xG, 0.15 if one does, 0 otherwise
+      // - Match count: scales from 0 to 0.45 (saturates at 20 matches)
+      // - Base: 0.2 (even basic Poisson is better than random)
+      const bothHaveXG = homeStats.hasXG && awayStats.hasXG;
+      const oneHasXG = (homeStats.hasXG || awayStats.hasXG) && !bothHaveXG;
+      const xgAvailable = bothHaveXG ? 0.35 : oneHasXG ? 0.15 : 0.0;
+      const matchCountFactor = Math.min(0.45, (dataPoints / 20) * 0.45);
+      const confidence = Math.min(0.95, xgAvailable + matchCountFactor + 0.2);
 
       this.logger.debug(
         `Poisson model: home=${homeTeamId} xG=${cappedHome.toFixed(2)}, ` +
@@ -139,12 +150,12 @@ export class PoissonModelService {
       };
     } catch (error) {
       this.logger.warn(`Poisson model failed: ${error.message}`);
-      // Return uniform-ish default
+      // Return league base rate defaults
       return {
-        homeWinProb: 0.4,
-        drawProb: 0.27,
-        awayWinProb: 0.33,
-        expectedHomeGoals: 1.3,
+        homeWinProb: 0.45,
+        drawProb: 0.26,
+        awayWinProb: 0.29,
+        expectedHomeGoals: 1.4,
         expectedAwayGoals: 1.1,
         confidence: 0,
         dataPoints: 0,
@@ -397,14 +408,19 @@ export class PoissonModelService {
    * Calculate the Dixon-Coles correlation parameter (rho).
    * Rho captures the dependency between low-scoring events.
    * Negative rho = more 0-0 and 1-1 than independent Poisson predicts.
+   *
+   * Research (Dixon & Coles 1997, Koopman & Lit 2015) shows rho
+   * typically ranges from -0.03 to -0.13 across European leagues.
+   * Using more precise estimates based on total expected goals.
    */
   private calculateRho(lambdaHome: number, lambdaAway: number): number {
-    // Empirical estimate: rho is typically between -0.1 and -0.2
-    // for most football leagues. More defensive leagues = more negative.
     const totalXG = lambdaHome + lambdaAway;
-    if (totalXG < 2.0) return -0.15; // Defensive game
-    if (totalXG > 3.5) return -0.05; // Attacking game
-    return -0.1; // Average
+    // Continuous rho estimation instead of discrete buckets
+    // At low xG (defensive), rho is more negative (stronger correction)
+    // At high xG (attacking), rho is less negative (Poisson fits better)
+    // Clamped to [-0.13, -0.03] based on empirical research
+    const rho = -0.13 + (totalXG - 1.5) * 0.025;
+    return Math.max(-0.13, Math.min(-0.03, rho));
   }
 
   /**

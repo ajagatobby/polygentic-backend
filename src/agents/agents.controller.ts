@@ -19,7 +19,10 @@ import { Roles } from '../auth/roles.decorator';
 import { AgentsService, PredictionType } from './agents.service';
 import { PredictionQueryDto } from './dto/prediction-query.dto';
 import { generatePredictionTask } from '../trigger/generate-prediction';
-import { generateDailyPredictionsTask } from '../trigger/generate-daily-predictions';
+import {
+  generateDailyPredictionsTask,
+  generateTodayPredictionsTask,
+} from '../trigger/generate-daily-predictions';
 import {
   resolvePredictionsTask,
   syncCompletedFixturesAndResolveTask,
@@ -425,10 +428,43 @@ export class AgentsController {
   }
 
   @Roles('admin')
+  @Post('generate-today')
+  @ApiOperation({
+    summary:
+      "[Admin] Generate predictions for today's fixtures only (runs as background task)",
+    description:
+      "Finds all fixtures scheduled for today (UTC) that don't have predictions yet " +
+      'and generates them. Use ?force=true to regenerate predictions even if they already exist.',
+  })
+  @ApiQuery({
+    name: 'force',
+    required: false,
+    type: String,
+    description:
+      'Force regenerate predictions even if they already exist (true/false, default: false)',
+  })
+  async generateTodayPredictions(@Query('force') force?: string) {
+    const forceFlag = force === 'true';
+    this.logger.log(
+      `Triggering today's prediction generation via API (force: ${forceFlag})`,
+    );
+
+    const handle = await generateTodayPredictionsTask.trigger({
+      force: forceFlag,
+    });
+
+    return {
+      message: "Today's prediction generation task triggered",
+      taskRunId: handle.id,
+      force: forceFlag,
+    };
+  }
+
+  @Roles('admin')
   @Post('generate-daily')
   @ApiOperation({
     summary:
-      '[Admin] Trigger daily predictions for all upcoming fixtures (runs as background task)',
+      '[Admin] Trigger daily predictions for all upcoming fixtures in the next 48h (runs as background task)',
   })
   async generateDailyPredictions() {
     this.logger.log('Triggering daily prediction generation via API');

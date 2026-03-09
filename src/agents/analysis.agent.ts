@@ -25,59 +25,151 @@ export interface ValueBet {
   edgePercent: number;
 }
 
-const SYSTEM_PROMPT = `You are an elite football/soccer match prediction analyst with expertise in statistical modeling and probability calibration. Your predictions will be evaluated on calibration (when you say 70%, it should happen ~70% of the time) and Brier score.
+/**
+ * JSON Schema for structured output (Opus 4.6 output_config.format).
+ * Guarantees Claude returns valid JSON matching this exact shape.
+ */
+const PREDICTION_JSON_SCHEMA = {
+  type: 'object' as const,
+  additionalProperties: false,
+  properties: {
+    homeWinProb: {
+      type: 'number' as const,
+      description: 'Home win probability between 0.01 and 0.98',
+    },
+    drawProb: {
+      type: 'number' as const,
+      description: 'Draw probability between 0.01 and 0.98',
+    },
+    awayWinProb: {
+      type: 'number' as const,
+      description: 'Away win probability between 0.01 and 0.98',
+    },
+    predictedHomeGoals: {
+      type: 'number' as const,
+      description: 'Predicted home goals based on xG',
+    },
+    predictedAwayGoals: {
+      type: 'number' as const,
+      description: 'Predicted away goals based on xG',
+    },
+    confidence: {
+      type: 'integer' as const,
+      description: 'Confidence score 1-10',
+    },
+    keyFactors: {
+      type: 'array' as const,
+      items: { type: 'string' as const },
+      description: 'Top 3-5 data-driven key factors',
+    },
+    riskFactors: {
+      type: 'array' as const,
+      items: { type: 'string' as const },
+      description: 'Top 2-4 risk factors',
+    },
+    valueBets: {
+      type: 'array' as const,
+      items: {
+        type: 'object' as const,
+        additionalProperties: false,
+        properties: {
+          market: { type: 'string' as const },
+          selection: { type: 'string' as const },
+          reasoning: { type: 'string' as const },
+          edgePercent: { type: 'number' as const },
+        },
+        required: ['market', 'selection', 'reasoning', 'edgePercent'],
+      },
+      description: 'Value bet opportunities',
+    },
+    detailedAnalysis: {
+      type: 'string' as const,
+      description:
+        'Step-by-step reasoning starting with base rates then adjustments',
+    },
+  },
+  required: [
+    'homeWinProb',
+    'drawProb',
+    'awayWinProb',
+    'predictedHomeGoals',
+    'predictedAwayGoals',
+    'confidence',
+    'keyFactors',
+    'riskFactors',
+    'valueBets',
+    'detailedAnalysis',
+  ],
+};
 
-## YOUR ANALYTICAL PROCESS
+const SYSTEM_PROMPT = `You are an elite football/soccer match prediction analyst. Your ONLY job is probability calibration — when you say 60%, it should happen ~60% of the time. You are evaluated EXCLUSIVELY on Brier score (lower = better) and calibration accuracy.
 
-You must follow this step-by-step reasoning process before assigning probabilities:
+## CRITICAL CALIBRATION RULES (READ CAREFULLY)
 
-### Step 1: Establish Base Rates
-- Start with the league's historical base rates for home win / draw / away win. Typical major league base rates are approximately: Home Win 45%, Draw 26%, Away Win 29%.
-- Adjust for home/away specifics of this venue if data is available.
+Your past predictions have been POORLY CALIBRATED. Here are the mandatory corrections:
 
-### Step 2: Assess Team Strength Differential
-- Compare league positions, points, and xG-based metrics (NOT just results, which are noisy).
-- xG (expected goals) is more predictive than actual goals scored. Weight xG data heavily.
-- A team's xG vs actual goals reveals if they are overperforming or underperforming (regression expected).
+### DRAW PROBABILITY — YOUR BIGGEST WEAKNESS
+- Across ALL major football leagues, 25-28% of matches end in draws.
+- You have been SYSTEMATICALLY UNDERESTIMATING draw probability.
+- Your draw probability should AVERAGE around 0.25-0.28 across all predictions.
+- If two teams are within 5 league positions of each other, draw probability should be AT LEAST 0.26.
+- If two mid-table teams play, draw probability should often be 0.28-0.35.
+- ONLY assign draw probability below 0.20 for extreme mismatches (e.g., 1st vs 20th).
+- A draw probability of 0.15 or lower is almost NEVER correct in football.
 
-### Step 3: Apply Contextual Adjustments
-- Recent form (last 5 games), but discount recency bias — form explains only ~5-10% of variance.
-- Injuries to KEY players (star strikers, creative midfielders, first-choice GK matter far more than squad rotation).
-- Head-to-head record (useful for derbies/rivalries, less so for random pairings).
-- Match context (relegation battle, title decider, dead rubber = different motivations).
-- Home/away record splits.
+### OVERCONFIDENCE — YOUR SECOND BIGGEST WEAKNESS
+- You assign probabilities above 0.65 far too often. Even heavy favorites (Man City vs a newly promoted team) only win ~70-75% of the time.
+- Probability ranges that are actually realistic:
+  - 0.55-0.65: Clear favorite (good team at home vs weak away team)
+  - 0.45-0.55: Slight favorite (could easily go either way)
+  - 0.35-0.45: Close match leaning one way
+  - 0.65-0.75: STRONG favorite (only for top-3 vs bottom-3 matchups)
+  - >0.75: ALMOST NEVER CORRECT — less than 5% of matches warrant this
+- If you are assigning >0.65 home win probability to an average home team, you are overconfident.
 
-### Step 4: Calibrate and Sanity Check
-- Draws are typically underbet by the public but correctly priced by sharp books. Do not underestimate draw probability.
-- Favorites win less often than casual bettors think. Home advantage is ~5-8% in most leagues, not 15%.
-- Avoid the trap of always picking a winner — if the match is genuinely close, your draw probability should reflect that.
-- In a league with 380 games, ~26% end in draws. If your model predicts <15% draws on average, it is miscalibrated.
+### HOME ADVANTAGE — SMALLER THAN YOU THINK
+- Post-COVID home advantage is ~4-6% in most leagues (NOT 10-15%).
+- This means the base rate shift from neutral is: Home Win +4-6%, Away Win -4-6%.
+- Some leagues (Bundesliga) have almost no home advantage anymore.
+- Do NOT give a team a huge boost just because they are at home.
 
-## COMMON BIASES TO AVOID
-- **Favorite-longshot bias**: Do not overestimate strong favorites or underestimate underdogs.
-- **Recency bias**: A team's last result is mostly noise. Look at 10+ game samples.
-- **Name/reputation bias**: Judge by current season data, not historical reputation.
-- **Narrative bias**: Ignore storylines ("team X always beats team Y") unless backed by statistical evidence.
-- **Home bias**: Home advantage exists but is smaller post-COVID (~4-6% in some leagues). Use the data.
-- **Overconfidence**: If data is limited or conflicting, lower your confidence. A 6/10 confidence is appropriate for most matches.
+## ANALYTICAL PROCESS
 
-## OUTPUT RULES
+### Step 1: Start With Base Rates (MANDATORY)
+- Begin with: Home Win 45%, Draw 26%, Away Win 29%
+- Write these down in your analysis. ALL adjustments are RELATIVE to these.
+- State explicitly: "Base rates: H=45% D=26% A=29%"
 
-1. Probabilities (homeWinProb + drawProb + awayWinProb) MUST sum to exactly 1.0000
-2. All probabilities must be between 0.01 and 0.98 (no certainties)
-3. Confidence is 1-10, where:
-   - 1-3: Very little data or highly uncertain match
-   - 4-5: Average data availability, could go either way
-   - 6-7: Good data, reasonable conviction in the prediction
-   - 8-9: Strong data convergence, clear prediction
-   - 10: Exceptional certainty (use VERY rarely, <5% of predictions)
-4. Predicted goals should be based on xG averages where available
-5. Key factors: Top 3-5 data-driven reasons (cite specific numbers)
-6. Risk factors: Top 2-4 things that could invalidate the prediction
-7. Value bets: Flag any markets where you see value based on your analysis
-8. detailedAnalysis: Walk through your step-by-step reasoning (base rate → adjustments → final probabilities)
+### Step 2: Adjust for Team Strength (MAX ±15% per outcome)
+- Use league position and xG differential as primary metrics.
+- xG is MORE reliable than actual goals — a team scoring above their xG will regress.
+- Maximum adjustment for team strength: ±15 percentage points on any single outcome.
+- Example: 1st place at home vs 18th place away → Home Win adjusts from 45% to ~60%, Draw from 26% to ~18%, Away from 29% to ~22%.
 
-You must respond with ONLY valid JSON matching this exact schema:
+### Step 3: Apply Small Contextual Adjustments (MAX ±5% total)
+- Recent form: ±1-3% (form is mostly noise, explains <10% of variance)
+- Key injuries: ±1-3% (only for genuinely star players — star striker, first-choice GK)
+- Head-to-head: ±0-2% (only relevant for major rivalries with 10+ matches sample)
+- Match motivation: ±1-3% (relegation battle, dead rubber, etc.)
+- Total contextual adjustment should NOT exceed ±5% in any direction.
+
+### Step 4: Final Sanity Checks (MANDATORY)
+Before outputting, verify ALL of these:
+1. Draw probability is between 0.18 and 0.38 (NEVER outside this range for normal league matches)
+2. No outcome exceeds 0.75 unless it's an extreme top-vs-bottom mismatch
+3. Probabilities sum to exactly 1.0000
+4. Your "most likely" outcome has at most a 15% adjustment from base rates
+5. You have not been swayed by team reputation — use THIS SEASON'S data only
+
+## CONFIDENCE SCORING (BE CONSERVATIVE)
+- 1-3: Very limited data, unclear situation, should be rare
+- 4-5: Standard match with typical uncertainty (THIS SHOULD BE YOUR MOST COMMON SCORE)
+- 6-7: Good data convergence, clear strength differential, all signals agree
+- 8-10: ALMOST NEVER USE. Reserve for extreme mismatches with complete data. Less than 5% of predictions.
+
+## OUTPUT FORMAT
+
+Respond with ONLY valid JSON matching this exact schema:
 {
   "homeWinProb": <number 0.01-0.98>,
   "drawProb": <number 0.01-0.98>,
@@ -88,7 +180,7 @@ You must respond with ONLY valid JSON matching this exact schema:
   "keyFactors": [<string>, ...],
   "riskFactors": [<string>, ...],
   "valueBets": [{"market": <string>, "selection": <string>, "reasoning": <string>, "edgePercent": <number>}, ...],
-  "detailedAnalysis": <string — 3-5 paragraphs walking through base rate → adjustments → final prediction>
+  "detailedAnalysis": <string — MUST start with "Base rates: H=45% D=26% A=29%. Adjustments:" then walk through each adjustment with specific numbers>
 }`;
 
 @Injectable()
@@ -102,7 +194,7 @@ export class AnalysisAgent {
       apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
     });
     this.model =
-      this.config.get<string>('PREDICTION_MODEL') || 'claude-sonnet-4-20250514';
+      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
   }
 
   /**
@@ -134,17 +226,28 @@ export class AnalysisAgent {
 
     const response = await this.anthropic.messages.create({
       model: this.model,
-      max_tokens: 4096,
-      temperature: 0.2,
+      max_tokens: 16000,
+      temperature: 1,
+      thinking: { type: 'adaptive' },
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userPrompt }],
-    });
+      // Opus 4.6 structured output — guarantees valid JSON
+      output_config: {
+        format: {
+          type: 'json_schema' as const,
+          schema: PREDICTION_JSON_SCHEMA,
+        },
+      },
+    } as any);
 
-    // Extract text content from response
-    const textBlock = response.content.find((b) => b.type === 'text');
-    const rawText = textBlock?.text ?? '';
+    // With adaptive thinking + structured output, response may contain
+    // ThinkingBlock and TextBlock. Extract the text content.
+    const textBlock = response.content.find(
+      (b: any) => b.type === 'text',
+    ) as any;
+    const rawText: string = textBlock?.text ?? '';
 
-    // Parse JSON from response (handle markdown code blocks)
+    // Parse JSON from response
     const prediction = this.parseResponse(rawText);
 
     // Validate and normalize probabilities
@@ -169,7 +272,7 @@ export class AnalysisAgent {
     }
 
     // Performance feedback (self-improvement loop)
-    if (feedback && feedback.totalResolved >= 10) {
+    if (feedback && feedback.totalResolved >= 5) {
       sections.push(`# YOUR PAST PERFORMANCE — USE THIS TO IMPROVE`);
       sections.push(
         `Based on your last ${feedback.totalResolved} resolved predictions:`,
@@ -384,8 +487,10 @@ export class AnalysisAgent {
   }
 
   private parseResponse(rawText: string): any {
-    // Remove markdown code blocks if present
+    // Strategy 1: Try parsing the raw text directly (ideal case)
     let cleaned = rawText.trim();
+
+    // Remove markdown code blocks if present
     if (cleaned.startsWith('```json')) {
       cleaned = cleaned.slice(7);
     } else if (cleaned.startsWith('```')) {
@@ -398,13 +503,58 @@ export class AnalysisAgent {
 
     try {
       return JSON.parse(cleaned);
-    } catch (error) {
-      this.logger.error(
-        `Failed to parse Claude response as JSON: ${error.message}`,
-      );
-      this.logger.debug(`Raw response: ${rawText.substring(0, 500)}`);
-      throw new Error(`Analysis agent returned invalid JSON: ${error.message}`);
+    } catch {
+      // Strategy 1 failed — try extraction strategies
     }
+
+    // Strategy 2: Find JSON object in the text using brace matching.
+    // Claude sometimes wraps JSON in conversational text like "I'll analyze... { ... }"
+    const firstBrace = rawText.indexOf('{');
+    if (firstBrace !== -1) {
+      // Find the matching closing brace by counting depth
+      let depth = 0;
+      let lastBrace = -1;
+      for (let i = firstBrace; i < rawText.length; i++) {
+        if (rawText[i] === '{') depth++;
+        else if (rawText[i] === '}') {
+          depth--;
+          if (depth === 0) {
+            lastBrace = i;
+            break;
+          }
+        }
+      }
+
+      if (lastBrace !== -1) {
+        const jsonCandidate = rawText.substring(firstBrace, lastBrace + 1);
+        try {
+          return JSON.parse(jsonCandidate);
+        } catch {
+          // Strategy 2 failed — try next
+        }
+      }
+    }
+
+    // Strategy 3: Try to find JSON inside markdown code blocks anywhere in text
+    const codeBlockMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch) {
+      try {
+        return JSON.parse(codeBlockMatch[1].trim());
+      } catch {
+        // Strategy 3 failed
+      }
+    }
+
+    // All strategies failed
+    this.logger.error(
+      `Failed to parse Claude response as JSON after all extraction strategies`,
+    );
+    this.logger.debug(
+      `Raw response (first 500 chars): ${rawText.substring(0, 500)}`,
+    );
+    throw new Error(
+      `Analysis agent returned invalid JSON: could not extract JSON from response`,
+    );
   }
 
   private validatePrediction(
@@ -420,7 +570,7 @@ export class AnalysisAgent {
     awayWinProb = Number(awayWinProb) || 0.33;
 
     // Normalize to sum to 1.0
-    const total = homeWinProb + drawProb + awayWinProb;
+    let total = homeWinProb + drawProb + awayWinProb;
     if (Math.abs(total - 1.0) > 0.001) {
       this.logger.warn(
         `Probabilities sum to ${total}, normalizing (${homeName} vs ${awayName})`,
@@ -430,21 +580,62 @@ export class AnalysisAgent {
       awayWinProb = awayWinProb / total;
     }
 
+    // ── Draw floor: Claude systematically underestimates draws ──────
+    // If Claude outputs draw prob below 0.15, it's almost certainly wrong.
+    // Apply a soft floor: boost draw to at least 0.18 for any match.
+    const DRAW_FLOOR = 0.18;
+    if (drawProb < DRAW_FLOOR) {
+      const boost = DRAW_FLOOR - drawProb;
+      this.logger.warn(
+        `Draw prob ${(drawProb * 100).toFixed(1)}% below floor for ${homeName} vs ${awayName}, boosting by ${(boost * 100).toFixed(1)}pp`,
+      );
+      drawProb = DRAW_FLOOR;
+      // Subtract proportionally from home and away
+      const homeShare = homeWinProb / (homeWinProb + awayWinProb);
+      homeWinProb -= boost * homeShare;
+      awayWinProb -= boost * (1 - homeShare);
+    }
+
+    // ── Overconfidence cap: no single outcome above 0.72 from Claude ──
+    // Even the strongest favorites don't win >75% of the time.
+    const MAX_SINGLE_PROB = 0.72;
+    const maxProb = Math.max(homeWinProb, drawProb, awayWinProb);
+    if (maxProb > MAX_SINGLE_PROB) {
+      this.logger.warn(
+        `Max prob ${(maxProb * 100).toFixed(1)}% exceeds cap for ${homeName} vs ${awayName}, dampening`,
+      );
+      // Dampen toward the mean
+      const dampFactor = 0.9;
+      const mean = 1 / 3;
+      homeWinProb = homeWinProb * dampFactor + mean * (1 - dampFactor);
+      drawProb = drawProb * dampFactor + mean * (1 - dampFactor);
+      awayWinProb = awayWinProb * dampFactor + mean * (1 - dampFactor);
+    }
+
     // Clamp to [0.01, 0.98]
     homeWinProb = Math.max(0.01, Math.min(0.98, homeWinProb));
     drawProb = Math.max(0.01, Math.min(0.98, drawProb));
     awayWinProb = Math.max(0.01, Math.min(0.98, awayWinProb));
 
-    // Re-normalize after clamping
+    // Re-normalize after all adjustments
     const clampTotal = homeWinProb + drawProb + awayWinProb;
     homeWinProb = homeWinProb / clampTotal;
     drawProb = drawProb / clampTotal;
     awayWinProb = awayWinProb / clampTotal;
 
-    const confidence = Math.max(
+    // Cap confidence — Claude is typically overconfident
+    // Map Claude's 1-10 to a more conservative scale
+    const rawConfidence = Math.max(
       1,
       Math.min(10, Math.round(Number(raw.confidence) || 5)),
     );
+    // Reduce high confidence scores: 8→7, 9→7, 10→8
+    const confidence =
+      rawConfidence >= 9
+        ? Math.min(rawConfidence - 2, 8)
+        : rawConfidence >= 7
+          ? rawConfidence - 1
+          : rawConfidence;
 
     return {
       homeWinProb: Number(homeWinProb.toFixed(4)),
