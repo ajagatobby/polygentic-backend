@@ -78,8 +78,10 @@ export const rerunPredictionsTask = task({
         actualHomeGoals: null,
         actualAwayGoals: null,
         actualResult: null,
+        predictedResult: null,
         wasCorrect: null,
         probabilityAccuracy: null,
+        predictionStatus: 'pending',
         updatedAt: new Date(),
       })
       .where(

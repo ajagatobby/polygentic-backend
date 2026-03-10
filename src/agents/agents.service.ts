@@ -1,6 +1,16 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { eq, and, gte, lte, desc, isNull, sql, asc } from 'drizzle-orm';
+import {
+  eq,
+  and,
+  gte,
+  lte,
+  desc,
+  isNull,
+  sql,
+  asc,
+  inArray,
+} from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { DataCollectorAgent, CollectedMatchData } from './data-collector.agent';
 import { ResearchAgent, ResearchResult } from './research.agent';
@@ -431,9 +441,15 @@ export class AgentsService {
    */
   async resolvePredictions(): Promise<{
     resolved: number;
+    voided: number;
     errors: string[];
   }> {
-    // Get unresolved predictions where the fixture is now finished (FT)
+    // Completed fixture statuses: Full Time, After Extra Time, Penalties
+    const COMPLETED_STATUSES = ['FT', 'AET', 'PEN'];
+    // Void fixture statuses: Postponed, Cancelled, Abandoned, Awarded, Walkover
+    const VOID_STATUSES = ['PST', 'CANC', 'ABD', 'AWD', 'WO'];
+
+    // Get unresolved predictions where the fixture is now finished or voided
     const unresolved = await this.db
       .select({
         prediction: schema.predictions,
@@ -446,16 +462,38 @@ export class AgentsService {
       )
       .where(
         and(
-          isNull(schema.predictions.resolvedAt),
-          eq(schema.fixtures.status, 'FT'),
+          eq(schema.predictions.predictionStatus, 'pending'),
+          inArray(schema.fixtures.status, [
+            ...COMPLETED_STATUSES,
+            ...VOID_STATUSES,
+          ]),
         ),
       );
 
     let resolved = 0;
+    let voided = 0;
     const errors: string[] = [];
 
     for (const { prediction, fixture } of unresolved) {
       try {
+        // ── Handle voided fixtures (postponed/cancelled/abandoned) ──
+        if (VOID_STATUSES.includes(fixture.status)) {
+          await this.db
+            .update(schema.predictions)
+            .set({
+              predictionStatus: 'void',
+              resolvedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.predictions.id, prediction.id));
+          voided++;
+          this.logger.log(
+            `Voided prediction ${prediction.id} — fixture ${fixture.id} status: ${fixture.status}`,
+          );
+          continue;
+        }
+
+        // ── Handle completed fixtures ──
         const actualHomeGoals = fixture.goalsHome;
         const actualAwayGoals = fixture.goalsAway;
 
@@ -467,15 +505,15 @@ export class AgentsService {
         else if (actualHomeGoals < actualAwayGoals) actualResult = 'away_win';
         else actualResult = 'draw';
 
-        // Determine predicted result
+        // Use stored predictedResult (locked at prediction time).
+        // Fall back to re-deriving from probs for legacy predictions without it.
         const homeProb = Number(prediction.homeWinProb);
         const drawProb = Number(prediction.drawProb);
         const awayProb = Number(prediction.awayWinProb);
-        const predictedResult = this.getPredictedResultFromProbs(
-          homeProb,
-          drawProb,
-          awayProb,
-        );
+        const predictedResult =
+          prediction.predictedResult ??
+          this.getPredictedResultFromProbs(homeProb, drawProb, awayProb);
+
         const wasCorrect = predictedResult === actualResult;
 
         // Calculate Brier score (lower is better, 0 = perfect)
@@ -493,6 +531,8 @@ export class AgentsService {
             actualAwayGoals,
             actualResult,
             wasCorrect,
+            predictedResult, // backfill for legacy rows that had null
+            predictionStatus: 'resolved',
             probabilityAccuracy: String(brierScore.toFixed(6)),
             resolvedAt: new Date(),
             updatedAt: new Date(),
@@ -520,11 +560,13 @@ export class AgentsService {
       }
     }
 
-    if (resolved > 0) {
-      this.logger.log(`Resolved ${resolved} predictions`);
+    if (resolved > 0 || voided > 0) {
+      this.logger.log(
+        `Resolved ${resolved} predictions, voided ${voided} predictions`,
+      );
     }
 
-    return { resolved, errors };
+    return { resolved, voided, errors };
   }
 
   // ─── Query methods ──────────────────────────────────────────────────
@@ -2235,6 +2277,9 @@ export class AgentsService {
     predictionType: PredictionType,
     modelVersion: string,
   ): Promise<any> {
+    // Lock in the predicted result at prediction time — never re-derived later
+    const predictedResult = this.getPredictedResult(prediction);
+
     const values = {
       fixtureId,
       homeTeamId: data.fixture.homeTeamId,
@@ -2244,6 +2289,7 @@ export class AgentsService {
       awayWinProb: String(prediction.awayWinProb),
       predictedHomeGoals: String(prediction.predictedHomeGoals),
       predictedAwayGoals: String(prediction.predictedAwayGoals),
+      predictedResult,
       confidence: prediction.confidence,
       predictionType,
       keyFactors: prediction.keyFactors,
@@ -2256,6 +2302,7 @@ export class AgentsService {
       },
       detailedAnalysis: prediction.detailedAnalysis,
       modelVersion,
+      predictionStatus: 'pending' as const,
       updatedAt: new Date(),
     };
 

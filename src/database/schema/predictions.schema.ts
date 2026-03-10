@@ -53,8 +53,19 @@ export const predictions = pgTable(
     researchContext: jsonb('research_context'), // raw research results
     detailedAnalysis: text('detailed_analysis'), // full reasoning text
 
+    // Predicted outcome (stored at prediction time — never re-derived)
+    predictedResult: varchar('predicted_result', { length: 20 }), // 'home_win' | 'draw' | 'away_win'
+
     // Model versioning
     modelVersion: varchar('model_version', { length: 50 }),
+
+    // Prediction lifecycle status
+    //   'pending'  — match not yet played
+    //   'resolved' — match finished and accuracy computed
+    //   'void'     — match postponed/cancelled/abandoned
+    predictionStatus: varchar('prediction_status', { length: 20 })
+      .default('pending')
+      .notNull(),
 
     // Accuracy tracking
     actualHomeGoals: integer('actual_home_goals'),
@@ -76,6 +87,7 @@ export const predictions = pgTable(
     index('idx_predictions_confidence').on(table.confidence),
     index('idx_predictions_created').on(table.createdAt),
     index('idx_predictions_resolved').on(table.resolvedAt),
+    index('idx_predictions_status').on(table.predictionStatus),
     uniqueIndex('uq_predictions_fixture_type').on(
       table.fixtureId,
       table.predictionType,
