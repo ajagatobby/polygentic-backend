@@ -2,13 +2,14 @@
 
 ## Overview
 
-Polygentic is a soccer prediction backend that uses a 3-agent AI pipeline to generate match predictions for 30 tracked football competitions worldwide. The system:
+Polygentic is a soccer prediction backend that uses a **multi-signal ensemble architecture** to generate calibrated match predictions for 66+ tracked football competitions worldwide. The system:
 
 1. **Syncs data** from API-Football (fixtures, stats, injuries, standings, lineups, live scores)
-2. **Collects odds** from The Odds API (60+ bookmakers, consensus probabilities)
-3. **Generates AI predictions** using a pipeline: Data Collection -> Perplexity research -> Claude analysis
+2. **Collects odds** from The Odds API (60+ bookmakers, weighted consensus probabilities)
+3. **Generates predictions** using a 4-signal ensemble: Dixon-Coles Poisson model + Claude AI analysis + bookmaker consensus + quantified player impact scoring
 4. **Monitors live matches** via adaptive polling with WebSocket broadcast
 5. **Resolves predictions** automatically after matches complete (accuracy scoring, Brier scores)
+6. **Self-improves** via performance feedback loops and semantic prediction memory
 
 ---
 
@@ -39,10 +40,15 @@ Polygentic is a soccer prediction backend that uses a 3-agent AI pipeline to gen
 |  /api/fixtures, /api/predictions, /api/alerts, /api/live  |
 |  /api/teams, /api/leagues, /api/odds, /api/health         |
 +-----------------------------------------------------------+
-|  Layer 4: AI Prediction Pipeline (3-Agent System)         |
+|  Layer 4: Multi-Signal Ensemble Prediction Pipeline       |
 |  +-- DataCollectorAgent (stats, form, injuries, lineups)  |
+|  +-- PlayerImpactService (quantified injury scoring)      |
+|  +-- PoissonModelService (Dixon-Coles xG-based model)     |
 |  +-- ResearchAgent (Perplexity Sonar web research)        |
 |  +-- AnalysisAgent (Claude structured prediction)         |
+|  +-- Ensemble Blender (40% Odds + 30% Poisson + 30% AI)  |
+|  +-- Calibration Layer (draw floors, dampening, caps)     |
+|  +-- PredictionMemoryService (Supermemory feedback loop)  |
 |  +-- Prediction Resolver (Brier score, wasCorrect)        |
 +-----------------------------------------------------------+
 |  Layer 3: Live Monitoring & Event Handling                |
@@ -110,12 +116,16 @@ src/
 |   +-- probability.util.ts          # Odds-to-probability, vig removal
 |   +-- dto/
 |
-+-- agents/                          # AI Prediction Pipeline
++-- agents/                          # Multi-Signal Ensemble Prediction Pipeline
 |   +-- agents.module.ts
-|   +-- agents.service.ts            # Pipeline orchestration, resolvePredictions()
+|   +-- agents.service.ts            # Pipeline orchestration, ensemble blending, calibration
 |   +-- data-collector.agent.ts      # Collects all match data (reads DB lineups first)
-|   +-- research.agent.ts            # Perplexity Sonar web research
-|   +-- analysis.agent.ts            # Claude structured prediction generation
+|   +-- research.agent.ts            # Perplexity Sonar web research (3 parallel queries)
+|   +-- analysis.agent.ts            # Claude structured prediction with adaptive thinking
+|   +-- poisson-model.service.ts     # Dixon-Coles Poisson model (xG-based)
+|   +-- player-impact.service.ts     # Quantified injury/absence impact scoring
+|   +-- prediction-memory.service.ts # Supermemory-backed prediction learning
+|   +-- perplexity.service.ts        # Perplexity Sonar API client
 |
 +-- alerts/                          # Alert system module
 |   +-- alerts.module.ts
@@ -189,17 +199,30 @@ Trigger.dev Schedule
     |       -> Fan out: generate-prediction per fixture
     |           |
     |           +-> DataCollectorAgent.collect()
-    |           |       -> Fixture data, team form, H2H, injuries
-    |           |       -> DB lineups (or API fallback)
+    |           |       -> Fixture data, team form (last 5), H2H (last 10)
+    |           |       -> Advanced stats (10-match rolling: xG, xGA, shots, possession)
+    |           |       -> DB lineups (or API fallback), injuries
     |           |       -> Bookmaker odds + consensus
     |           |
-    |           +-> ResearchAgent.research()
-    |           |       -> Perplexity Sonar web search
-    |           |       -> Recent news, team updates, tactical analysis
+    |           +-> PlayerImpactService.computeImpactScores()
+    |           |       -> Goal/assist history from fixture_events (last 15 matches)
+    |           |       -> Starter detection from fixture_lineups
+    |           |       -> xG/xGA multipliers for injured/absent players
+    |           |
+    |           +-> In parallel:
+    |           |   +-> ResearchAgent.research()     (3 Perplexity web searches)
+    |           |   +-> PoissonModel.predict()        (Dixon-Coles with injury adjustments)
+    |           |   +-> getPerformanceFeedback()      (last 500 predictions analysis)
+    |           |   +-> PredictionMemory.recall()      (Supermemory semantic search)
     |           |
     |           +-> AnalysisAgent.analyze()
-    |           |       -> Claude generates structured prediction
+    |           |       -> Claude with enriched data + quantified injuries + feedback
     |           |       -> Probabilities, confidence, key factors, value bets
+    |           |
+    |           +-> ensemblePredictions()
+    |           |       -> Blend: 40% bookmaker + 30% Poisson + 30% Claude
+    |           |       -> Draw calibration floors, overconfidence dampening
+    |           |       -> Match-type aware confidence adjustment
     |           |
     |           +-> Store prediction + create alert if high confidence
     |
@@ -255,16 +278,19 @@ Client Request -> Controller -> Service -> Database
 
 ## Key Design Decisions
 
-| Decision              | Choice                                         | Reasoning                                                                      |
-| --------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ |
-| **Prediction engine** | 3-agent AI pipeline (Perplexity + Claude)      | Richer analysis than heuristic models; web research captures real-time context |
-| **Durable execution** | Trigger.dev for prediction workloads           | Automatic retries, observability dashboard, handles AI API failures gracefully |
-| **Lightweight sync**  | NestJS @Cron for data sync                     | Simple, idempotent operations that don't need retry infrastructure             |
-| **Live scores**       | Adaptive polling (15-60s)                      | API-Football Pro plan supports ~10 concurrent matches; adaptive saves budget   |
-| **Season detection**  | `getCurrentSeason()` + `CALENDAR_YEAR_LEAGUES` | Single source of truth; handles MLS/Brasileirao/Liga MX/Argentina correctly    |
-| **Lineup strategy**   | Persist to DB, read DB first                   | Avoids redundant API calls; lineups available even after API cache expires     |
-| **Database**          | PostgreSQL (Supabase)                          | Excellent for relational data, JSONB for flexible fields, managed hosting      |
-| **No Redis/Bull**     | Removed in favor of Trigger.dev                | Trigger.dev provides better retry, observability, and doesn't require Redis    |
+| Decision              | Choice                                          | Reasoning                                                                                       |
+| --------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Prediction engine** | Multi-signal ensemble (Poisson + Claude + Odds) | No single model is sufficient; ensemble reduces variance and corrects individual biases         |
+| **Draw calibration**  | Match-type aware thresholds, not pure argmax    | Pure argmax predicted draws <10% of the time; football draws occur ~26%                         |
+| **Player impact**     | Data-driven (goal involvement + starter status) | Replaces reliance on Claude "knowing" who's important; quantified and auditable                 |
+| **Ensemble weights**  | 40% bookmaker + 30% Poisson + 30% Claude        | Bookmakers are best calibrated but not optimal for 1X2 prediction; Claude adds qualitative edge |
+| **Durable execution** | Trigger.dev for prediction workloads            | Automatic retries, observability dashboard, handles AI API failures gracefully                  |
+| **Lightweight sync**  | NestJS @Cron for data sync                      | Simple, idempotent operations that don't need retry infrastructure                              |
+| **Live scores**       | Adaptive polling (15-60s)                       | API-Football Pro plan supports ~10 concurrent matches; adaptive saves budget                    |
+| **Season detection**  | `getCurrentSeason()` + `CALENDAR_YEAR_LEAGUES`  | Single source of truth; handles MLS/Brasileirao/Liga MX/Argentina correctly                     |
+| **Lineup strategy**   | Persist to DB, read DB first                    | Avoids redundant API calls; lineups available even after API cache expires                      |
+| **Database**          | PostgreSQL (Supabase)                           | Excellent for relational data, JSONB for flexible fields, managed hosting                       |
+| **Self-improvement**  | Performance feedback + semantic memory          | Model learns from own mistakes via bias detection and Supermemory recall                        |
 
 ---
 

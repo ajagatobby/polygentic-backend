@@ -87,21 +87,34 @@ The project has evolved from its original 7-phase plan. The core system is opera
 
 ## Phase 5: AI Prediction Engine -- COMPLETE
 
-**Goal:** Generate AI-powered match predictions.
+**Goal:** Generate AI-powered match predictions with multi-signal ensemble.
 
-- [x] **3-Agent Pipeline** — DataCollector -> Perplexity Research -> Claude Analysis
-- [x] **DataCollectorAgent** — Gathers fixture, form, H2H, injuries, lineups (DB first), odds
-- [x] **ResearchAgent** — Perplexity Sonar web research for real-time context
-- [x] **AnalysisAgent** — Claude structured prediction (probabilities, goals, confidence, factors)
+- [x] **Multi-Signal Ensemble Pipeline** — DataCollector -> PlayerImpact + Research + Poisson + Memory (parallel) -> Claude -> Ensemble Blend -> Calibration
+- [x] **DataCollectorAgent** — Gathers fixture, form, H2H, injuries, lineups (DB first), odds, advanced stats (xG, xGA, shots, possession)
+- [x] **PlayerImpactService** — Quantified injury/absence scoring (goal involvement, starter status, position-based weights, xG/xGA multipliers)
+- [x] **PoissonModelService** — Dixon-Coles statistical model with xG data, home advantage, recency weighting, and player absence adjustments
+- [x] **ResearchAgent** — 3 parallel Perplexity Sonar web searches (preview, team news, tactical analysis)
+- [x] **AnalysisAgent** — Claude with structured output, adaptive thinking, match-type classification (TIGHT/MODERATE/MISMATCH), and mandatory base-rate anchoring
+- [x] **Ensemble Blending** — 40% bookmaker consensus + 30% Poisson + 30% Claude with dynamic weight redistribution
+- [x] **Draw Calibration** — Tiered draw floors (0.24/0.22/0.18), match-type aware draw prediction thresholds, competitive-match dampening
+- [x] **Overconfidence Control** — Claude cap at 0.65, ensemble cap at 0.70, aggressive confidence compression
+- [x] **Self-Improvement Loop** — Performance feedback from last 500 predictions with bias detection and auto-corrective instructions
+- [x] **Prediction Memory** — Supermemory-backed semantic recall of past prediction outcomes for same teams/leagues
 - [x] **Trigger.dev integration** — Durable execution with retries for all prediction tasks
 - [x] **Daily predictions** — 6 AM UTC for next 48 hours of fixtures
 - [x] **Pre-match predictions** — Every 15 minutes for fixtures within 1 hour
 - [x] **Lineup-aware regeneration** — Every 5 minutes, detects lineups and re-generates predictions
 - [x] **Prediction resolution** — Automatic after match completion (wasCorrect, Brier score)
-- [x] **Accuracy tracking** — `getAccuracyStats()` returns accuracy metrics by type
+- [x] **Accuracy tracking** — `getAccuracyStats()` and `getPerformanceFeedback()` with per-result, per-league, and confidence-calibrated metrics
+- [x] **Bookmaker consensus** — Weighted by bookmaker sharpness (Pinnacle 25%, Betfair 20%, tiered soft books)
 - [x] **API endpoints:**
   - `GET /api/predictions` — All predictions sorted by confidence
   - `GET /api/predictions/accuracy` — Accuracy statistics
+  - `GET /api/predictions/performance-feedback` — Detailed bias analysis
+  - `GET /api/predictions/daily-breakdown` — Per-day performance with match detail
+  - `GET /api/predictions/bullish` — Top predictions by composite bullish score
+  - `GET /api/predictions/today` — Today's predictions by match date
+  - `GET /api/predictions/upcoming` — Upcoming predictions with date range
 
 ---
 
@@ -161,4 +174,10 @@ The project has evolved from its original 7-phase plan. The core system is opera
 - [ ] Clean up dead code (`syncTeams()` never called by any automated process)
 - [ ] Add authentication to API endpoints
 - [ ] Set up production monitoring and alerting
-- [ ] Implement ML-based model calibration from historical accuracy data
+
+### Planned Improvements (Phased)
+
+- [ ] **xT (Expected Threat) integration** — Identify teams dominating territory vs lucky shot-takers. Needs StatsBomb/Opta/FBref data source.
+- [ ] **Isotonic regression calibration** — Post-hoc probability calibration from historical accuracy data. Requires 200+ resolved predictions.
+- [ ] **Gradient boosting meta-learner** — XGBoost/LightGBM on structured features as an additional ensemble signal. Requires 1000+ resolved predictions with proper feature engineering.
+- [ ] **Prediction caching** — Skip re-generation if data hasn't changed significantly since last prediction.
