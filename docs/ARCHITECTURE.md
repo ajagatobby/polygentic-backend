@@ -6,7 +6,7 @@ Polygentic is a soccer prediction backend that uses a **multi-signal ensemble ar
 
 1. **Syncs data** from API-Football (fixtures, stats, injuries, standings, lineups, live scores)
 2. **Collects odds** from The Odds API (60+ bookmakers, weighted consensus probabilities)
-3. **Generates predictions** using a 4-signal ensemble: Dixon-Coles Poisson model + Claude AI analysis + bookmaker consensus + quantified player impact scoring
+3. **Generates predictions** using a 4-signal ensemble: Dixon-Coles Poisson model + LLM analysis (Anthropic Claude or OpenAI o3/o4-mini/GPT-5) + bookmaker consensus + quantified player impact scoring
 4. **Monitors live matches** via adaptive polling with WebSocket broadcast
 5. **Resolves predictions** automatically after matches complete (accuracy scoring, Brier scores)
 6. **Self-improves** via performance feedback loops and semantic prediction memory
@@ -15,20 +15,20 @@ Polygentic is a soccer prediction backend that uses a **multi-signal ensemble ar
 
 ## Tech Stack
 
-| Layer             | Technology                              | Purpose                                                  |
-| ----------------- | --------------------------------------- | -------------------------------------------------------- |
-| Framework         | **NestJS 11**                           | Modular backend with DI, cron, WebSockets                |
-| Language          | **TypeScript 5**                        | Type safety across the entire codebase                   |
-| Database          | **PostgreSQL** (Supabase)               | Match data, predictions, alerts, lineups                 |
-| ORM               | **Drizzle ORM**                         | Type-safe, SQL-like query builder                        |
-| Durable Execution | **Trigger.dev**                         | Prediction pipeline, sync+resolve workflows with retries |
-| Scheduler         | **@nestjs/schedule**                    | Lightweight cron-based data sync                         |
-| AI - Research     | **Perplexity Sonar**                    | Real-time web research for match context                 |
-| AI - Analysis     | **Anthropic Claude**                    | Structured match prediction generation                   |
-| WebSocket         | **Socket.IO**                           | Live score broadcast to clients                          |
-| HTTP Client       | **Axios**                               | API requests to external data sources                    |
-| Validation        | **class-validator + class-transformer** | Request/response validation                              |
-| Documentation     | **@nestjs/swagger**                     | Auto-generated API docs                                  |
+| Layer             | Technology                                         | Purpose                                                                       |
+| ----------------- | -------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Framework         | **NestJS 11**                                      | Modular backend with DI, cron, WebSockets                                     |
+| Language          | **TypeScript 5**                                   | Type safety across the entire codebase                                        |
+| Database          | **PostgreSQL** (Supabase)                          | Match data, predictions, alerts, lineups                                      |
+| ORM               | **Drizzle ORM**                                    | Type-safe, SQL-like query builder                                             |
+| Durable Execution | **Trigger.dev**                                    | Prediction pipeline, sync+resolve workflows with retries                      |
+| Scheduler         | **@nestjs/schedule**                               | Lightweight cron-based data sync                                              |
+| AI - Research     | **Perplexity Sonar**                               | Real-time web research for match context                                      |
+| AI - Analysis     | **Anthropic Claude / OpenAI (o3, o4-mini, GPT-5)** | Structured match prediction generation (auto-detect provider from model name) |
+| WebSocket         | **Socket.IO**                                      | Live score broadcast to clients                                               |
+| HTTP Client       | **Axios**                                          | API requests to external data sources                                         |
+| Validation        | **class-validator + class-transformer**            | Request/response validation                                                   |
+| Documentation     | **@nestjs/swagger**                                | Auto-generated API docs                                                       |
 
 ---
 
@@ -45,7 +45,7 @@ Polygentic is a soccer prediction backend that uses a **multi-signal ensemble ar
 |  +-- PlayerImpactService (quantified injury scoring)      |
 |  +-- PoissonModelService (Dixon-Coles xG-based model)     |
 |  +-- ResearchAgent (Perplexity Sonar web research)        |
-|  +-- AnalysisAgent (Claude structured prediction)         |
+|  +-- AnalysisAgent (Claude/OpenAI structured prediction)  |
 |  +-- Ensemble Blender (40% Odds + 30% Poisson + 30% AI)  |
 |  +-- Calibration Layer (draw floors, dampening, caps)     |
 |  +-- PredictionMemoryService (Supermemory feedback loop)  |
@@ -121,7 +121,7 @@ src/
 |   +-- agents.service.ts            # Pipeline orchestration, ensemble blending, calibration
 |   +-- data-collector.agent.ts      # Collects all match data (reads DB lineups first)
 |   +-- research.agent.ts            # Perplexity Sonar web research (3 parallel queries)
-|   +-- analysis.agent.ts            # Claude structured prediction with adaptive thinking
+|   +-- analysis.agent.ts            # Multi-provider LLM prediction (Anthropic Claude / OpenAI o3/o4-mini/GPT-5)
 |   +-- poisson-model.service.ts     # Dixon-Coles Poisson model (xG-based)
 |   +-- player-impact.service.ts     # Quantified injury/absence impact scoring
 |   +-- prediction-memory.service.ts # Supermemory-backed prediction learning
@@ -280,7 +280,8 @@ Client Request -> Controller -> Service -> Database
 
 | Decision              | Choice                                          | Reasoning                                                                                       |
 | --------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| **Prediction engine** | Multi-signal ensemble (Poisson + Claude + Odds) | No single model is sufficient; ensemble reduces variance and corrects individual biases         |
+| **Prediction engine** | Multi-signal ensemble (Poisson + LLM + Odds)    | No single model is sufficient; ensemble reduces variance and corrects individual biases         |
+| **LLM provider**      | Auto-detect from `PREDICTION_MODEL` env var     | Set `claude-*` for Anthropic, `o3`/`o4-mini` for OpenAI reasoning, `gpt-*` for OpenAI standard  |
 | **Draw calibration**  | Match-type aware thresholds, not pure argmax    | Pure argmax predicted draws <10% of the time; football draws occur ~26%                         |
 | **Player impact**     | Data-driven (goal involvement + starter status) | Replaces reliance on Claude "knowing" who's important; quantified and auditable                 |
 | **Ensemble weights**  | 40% bookmaker + 30% Poisson + 30% Claude        | Bookmakers are best calibrated but not optimal for 1X2 prediction; Claude adds qualitative edge |
@@ -301,7 +302,8 @@ Client Request -> Controller -> Service -> Database
 | **API-Football**     | 7,500 req/day, 300/min | ~4,500 for periodic sync, ~2,500 for live monitoring, ~500 for lineups |
 | **The Odds API**     | 20,000 credits/month   | ~4,600 credits/month across all leagues                                |
 | **Perplexity Sonar** | Per-request (paid)     | ~50-100 predictions/day                                                |
-| **Anthropic Claude** | Per-token (paid)       | ~50-100 predictions/day                                                |
+| **Anthropic Claude** | Per-token (paid)       | ~50-100 predictions/day (default provider)                             |
+| **OpenAI**           | Per-token (paid)       | ~50-100 predictions/day (optional alternative provider)                |
 
 ---
 

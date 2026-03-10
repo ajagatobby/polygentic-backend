@@ -94,7 +94,8 @@ The project has evolved from its original 7-phase plan. The core system is opera
 - [x] **PlayerImpactService** — Quantified injury/absence scoring (goal involvement, starter status, position-based weights, xG/xGA multipliers)
 - [x] **PoissonModelService** — Dixon-Coles statistical model with xG data, home advantage, recency weighting, and player absence adjustments
 - [x] **ResearchAgent** — 3 parallel Perplexity Sonar web searches (preview, team news, tactical analysis)
-- [x] **AnalysisAgent** — Claude with structured output, adaptive thinking, match-type classification (TIGHT/MODERATE/MISMATCH), and mandatory base-rate anchoring
+- [x] **AnalysisAgent** — Multi-provider LLM (Anthropic Claude or OpenAI o3/o4-mini/GPT-5) with structured output, adaptive thinking, match-type classification (TIGHT/MODERATE/MISMATCH), and mandatory base-rate anchoring
+- [x] **Multi-provider LLM support** — Auto-detects provider from `PREDICTION_MODEL` env var: `claude-*` for Anthropic, `o3`/`o4-mini` for OpenAI reasoning models, `gpt-*` for OpenAI standard models. Handles role mapping (`system` vs `developer`), structured output format differences, and temperature/reasoning_effort parameter routing
 - [x] **Ensemble Blending** — 40% bookmaker consensus + 30% Poisson + 30% Claude with dynamic weight redistribution
 - [x] **Draw Calibration** — Tiered draw floors (0.24/0.22/0.18), match-type aware draw prediction thresholds, competitive-match dampening
 - [x] **Overconfidence Control** — Claude cap at 0.65, ensemble cap at 0.70, aggressive confidence compression
@@ -104,7 +105,7 @@ The project has evolved from its original 7-phase plan. The core system is opera
 - [x] **Daily predictions** — 6 AM UTC for next 48 hours of fixtures
 - [x] **Pre-match predictions** — Every 15 minutes for fixtures within 1 hour
 - [x] **Lineup-aware regeneration** — Every 5 minutes, detects lineups and re-generates predictions
-- [x] **Prediction resolution** — Automatic after match completion (wasCorrect, Brier score)
+- [x] **Prediction resolution** — Automatic after match completion (wasCorrect, Brier score) with stored `predictedResult` (never re-derived), `predictionStatus` lifecycle (`pending` → `resolved` | `void`), AET/PEN support, and auto-voiding of postponed/cancelled/abandoned matches
 - [x] **Accuracy tracking** — `getAccuracyStats()` and `getPerformanceFeedback()` with per-result, per-league, and confidence-calibrated metrics
 - [x] **Bookmaker consensus** — Weighted by bookmaker sharpness (Pinnacle 25%, Betfair 20%, tiered soft books)
 - [x] **API endpoints:**
@@ -166,6 +167,10 @@ The project has evolved from its original 7-phase plan. The core system is opera
 - [x] Historical backfill script ready (`scripts/backfill-historical.ts`)
 - [x] CLI sync script (`scripts/sync-fixtures.ts`)
 - [x] Trigger.dev config with build externals for NestJS peer deps
+- [x] Prediction audit scripts (`scripts/audit-predictions.ts`, `scripts/retroactive-audit.ts`)
+- [x] Migration 0008: `predictedResult` + `predictionStatus` columns with backfill (11 pending, 11 resolved)
+- [x] Resolution pipeline fixes: stored predictedResult, AET/PEN/void handling, predictionStatus lifecycle
+- [x] OpenAI SDK installed and dual-provider support in AnalysisAgent + PolymarketTradingAgent
 
 ### Pending
 
@@ -174,6 +179,7 @@ The project has evolved from its original 7-phase plan. The core system is opera
 - [ ] Clean up dead code (`syncTeams()` never called by any automated process)
 - [ ] Add authentication to API endpoints
 - [ ] Set up production monitoring and alerting
+- [ ] Add `OPENAI_API_KEY` to Trigger.dev environment variables (required to use OpenAI models)
 
 ### Planned Improvements (Phased)
 

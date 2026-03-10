@@ -176,11 +176,43 @@ An independent statistical model that runs in parallel with Claude analysis.
 
 ---
 
-## Agent 3: AnalysisAgent (Anthropic Claude)
+## Agent 3: AnalysisAgent (Multi-Provider LLM)
 
 **File:** `src/agents/analysis.agent.ts`
 
-Takes all collected data, research context, and quantified injury impacts, produces a structured prediction via Claude with adaptive thinking.
+Takes all collected data, research context, and quantified injury impacts, produces a structured prediction via a configurable LLM provider (Anthropic Claude or OpenAI) with adaptive thinking.
+
+### Model Provider Support
+
+The agent supports **auto-detection** based on the `PREDICTION_MODEL` environment variable:
+
+| Model String      | Provider  | Type      | System Role | Temperature        | Structured Output             |
+| ----------------- | --------- | --------- | ----------- | ------------------ | ----------------------------- |
+| `claude-*`        | Anthropic | Standard  | `system`    | `temperature`      | `tool_use` with JSON schema   |
+| `o3`, `o4-mini`   | OpenAI    | Reasoning | `developer` | `reasoning_effort` | `response_format.json_schema` |
+| `gpt-5`, `gpt-4o` | OpenAI    | Standard  | `system`    | `temperature`      | `response_format.json_schema` |
+
+**Configuration:**
+
+```env
+# In .env — set one of:
+PREDICTION_MODEL=claude-sonnet-4-20250514   # Default (Anthropic)
+PREDICTION_MODEL=o3                          # OpenAI reasoning model
+PREDICTION_MODEL=o4-mini                     # OpenAI reasoning (cheaper)
+PREDICTION_MODEL=gpt-5                       # OpenAI standard model
+
+# Required for OpenAI models:
+OPENAI_API_KEY=sk-...
+```
+
+**Key differences between providers:**
+
+- **Anthropic**: Uses `tool_use` for structured output with `{ type: 'json', schema }` directly
+- **OpenAI reasoning models** (o3, o4-mini): Use `developer` role instead of `system`, `reasoning_effort` instead of `temperature`, `max_completion_tokens` instead of `max_tokens`
+- **OpenAI standard models** (gpt-5, gpt-4o): Use `system` role and `temperature` normally
+- **Both OpenAI types**: Use `response_format: { type: 'json_schema', json_schema: { name, strict, schema } }` wrapper
+
+The same system prompt, JSON schema, validation logic, and post-processing pipeline apply regardless of provider. The `polymarket-trading.agent.ts` also uses the same dual-provider pattern.
 
 ### Input
 
@@ -318,7 +350,23 @@ This ensures predictions always use the most accurate team sheet data available.
 
 ## Prediction Resolution
 
-After a match completes (status = FT, AET, or PEN), predictions are automatically resolved.
+After a match completes (status = FT, AET, or PEN), predictions are automatically resolved. Postponed, cancelled, or abandoned matches are voided.
+
+### Prediction Lifecycle
+
+Each prediction has a `predictionStatus` column tracking its lifecycle:
+
+```
+pending  ──→  resolved   (match completed normally: FT, AET, PEN)
+pending  ──→  void       (match postponed, cancelled, or abandoned: PST, CANC, ABD, AWD, WO)
+```
+
+### Stored vs Derived Predictions
+
+**Critical design decision:** The `predictedResult` column is written **at prediction time** and never re-derived during resolution. This prevents the "wasCorrect mismatch" bug where updated prediction logic could retroactively change what was predicted, causing correct predictions to be marked wrong.
+
+- At prediction time: `predictedResult = getPredictedResultFromProbs(homeWinProb, drawProb, awayWinProb)`
+- At resolution time: `wasCorrect = (prediction.predictedResult === actualResult)` — reads the stored value directly
 
 ### Resolution Flow
 
@@ -330,27 +378,42 @@ After a match completes (status = FT, AET, or PEN), predictions are automaticall
 **Steps:**
 
 1. `syncCompletedFixtures()` — Fetch recently completed fixtures (last 2 days) from API-Football, update DB with final status/scores
-2. `resolvePredictions()` — Find all unresolved predictions where the linked fixture has status FT:
+2. `resolvePredictions()` — Find all pending predictions where the linked fixture has a terminal status:
 
 ```
-For each unresolved prediction:
-  1. Read actual goals from fixture (goalsHome, goalsAway)
-  2. Determine actual result:
-     - goalsHome > goalsAway → "home_win"
-     - goalsHome < goalsAway → "away_win"
-     - goalsHome == goalsAway → "draw"
-   3. Determine predicted result (match-type aware: draw thresholds for tight/competitive matches)
-  4. wasCorrect = (predictedResult === actualResult)
-  5. Calculate Brier score (3-outcome):
-     brierScore = (homeWinProb - homeActual)^2 + (drawProb - drawActual)^2 + (awayWinProb - awayActual)^2
-     where homeActual/drawActual/awayActual are 1 or 0
-  6. Update prediction row:
-     - actualHomeGoals, actualAwayGoals
-     - actualResult
-     - wasCorrect
-     - probabilityAccuracy (Brier score)
-     - resolvedAt
+For each pending prediction:
+  IF fixture.status IN ('FT', 'AET', 'PEN'):
+    1. Read actual goals from fixture (goalsHome, goalsAway)
+    2. Determine actual result:
+       - goalsHome > goalsAway → "home_win"
+       - goalsHome < goalsAway → "away_win"
+       - goalsHome == goalsAway → "draw"
+    3. Read stored predictedResult (set at prediction time, NOT re-derived)
+    4. wasCorrect = (predictedResult === actualResult)
+    5. Calculate Brier score (3-outcome):
+       brierScore = (homeWinProb - homeActual)² + (drawProb - drawActual)² + (awayWinProb - awayActual)²
+       where homeActual/drawActual/awayActual are 1 or 0
+    6. Update prediction row:
+       - actualHomeGoals, actualAwayGoals
+       - actualResult, wasCorrect
+       - probabilityAccuracy (Brier score)
+       - predictionStatus → 'resolved'
+       - resolvedAt
+
+  ELSE IF fixture.status IN ('PST', 'CANC', 'ABD', 'AWD', 'WO'):
+    1. Set predictionStatus → 'void'
+    2. Set resolvedAt to current timestamp
+    3. No accuracy metrics computed (voided predictions excluded from stats)
 ```
+
+### Schema Changes (Migration 0008)
+
+| Column             | Type    | Default     | Description                                               |
+| ------------------ | ------- | ----------- | --------------------------------------------------------- |
+| `predictedResult`  | varchar | null        | Stored at prediction time: `home_win`, `draw`, `away_win` |
+| `predictionStatus` | varchar | `'pending'` | Lifecycle: `pending` → `resolved` or `void`               |
+
+Index: `idx_predictions_status` on `predictionStatus` for efficient resolution queries.
 
 ### Accuracy Metrics
 
