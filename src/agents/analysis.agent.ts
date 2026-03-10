@@ -173,12 +173,18 @@ Before adjusting probabilities, classify the match:
 - MODERATE matches: max total adjustment is ±10% from base rates
 - MISMATCH: max total adjustment is ±15% from base rates
 
-### Step 4: Apply Contextual Adjustments (MAX ±3% total)
-- Key injuries: ±1-2% (only for top-3 players in the squad)
+### Step 4: Apply Contextual Adjustments (MAX ±5% total)
+- **Key injuries (USE THE IMPACT SCORES)**: The injury data now includes quantified impact scores (0-1 scale) based on goal involvement, starter status, and position. Use these scores directly:
+  - CRITICAL impact (0.6+): adjust by ±2-3% — this player's absence materially changes the match
+  - HIGH impact (0.4-0.6): adjust by ±1-2%
+  - MODERATE impact (0.25-0.4): adjust by ±0.5-1%
+  - LOW/MINIMAL: ignore — these are squad players
+  - Pay attention to the xG/xGA multipliers — they tell you exactly how much the team's attacking/defensive output is reduced
+  - A team with xG ×0.85 (15% offensive reduction) should have their win probability reduced noticeably
 - Match motivation: ±1-2% (relegation 6-pointer, title decider, dead rubber)
 - Head-to-head: ±0-1% (only with 10+ match sample, and only if pattern is extreme)
 - Weather/travel: ±0-1% (rarely significant)
-- TOTAL contextual adjustment MUST NOT exceed ±3% in any direction.
+- TOTAL contextual adjustment MUST NOT exceed ±5% in any direction.
 
 ### Step 5: Final Sanity Checks (MANDATORY)
 Before outputting, verify ALL of these:
@@ -477,14 +483,87 @@ export class AnalysisAgent {
       }
     }
 
-    // Injuries
+    // Injuries — with quantified player impact scores when available
     if (data.injuries.length > 0) {
-      sections.push(`\n## Injuries & Suspensions`);
-      for (const inj of data.injuries) {
-        const side = inj.teamId === fixture.homeTeamId ? homeName : awayName;
+      const playerImpact = (data as any).playerImpact;
+
+      if (playerImpact) {
+        sections.push(`\n## Injuries & Suspensions (Quantified Impact)`);
         sections.push(
-          `- [${side}] ${inj.playerName}: ${inj.type ?? '?'} — ${inj.reason ?? 'Unknown'}`,
+          `Impact scores are data-driven (0-1 scale based on goal involvement, starter status, and position).`,
         );
+
+        // Home team absences
+        if (playerImpact.home.players.length > 0) {
+          sections.push(`\n### ${homeName} Absences`);
+          sections.push(
+            `Combined effect: xG ×${playerImpact.home.xgMultiplier} (${((1 - playerImpact.home.xgMultiplier) * 100).toFixed(0)}% offensive reduction), xGA ×${playerImpact.home.xgaMultiplier} (${((playerImpact.home.xgaMultiplier - 1) * 100).toFixed(0)}% more vulnerable)`,
+          );
+          for (const p of playerImpact.home.players) {
+            const posLabel =
+              p.position === 'F'
+                ? 'FW'
+                : p.position === 'M'
+                  ? 'MF'
+                  : p.position === 'D'
+                    ? 'DF'
+                    : p.position === 'G'
+                      ? 'GK'
+                      : '??';
+            const starterTag = p.isRegularStarter ? 'STARTER' : 'squad';
+            const statsTag =
+              p.goals + p.assists > 0
+                ? ` (${p.goals}G ${p.assists}A in ${p.teamMatches} matches)`
+                : ` (${p.appearances}/${p.teamMatches} appearances)`;
+            sections.push(
+              `- [${p.impactLabel}] ${p.playerName} (${posLabel}, ${starterTag})${statsTag}: ${p.absenceType ?? '?'} — ${p.reason ?? 'Unknown'} [impact=${p.impactScore.toFixed(2)}, absence_prob=${(p.absenceProbability * 100).toFixed(0)}%]`,
+            );
+          }
+        }
+
+        // Away team absences
+        if (playerImpact.away.players.length > 0) {
+          sections.push(`\n### ${awayName} Absences`);
+          sections.push(
+            `Combined effect: xG ×${playerImpact.away.xgMultiplier} (${((1 - playerImpact.away.xgMultiplier) * 100).toFixed(0)}% offensive reduction), xGA ×${playerImpact.away.xgaMultiplier} (${((playerImpact.away.xgaMultiplier - 1) * 100).toFixed(0)}% more vulnerable)`,
+          );
+          for (const p of playerImpact.away.players) {
+            const posLabel =
+              p.position === 'F'
+                ? 'FW'
+                : p.position === 'M'
+                  ? 'MF'
+                  : p.position === 'D'
+                    ? 'DF'
+                    : p.position === 'G'
+                      ? 'GK'
+                      : '??';
+            const starterTag = p.isRegularStarter ? 'STARTER' : 'squad';
+            const statsTag =
+              p.goals + p.assists > 0
+                ? ` (${p.goals}G ${p.assists}A in ${p.teamMatches} matches)`
+                : ` (${p.appearances}/${p.teamMatches} appearances)`;
+            sections.push(
+              `- [${p.impactLabel}] ${p.playerName} (${posLabel}, ${starterTag})${statsTag}: ${p.absenceType ?? '?'} — ${p.reason ?? 'Unknown'} [impact=${p.impactScore.toFixed(2)}, absence_prob=${(p.absenceProbability * 100).toFixed(0)}%]`,
+            );
+          }
+        }
+
+        if (
+          playerImpact.home.players.length === 0 &&
+          playerImpact.away.players.length === 0
+        ) {
+          sections.push(`No significant absences for either team.`);
+        }
+      } else {
+        // Fallback: no impact scores available, use basic format
+        sections.push(`\n## Injuries & Suspensions`);
+        for (const inj of data.injuries) {
+          const side = inj.teamId === fixture.homeTeamId ? homeName : awayName;
+          sections.push(
+            `- [${side}] ${inj.playerName}: ${inj.type ?? '?'} — ${inj.reason ?? 'Unknown'}`,
+          );
+        }
       }
     }
 

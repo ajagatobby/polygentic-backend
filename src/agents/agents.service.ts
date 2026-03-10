@@ -6,6 +6,10 @@ import { DataCollectorAgent, CollectedMatchData } from './data-collector.agent';
 import { ResearchAgent, ResearchResult } from './research.agent';
 import { AnalysisAgent, PredictionOutput } from './analysis.agent';
 import { PoissonModelService } from './poisson-model.service';
+import {
+  PlayerImpactService,
+  TeamAbsenceImpact,
+} from './player-impact.service';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
@@ -30,6 +34,7 @@ export class AgentsService {
     private readonly researchAgent: ResearchAgent,
     private readonly analysisAgent: AnalysisAgent,
     private readonly poissonModel: PoissonModelService,
+    private readonly playerImpact: PlayerImpactService,
     private readonly footballService: FootballService,
     private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
@@ -68,6 +73,42 @@ export class AgentsService {
       throw error;
     }
 
+    // Step 1b: Compute player impact scores for injuries/absences
+    let playerImpactScores: {
+      home: TeamAbsenceImpact;
+      away: TeamAbsenceImpact;
+    } | null = null;
+    try {
+      playerImpactScores = await this.playerImpact.computeImpactScores(
+        matchData.injuries,
+        matchData.fixture.homeTeamId,
+        matchData.fixture.awayTeamId,
+        matchData.fixture.leagueId,
+        fixtureId,
+      );
+
+      const homeAbsences = playerImpactScores.home.players.filter(
+        (p) => p.impactLabel !== 'MINIMAL',
+      );
+      const awayAbsences = playerImpactScores.away.players.filter(
+        (p) => p.impactLabel !== 'MINIMAL',
+      );
+      if (homeAbsences.length > 0 || awayAbsences.length > 0) {
+        this.logger.log(
+          `Player impact for fixture ${fixtureId}: ` +
+            `Home absences=${homeAbsences.length} (xG×${playerImpactScores.home.xgMultiplier}, xGA×${playerImpactScores.home.xgaMultiplier}), ` +
+            `Away absences=${awayAbsences.length} (xG×${playerImpactScores.away.xgMultiplier}, xGA×${playerImpactScores.away.xgaMultiplier})`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Player impact scoring failed for fixture ${fixtureId}: ${error.message}`,
+      );
+    }
+
+    // Attach player impact to matchData so downstream agents can use it
+    matchData.playerImpact = playerImpactScores;
+
     // Step 2: Web research + performance feedback + Poisson model + memory recall (in parallel)
     let research: ResearchResult;
     let feedback: PerformanceFeedback | null = null;
@@ -90,6 +131,7 @@ export class AgentsService {
             matchData.fixture.awayTeamId,
             matchData.fixture.leagueId,
             fixtureId,
+            playerImpactScores ?? undefined,
           ),
           this.predictionMemory.recallForPrediction({
             homeTeamName: homeName,
@@ -176,6 +218,12 @@ export class AgentsService {
 
     // Step 3b: Ensemble — blend Claude + Poisson + Bookmaker odds
     prediction = this.ensemblePredictions(prediction, poissonOutput, matchData);
+
+    // TODO [Phase 3]: Apply isotonic regression calibration to final probabilities
+    // once we have 200+ resolved predictions. Isotonic regression maps raw model
+    // probabilities to empirically calibrated ones, fixing systematic miscalibration.
+    // Implementation: train an isotonic regressor on (predicted_prob, actual_outcome)
+    // pairs, then apply to homeWinProb/drawProb/awayWinProb before storage.
 
     // Step 4: Store prediction
     const modelVersion =

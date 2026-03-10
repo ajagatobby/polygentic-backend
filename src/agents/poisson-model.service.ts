@@ -2,6 +2,7 @@ import { Injectable, Inject, Logger } from '@nestjs/common';
 import { eq, and, desc, sql } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { PoissonModelOutput } from './types';
+import { TeamAbsenceImpact } from './player-impact.service';
 
 /**
  * Poisson-based statistical prediction model.
@@ -12,6 +13,7 @@ import { PoissonModelOutput } from './types';
  * 2. Compute expected goals for each team using home/away factors
  * 3. Use Poisson distribution to calculate match outcome probabilities
  * 4. Apply low-scoring correction for 0-0, 1-0, 0-1 scorelines (Dixon-Coles adjustment)
+ * 5. (NEW) Apply player absence impact adjustments to expected goals
  */
 @Injectable()
 export class PoissonModelService {
@@ -21,12 +23,16 @@ export class PoissonModelService {
 
   /**
    * Generate Poisson-based probabilities for a fixture.
+   *
+   * @param playerImpact Optional player absence impact scores.
+   *   When provided, adjusts expected goals based on quantified injury impact.
    */
   async predict(
     homeTeamId: number,
     awayTeamId: number,
     leagueId: number,
     fixtureId: number,
+    playerImpact?: { home: TeamAbsenceImpact; away: TeamAbsenceImpact },
   ): Promise<PoissonModelOutput> {
     try {
       // Get recent completed fixtures with stats for both teams
@@ -71,10 +77,39 @@ export class PoissonModelService {
       // Expected goals
       // Home xG = league_avg * home_attack * away_defense * home_advantage
       // Away xG = league_avg * away_attack * home_defense * (1/home_advantage)
-      const expectedHomeGoals =
+      let expectedHomeGoals =
         leagueAvgGoals * homeAttack * awayDefense * homeAdvantage;
-      const expectedAwayGoals =
+      let expectedAwayGoals =
         leagueAvgGoals * awayAttack * homeDefense * (1 / homeAdvantage);
+
+      // ── Player absence adjustments ──────────────────────────────────
+      // When key players are injured/suspended, adjust expected goals:
+      // - Home team missing attackers → reduce home xG (multiply by xgMultiplier)
+      // - Home team missing defenders → increase away xG (multiply by xgaMultiplier)
+      // - And vice versa for away team
+      if (playerImpact) {
+        const homeXgMult = playerImpact.home.xgMultiplier;
+        const homeXgaMult = playerImpact.home.xgaMultiplier;
+        const awayXgMult = playerImpact.away.xgMultiplier;
+        const awayXgaMult = playerImpact.away.xgaMultiplier;
+
+        // Home team's offensive output reduced by their absences
+        expectedHomeGoals *= homeXgMult;
+        // Away team benefits from home's defensive absences
+        expectedAwayGoals *= homeXgaMult;
+        // Away team's offensive output reduced by their absences
+        expectedAwayGoals *= awayXgMult;
+        // Home team benefits from away's defensive absences
+        expectedHomeGoals *= awayXgaMult;
+
+        if (homeXgMult < 0.95 || awayXgMult < 0.95) {
+          this.logger.debug(
+            `Poisson player impact: homeXG ×${homeXgMult} ×${awayXgaMult}, ` +
+              `awayXG ×${awayXgMult} ×${homeXgaMult} → ` +
+              `home=${expectedHomeGoals.toFixed(2)}, away=${expectedAwayGoals.toFixed(2)}`,
+          );
+        }
+      }
 
       // Cap expected goals at reasonable range
       const cappedHome = Math.max(0.3, Math.min(4.0, expectedHomeGoals));

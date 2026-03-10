@@ -63,6 +63,11 @@ export interface CollectedMatchData {
     home: TeamRecentStats | null;
     away: TeamRecentStats | null;
   };
+  /** Quantified player absence impact scores (set by agents.service after data collection) */
+  playerImpact?: {
+    home: any;
+    away: any;
+  } | null;
 }
 
 @Injectable()

@@ -20,6 +20,7 @@ import { DataCollectorAgent } from '../agents/data-collector.agent';
 import { ResearchAgent } from '../agents/research.agent';
 import { AnalysisAgent } from '../agents/analysis.agent';
 import { PoissonModelService } from '../agents/poisson-model.service';
+import { PlayerImpactService } from '../agents/player-impact.service';
 import { AgentsService } from '../agents/agents.service';
 import { SyncService } from '../sync/sync.service';
 import { PolymarketGammaService } from '../polymarket/services/polymarket-gamma.service';
@@ -96,6 +97,7 @@ export function initServices(): Services {
   const researchAgent = new ResearchAgent(perplexityService);
   const analysisAgent = new AnalysisAgent(config);
   const poissonModel = new PoissonModelService(db as any);
+  const playerImpactService = new PlayerImpactService(db as any);
 
   const predictionMemory = new PredictionMemoryService(config);
 
@@ -106,6 +108,7 @@ export function initServices(): Services {
     researchAgent,
     analysisAgent,
     poissonModel,
+    playerImpactService,
     footballService,
     oddsService,
     alertsService,
