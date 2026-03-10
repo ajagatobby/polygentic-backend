@@ -1,9 +1,42 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { CollectedMatchData } from './data-collector.agent';
 import { ResearchResult } from './research.agent';
 import { PerformanceFeedback, PoissonModelOutput } from './types';
+
+// ─── Provider detection ─────────────────────────────────────────────
+type ModelProvider = 'anthropic' | 'openai';
+
+/**
+ * Auto-detect the LLM provider from the model name.
+ * OpenAI models: o1, o3, o4-mini, gpt-4o, gpt-5, etc.
+ * Everything else defaults to Anthropic (Claude).
+ */
+function detectProvider(model: string): ModelProvider {
+  const m = model.toLowerCase();
+  if (
+    m.startsWith('gpt-') ||
+    m.startsWith('o1') ||
+    m.startsWith('o3') ||
+    m.startsWith('o4') ||
+    m === 'chatgpt-4o-latest'
+  ) {
+    return 'openai';
+  }
+  return 'anthropic';
+}
+
+/**
+ * Detect if the model is an OpenAI reasoning model (o-series).
+ * Reasoning models use `reasoning_effort` instead of `temperature`,
+ * and use `developer` role instead of `system` role.
+ */
+function isReasoningModel(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4');
+}
 
 export interface PredictionOutput {
   homeWinProb: number;
@@ -222,19 +255,36 @@ Respond with ONLY valid JSON matching this exact schema:
 @Injectable()
 export class AnalysisAgent {
   private readonly logger = new Logger(AnalysisAgent.name);
-  private readonly anthropic: Anthropic;
+  private readonly anthropic: Anthropic | null;
+  private readonly openai: OpenAI | null;
   private readonly model: string;
+  private readonly provider: ModelProvider;
 
   constructor(private readonly config: ConfigService) {
-    this.anthropic = new Anthropic({
-      apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
-    });
     this.model =
       this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
+    this.provider = detectProvider(this.model);
+
+    if (this.provider === 'openai') {
+      const apiKey = this.config.get<string>('OPENAI_API_KEY');
+      if (!apiKey) {
+        throw new Error(
+          `OPENAI_API_KEY is required when using OpenAI model "${this.model}"`,
+        );
+      }
+      this.openai = new OpenAI({ apiKey });
+      this.anthropic = null;
+    } else {
+      this.anthropic = new Anthropic({
+        apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
+      });
+      this.openai = null;
+    }
   }
 
   /**
-   * Run Claude analysis over collected data + research to produce a structured prediction.
+   * Run LLM analysis over collected data + research to produce a structured prediction.
+   * Supports both Anthropic (Claude) and OpenAI (o3, o4-mini, GPT-5) models.
    */
   async analyze(
     data: CollectedMatchData,
@@ -249,7 +299,7 @@ export class AnalysisAgent {
       data.awayTeam?.team?.name ?? `Team ${data.fixture.awayTeamId}`;
 
     this.logger.log(
-      `Analyzing: ${homeName} vs ${awayName} with model ${this.model}`,
+      `Analyzing: ${homeName} vs ${awayName} with model ${this.model} (${this.provider})`,
     );
 
     const userPrompt = this.buildPrompt(
@@ -260,14 +310,32 @@ export class AnalysisAgent {
       memories,
     );
 
-    const response = await this.anthropic.messages.create({
+    const rawText =
+      this.provider === 'openai'
+        ? await this.callOpenAI(userPrompt)
+        : await this.callAnthropic(userPrompt);
+
+    // Parse JSON from response
+    const prediction = this.parseResponse(rawText);
+
+    // Validate and normalize probabilities
+    return this.validatePrediction(prediction, homeName, awayName);
+  }
+
+  // ─── LLM Provider Calls ────────────────────────────────────────────
+
+  /**
+   * Call Anthropic (Claude) with extended thinking and structured output.
+   */
+  private async callAnthropic(userPrompt: string): Promise<string> {
+    const response = await this.anthropic!.messages.create({
       model: this.model,
       max_tokens: 16000,
       temperature: 1,
       thinking: { type: 'adaptive' },
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userPrompt }],
-      // Opus 4.6 structured output — guarantees valid JSON
+      // Structured output — guarantees valid JSON
       output_config: {
         format: {
           type: 'json_schema' as const,
@@ -281,13 +349,71 @@ export class AnalysisAgent {
     const textBlock = response.content.find(
       (b: any) => b.type === 'text',
     ) as any;
-    const rawText: string = textBlock?.text ?? '';
+    return textBlock?.text ?? '';
+  }
 
-    // Parse JSON from response
-    const prediction = this.parseResponse(rawText);
+  /**
+   * Call OpenAI (o3, o4-mini, GPT-5, etc.) with structured output.
+   *
+   * Key API differences from Anthropic:
+   * - Reasoning models (o-series): use `developer` role, `reasoning_effort`,
+   *   no `temperature` parameter
+   * - GPT models: use `system` role, support `temperature`
+   * - Both: structured output via `response_format.type = 'json_schema'`
+   */
+  private async callOpenAI(userPrompt: string): Promise<string> {
+    const reasoning = isReasoningModel(this.model);
 
-    // Validate and normalize probabilities
-    return this.validatePrediction(prediction, homeName, awayName);
+    // OpenAI's structured output wraps the schema in a named container
+    const responseFormat = {
+      type: 'json_schema' as const,
+      json_schema: {
+        name: 'prediction_output',
+        strict: true,
+        schema: PREDICTION_JSON_SCHEMA,
+      },
+    };
+
+    // Build request — reasoning models have different parameters
+    const messages: OpenAI.ChatCompletionMessageParam[] = [
+      {
+        // Reasoning models use 'developer' role; GPT models use 'system'
+        role: reasoning ? 'developer' : 'system',
+        content: SYSTEM_PROMPT,
+      },
+      {
+        role: 'user',
+        content: userPrompt,
+      },
+    ];
+
+    const params: OpenAI.ChatCompletionCreateParamsNonStreaming = {
+      model: this.model,
+      messages,
+      max_completion_tokens: 16000,
+      response_format: responseFormat,
+      // Reasoning models don't support temperature — use reasoning_effort instead
+      ...(reasoning
+        ? { reasoning_effort: 'high' as const }
+        : { temperature: 0.7 }),
+    };
+
+    const response = await this.openai!.chat.completions.create(params);
+
+    const content = response.choices[0]?.message?.content ?? '';
+
+    // Log reasoning token usage if available
+    const usage = response.usage;
+    if (usage) {
+      const reasoningTokens = (usage as any).completion_tokens_details
+        ?.reasoning_tokens;
+      this.logger.log(
+        `OpenAI usage — input: ${usage.prompt_tokens}, output: ${usage.completion_tokens}` +
+          (reasoningTokens ? `, reasoning: ${reasoningTokens}` : ''),
+      );
+    }
+
+    return content;
   }
 
   // ─── Private helpers ────────────────────────────────────────────────
@@ -656,13 +782,13 @@ export class AnalysisAgent {
 
     // All strategies failed
     this.logger.error(
-      `Failed to parse Claude response as JSON after all extraction strategies`,
+      `Failed to parse ${this.provider} response as JSON after all extraction strategies`,
     );
     this.logger.debug(
       `Raw response (first 500 chars): ${rawText.substring(0, 500)}`,
     );
     throw new Error(
-      `Analysis agent returned invalid JSON: could not extract JSON from response`,
+      `Analysis agent (${this.provider}/${this.model}) returned invalid JSON: could not extract JSON from response`,
     );
   }
 

@@ -174,6 +174,10 @@ export class EnvConfig {
   ANTHROPIC_API_KEY: string;
 
   @IsString()
+  @IsOptional()
+  OPENAI_API_KEY?: string;
+
+  @IsString()
   @IsNotEmpty()
   PERPLEXITY_API_KEY: string;
 

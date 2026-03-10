@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { MarketPricingSnapshot } from './polymarket-clob.service';
 import {
   MarketMatch,
@@ -265,15 +266,41 @@ Respond with ONLY valid JSON:
 @Injectable()
 export class PolymarketTradingAgent {
   private readonly logger = new Logger(PolymarketTradingAgent.name);
-  private readonly anthropic: Anthropic;
+  private readonly anthropic: Anthropic | null;
+  private readonly openai: OpenAI | null;
   private readonly model: string;
+  private readonly provider: 'anthropic' | 'openai';
 
   constructor(private readonly config: ConfigService) {
-    this.anthropic = new Anthropic({
-      apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
-    });
     this.model =
       this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
+
+    // Auto-detect provider from model name
+    const m = this.model.toLowerCase();
+    this.provider =
+      m.startsWith('gpt-') ||
+      m.startsWith('o1') ||
+      m.startsWith('o3') ||
+      m.startsWith('o4') ||
+      m === 'chatgpt-4o-latest'
+        ? 'openai'
+        : 'anthropic';
+
+    if (this.provider === 'openai') {
+      const apiKey = this.config.get<string>('OPENAI_API_KEY');
+      if (!apiKey) {
+        throw new Error(
+          `OPENAI_API_KEY is required when using OpenAI model "${this.model}"`,
+        );
+      }
+      this.openai = new OpenAI({ apiKey });
+      this.anthropic = null;
+    } else {
+      this.anthropic = new Anthropic({
+        apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
+      });
+      this.openai = null;
+    }
   }
 
   /**
@@ -306,26 +333,49 @@ export class PolymarketTradingAgent {
 
     this.logger.log(
       `Evaluating trade: ${logLabel} ` +
-        `(edge: ${(candidate.rawEdge * 100).toFixed(1)}%)`,
+        `(edge: ${(candidate.rawEdge * 100).toFixed(1)}%) [${this.provider}/${this.model}]`,
     );
 
-    const response = await this.anthropic.messages.create({
-      model: this.model,
-      max_tokens: 2048,
-      temperature: 0.1,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content:
-            prompt +
-            '\n\nIMPORTANT: Your ENTIRE response must be a single valid JSON object. Do NOT include any text, explanation, or markdown before or after the JSON. Start your response with { and end with }.',
-        },
-      ],
-    });
+    const userContent =
+      prompt +
+      '\n\nIMPORTANT: Your ENTIRE response must be a single valid JSON object. Do NOT include any text, explanation, or markdown before or after the JSON. Start your response with { and end with }.';
 
-    const textBlock = response.content.find((b) => b.type === 'text');
-    const rawText = textBlock?.text ?? '';
+    let rawText: string;
+
+    if (this.provider === 'openai') {
+      const m = this.model.toLowerCase();
+      const reasoning =
+        m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4');
+
+      const messages: OpenAI.ChatCompletionMessageParam[] = [
+        { role: reasoning ? 'developer' : 'system', content: systemPrompt },
+        { role: 'user', content: userContent },
+      ];
+
+      const params: OpenAI.ChatCompletionCreateParamsNonStreaming = {
+        model: this.model,
+        messages,
+        max_completion_tokens: 2048,
+        response_format: { type: 'json_object' as const },
+        ...(reasoning
+          ? { reasoning_effort: 'medium' as const }
+          : { temperature: 0.1 }),
+      };
+
+      const response = await this.openai!.chat.completions.create(params);
+      rawText = response.choices[0]?.message?.content ?? '';
+    } else {
+      const response = await this.anthropic!.messages.create({
+        model: this.model,
+        max_tokens: 2048,
+        temperature: 0.1,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userContent }],
+      });
+
+      const textBlock = response.content.find((b) => b.type === 'text');
+      rawText = textBlock?.text ?? '';
+    }
 
     return this.parseDecision(rawText, candidate);
   }
