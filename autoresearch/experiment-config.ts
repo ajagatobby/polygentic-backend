@@ -164,7 +164,7 @@ export const EXPERIMENT_CONFIG: ExperimentConfig = {
   competitiveDampening: {
     upperThreshold: 0.5,
     lowerThreshold: 0.38,
-    dampeningFactor: 0.95,
+    dampeningFactor: 1.0,
   },
 
   confidence: {
