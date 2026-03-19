@@ -150,9 +150,9 @@ export const EXPERIMENT_CONFIG: ExperimentConfig = {
   drawCalibration: {
     tier1Threshold: 0.5,
     tier2Threshold: 0.6,
-    tier1Floor: 0.38,
-    tier2Floor: 0.35,
-    tier3Floor: 0.28,
+    tier1Floor: 0.4,
+    tier2Floor: 0.36,
+    tier3Floor: 0.3,
     gapClosureFactor: 1.0,
   },
 
