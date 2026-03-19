@@ -1986,10 +1986,11 @@ export class AgentsService {
       poissonWeight = 0.65 * poissonConfMultiplier;
       bookmakerWeight = 0;
     } else if (!hasPoissonData && hasBookmakerData) {
-      // No Poisson data — bookmaker dominates
-      claudeWeight = 0.25;
+      // No Poisson data — avoid fully shadowing Claude with market priors.
+      // Heavy bookmaker dominance tended to over-pick favourites and suppress draws.
+      claudeWeight = 0.45;
       poissonWeight = 0;
-      bookmakerWeight = 0.75;
+      bookmakerWeight = 0.55;
     } else {
       // Only Claude available — worst case, use historical calibration adjustment
       claudeWeight = 1.0;
@@ -2030,25 +2031,53 @@ export class AgentsService {
     // Both LLMs and naive models systematically underestimate draw probability.
     //
     // Two-tier floor:
-    // - Tier 1 (close matches, max win < 0.50): draw floor = 0.24
+    // - Tier 1 (close matches, max win < 0.50): draw floor = 0.25
     //   These matches are genuinely uncertain; draws are common (~30%+)
-    // - Tier 2 (moderate matches, max win < 0.60): draw floor = 0.22
+    // - Tier 2 (moderate matches, max win < 0.60): draw floor = 0.23
     //   Slight favourite, but draw is still realistic (~25%)
-    // - Tier 3 (clear favourite, max win >= 0.60): draw floor = 0.18
+    // - Tier 3 (clear favourite, max win >= 0.60): draw floor = 0.20
     //   Only extreme mismatches should have draw below this
     const dominantProb = Math.max(homeWinProb, awayWinProb);
     let drawFloor: number;
     if (dominantProb < 0.5) {
-      drawFloor = 0.24; // Close match — draws very common
+      drawFloor = 0.25; // Close match — draws very common
     } else if (dominantProb < 0.6) {
-      drawFloor = 0.22; // Moderate favourite — draw still realistic
+      drawFloor = 0.23; // Moderate favourite — draw still realistic
     } else {
-      drawFloor = 0.18; // Clear favourite — lower draw floor
+      drawFloor = 0.2; // Clear favourite — lower draw floor
+    }
+
+    // Context-aware draw uplift for parity matches.
+    // These are high-draw profiles that pure probability blending often misses.
+    const homePos = Number(matchData.standings?.home?.leaguePosition ?? 0);
+    const awayPos = Number(matchData.standings?.away?.leaguePosition ?? 0);
+    if (homePos > 0 && awayPos > 0) {
+      const posGap = Math.abs(homePos - awayPos);
+      if (posGap <= 3) {
+        drawFloor = Math.max(drawFloor, 0.28);
+      } else if (posGap <= 5) {
+        drawFloor = Math.max(drawFloor, 0.26);
+      }
+    }
+
+    const homeXgDiff =
+      (matchData.recentStats?.home?.averages?.xG ?? 0) -
+      (matchData.recentStats?.home?.averages?.xGA ?? 0);
+    const awayXgDiff =
+      (matchData.recentStats?.away?.averages?.xG ?? 0) -
+      (matchData.recentStats?.away?.averages?.xGA ?? 0);
+    if (homeXgDiff !== 0 || awayXgDiff !== 0) {
+      const xgGap = Math.abs(homeXgDiff - awayXgDiff);
+      if (xgGap < 0.2) {
+        drawFloor = Math.max(drawFloor, 0.27);
+      } else if (xgGap < 0.35) {
+        drawFloor = Math.max(drawFloor, 0.25);
+      }
     }
 
     if (drawProb < drawFloor) {
-      // Draw is underweighted — apply calibration with 70% gap closure
-      const drawBoost = (drawFloor - drawProb) * 0.7;
+      // Draw is underweighted — apply stronger calibration with 85% gap closure
+      const drawBoost = (drawFloor - drawProb) * 0.85;
       drawProb += drawBoost;
       // Subtract proportionally from home and away
       const homeShare = homeWinProb / (homeWinProb + awayWinProb);
@@ -2066,7 +2095,7 @@ export class AgentsService {
     // When the favourite's probability is modest (< 0.50), the match is
     // genuinely uncertain. Dampen toward equal probabilities to avoid
     // false confidence in a marginal favourite.
-    const maxProb = Math.max(homeWinProb, drawProb, awayWinProb);
+    let maxProb = Math.max(homeWinProb, drawProb, awayWinProb);
     if (maxProb < 0.5 && maxProb > 0.38) {
       // Tight match — pull probabilities 5% toward the mean (1/3)
       const dampeningFactor = 0.95;
@@ -2082,13 +2111,14 @@ export class AgentsService {
       homeWinProb /= total;
       drawProb /= total;
       awayWinProb /= total;
+
+      maxProb = Math.max(homeWinProb, drawProb, awayWinProb);
     }
 
     // ── Overconfidence dampening ──────────────────────────────────────
-    // If any single outcome probability exceeds 0.70, dampen it.
-    // Even heavy favorites lose 20-25% of the time. The previous 0.75
-    // threshold was too generous — lowered to 0.70.
-    if (maxProb > 0.7) {
+    // If any single outcome probability exceeds 0.65, dampen it.
+    // Even heavy favorites lose 20-25% of the time.
+    if (maxProb > 0.65) {
       const dampeningFactor = 0.9; // Pull extreme probs 10% toward the mean
       const mean = 1 / 3;
       homeWinProb =
@@ -2392,21 +2422,25 @@ export class AgentsService {
     const maxWinProb = Math.max(homeProb, awayProb);
     const winSpread = Math.abs(homeProb - awayProb);
 
-    // 2. VERY TIGHT MATCH: no clear favourite (max win prob < 0.40)
-    //    AND draw is within 4pp of the leader AND draw is >= 0.30
+    // 2. VERY TIGHT MATCH: no clear favourite (max win prob < 0.43)
+    //    AND draw is within 6pp of the leader AND draw is >= 0.27
     //    These are genuinely uncertain matches — all three outcomes equally viable
-    if (maxWinProb < 0.4 && drawProb >= 0.3 && maxWinProb - drawProb < 0.04) {
+    if (maxWinProb < 0.43 && drawProb >= 0.27 && maxWinProb - drawProb < 0.06) {
       return 'draw';
     }
 
-    // 3. COMPETITIVE MATCH: slight favourite (max win prob 0.40-0.50)
-    //    Only predict draw when both teams are essentially equal (spread < 0.05)
-    //    AND draw probability is very strong (>= 0.32)
-    if (maxWinProb <= 0.5 && winSpread < 0.05 && drawProb >= 0.32) {
+    // 3. COMPETITIVE MATCH: slight favourite (max win prob up to 0.53)
+    //    Predict draw when teams are close and draw is meaningfully high.
+    if (maxWinProb <= 0.53 && winSpread < 0.08 && drawProb >= 0.28) {
       return 'draw';
     }
 
-    // 4. Otherwise, pick the higher of home or away
+    // 4. MODERATE FAVOURITE: still allow draw when it is very close to the leader.
+    if (maxWinProb <= 0.58 && drawProb >= 0.3 && maxWinProb - drawProb < 0.03) {
+      return 'draw';
+    }
+
+    // 5. Otherwise, pick the higher of home or away
     if (homeProb >= awayProb) return 'home_win';
     return 'away_win';
   }
