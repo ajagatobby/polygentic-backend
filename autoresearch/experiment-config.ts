@@ -152,7 +152,7 @@ export const EXPERIMENT_CONFIG: ExperimentConfig = {
     tier2Threshold: 0.6,
     tier1Floor: 0.4,
     tier2Floor: 0.36,
-    tier3Floor: 0.22,
+    tier3Floor: 0.2,
     gapClosureFactor: 1.0,
   },
 
