@@ -8,7 +8,7 @@
  * 4. What is the actual performance breakdown?
  */
 
-import postgres from 'postgres';
+import postgres = require('postgres');
 
 const DATABASE_URL =
   process.env.DATABASE_URL ||
