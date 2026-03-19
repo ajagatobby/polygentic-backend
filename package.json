@@ -28,7 +28,8 @@
     "trigger:run": "npx trigger.dev run",
     "trigger:status": "npx trigger.dev status",
     "sync:fixtures": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts",
-    "sync:fixtures:all": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts --all"
+    "sync:fixtures:all": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts --all",
+    "backtest": "npx ts-node -r tsconfig-paths/register autoresearch/backtest.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
