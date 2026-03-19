@@ -153,7 +153,7 @@ export const EXPERIMENT_CONFIG: ExperimentConfig = {
     tier1Floor: 0.38,
     tier2Floor: 0.35,
     tier3Floor: 0.28,
-    gapClosureFactor: 0.85,
+    gapClosureFactor: 1.0,
   },
 
   overconfidence: {
