@@ -46,6 +46,41 @@ export interface TeamRecentStats {
   };
 }
 
+export interface TeamFormWindowSummary {
+  sampleSize: number;
+  wins: number;
+  draws: number;
+  losses: number;
+  points: number;
+  pointsPerGame: number;
+  goalsFor: number;
+  goalsAgainst: number;
+  goalDiff: number;
+  winRate: number;
+  unbeatenRate: number;
+}
+
+export interface TeamFormWindows {
+  last5: TeamFormWindowSummary;
+  last10: TeamFormWindowSummary;
+}
+
+export interface SeasonRematchContext {
+  isSeasonRematch: boolean;
+  previousMeeting: {
+    fixtureId: number;
+    date: string;
+    round: string | null;
+    homeTeamId: number;
+    awayTeamId: number;
+    homeGoals: number | null;
+    awayGoals: number | null;
+    result: 'home_win' | 'away_win' | 'draw' | 'unknown';
+    winnerTeamId: number | null;
+    wasReverseFixture: boolean;
+  } | null;
+}
+
 export interface CollectedMatchData {
   fixture: any;
   homeTeam: { team: any; form: any[] } | null;
@@ -63,6 +98,11 @@ export interface CollectedMatchData {
     home: TeamRecentStats | null;
     away: TeamRecentStats | null;
   };
+  formWindows: {
+    home: TeamFormWindows | null;
+    away: TeamFormWindows | null;
+  };
+  seasonRematch: SeasonRematchContext;
   /** Quantified player absence impact scores (set by agents.service after data collection) */
   playerImpact?: {
     home: any;
@@ -111,6 +151,9 @@ export class DataCollectorAgent {
       apiPrediction,
       homeRecentStats,
       awayRecentStats,
+      homeFormWindows,
+      awayFormWindows,
+      seasonRematch,
     ] = await Promise.allSettled([
       this.footballService.getTeamById(fixture.homeTeamId),
       this.footballService.getTeamById(fixture.awayTeamId),
@@ -126,6 +169,9 @@ export class DataCollectorAgent {
       this.fetchApiPredictionSafe(fixtureId),
       this.getTeamRecentStats(fixture.homeTeamId, fixtureId, fixture.leagueId),
       this.getTeamRecentStats(fixture.awayTeamId, fixtureId, fixture.leagueId),
+      this.getTeamFormWindows(fixture.homeTeamId, fixtureId, fixture.leagueId),
+      this.getTeamFormWindows(fixture.awayTeamId, fixtureId, fixture.leagueId),
+      this.getSeasonRematchContext(fixture),
     ]);
 
     // 3. Get odds data by matching team names
@@ -148,13 +194,22 @@ export class DataCollectorAgent {
         home: this.unwrap(homeRecentStats),
         away: this.unwrap(awayRecentStats),
       },
+      formWindows: {
+        home: this.unwrap(homeFormWindows),
+        away: this.unwrap(awayFormWindows),
+      },
+      seasonRematch: this.unwrap(seasonRematch) ?? {
+        isSeasonRematch: false,
+        previousMeeting: null,
+      },
     };
 
     this.logger.log(
       `Data collected for fixture ${fixtureId}: ` +
         `h2h=${result.h2h.length}, injuries=${result.injuries.length}, ` +
         `lineups=${result.lineups.length}, odds_consensus=${result.odds.consensus.length}, ` +
-        `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}`,
+        `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}, ` +
+        `seasonRematch=${result.seasonRematch.isSeasonRematch}`,
     );
 
     return result;
@@ -243,11 +298,48 @@ export class DataCollectorAgent {
         .orderBy(desc(schema.injuries.updatedAt))
         .limit(50);
 
-      return injuries;
+      return injuries.filter((inj: any) =>
+        this.isConfirmedUnavailable(inj.type, inj.reason),
+      );
     } catch (error) {
       this.logger.warn(`Injuries fetch failed: ${error.message}`);
       return [];
     }
+  }
+
+  private isConfirmedUnavailable(
+    type: string | null,
+    reason: string | null,
+  ): boolean {
+    const t = String(type ?? '').toLowerCase();
+    const r = String(reason ?? '').toLowerCase();
+
+    if (!t && !r) return false;
+
+    if (
+      t.includes('questionable') ||
+      t.includes('doubtful') ||
+      t.includes('probable') ||
+      t.includes('fitness')
+    ) {
+      return false;
+    }
+
+    if (
+      t.includes('missing') ||
+      t.includes('out') ||
+      t.includes('suspended') ||
+      t.includes('ban')
+    ) {
+      return true;
+    }
+
+    // Fallback when provider omits type but reason clearly confirms absence.
+    if (r.includes('suspended') || r.includes('ban')) {
+      return true;
+    }
+
+    return false;
   }
 
   private async getTeamForm(
@@ -310,6 +402,163 @@ export class DataCollectorAgent {
     } catch (error) {
       this.logger.warn(`Odds fetch for fixture failed: ${error.message}`);
       return { consensus: [], bookmakers: [] };
+    }
+  }
+
+  /**
+   * Build overall-form windows from completed league matches only.
+   */
+  private async getTeamFormWindows(
+    teamId: number,
+    currentFixtureId: number,
+    leagueId: number,
+  ): Promise<TeamFormWindows | null> {
+    try {
+      const recentFixtures = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+            eq(schema.fixtures.status, 'FT'),
+            eq(schema.fixtures.leagueId, leagueId),
+            sql`${schema.fixtures.id} != ${currentFixtureId}`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(10);
+
+      if (recentFixtures.length === 0) return null;
+
+      const summarize = (fixtures: any[]): TeamFormWindowSummary => {
+        let wins = 0;
+        let draws = 0;
+        let losses = 0;
+        let goalsFor = 0;
+        let goalsAgainst = 0;
+
+        for (const f of fixtures) {
+          const isHome = f.homeTeamId === teamId;
+          const gf = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+          const ga = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+
+          goalsFor += gf;
+          goalsAgainst += ga;
+
+          if (gf > ga) wins++;
+          else if (gf < ga) losses++;
+          else draws++;
+        }
+
+        const sampleSize = fixtures.length;
+        const points = wins * 3 + draws;
+
+        return {
+          sampleSize,
+          wins,
+          draws,
+          losses,
+          points,
+          pointsPerGame:
+            sampleSize > 0 ? Number((points / sampleSize).toFixed(2)) : 0,
+          goalsFor,
+          goalsAgainst,
+          goalDiff: goalsFor - goalsAgainst,
+          winRate: sampleSize > 0 ? Number((wins / sampleSize).toFixed(2)) : 0,
+          unbeatenRate:
+            sampleSize > 0
+              ? Number(((wins + draws) / sampleSize).toFixed(2))
+              : 0,
+        };
+      };
+
+      return {
+        last5: summarize(recentFixtures.slice(0, 5)),
+        last10: summarize(recentFixtures),
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Form windows fetch failed for team ${teamId}: ${error.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Detects whether this is a same-competition, same-season rematch,
+   * and returns the latest prior meeting context.
+   */
+  private async getSeasonRematchContext(
+    fixture: any,
+  ): Promise<SeasonRematchContext> {
+    try {
+      if (!fixture?.season) {
+        return { isSeasonRematch: false, previousMeeting: null };
+      }
+
+      const previousRows = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            eq(schema.fixtures.leagueId, fixture.leagueId),
+            eq(schema.fixtures.season, fixture.season),
+            sql`${schema.fixtures.id} != ${fixture.id}`,
+            sql`${schema.fixtures.date} < ${fixture.date}`,
+            sql`(
+              (${schema.fixtures.homeTeamId} = ${fixture.homeTeamId} AND ${schema.fixtures.awayTeamId} = ${fixture.awayTeamId}) OR
+              (${schema.fixtures.homeTeamId} = ${fixture.awayTeamId} AND ${schema.fixtures.awayTeamId} = ${fixture.homeTeamId})
+            )`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(1);
+
+      const previous = previousRows?.[0];
+      if (!previous) {
+        return { isSeasonRematch: false, previousMeeting: null };
+      }
+
+      const homeGoals = previous.goalsHome;
+      const awayGoals = previous.goalsAway;
+
+      let result: 'home_win' | 'away_win' | 'draw' | 'unknown' = 'unknown';
+      let winnerTeamId: number | null = null;
+
+      if (homeGoals != null && awayGoals != null) {
+        if (homeGoals > awayGoals) {
+          result = 'home_win';
+          winnerTeamId = previous.homeTeamId;
+        } else if (awayGoals > homeGoals) {
+          result = 'away_win';
+          winnerTeamId = previous.awayTeamId;
+        } else {
+          result = 'draw';
+        }
+      }
+
+      return {
+        isSeasonRematch: true,
+        previousMeeting: {
+          fixtureId: previous.id,
+          date: new Date(previous.date).toISOString(),
+          round: previous.round ?? null,
+          homeTeamId: previous.homeTeamId,
+          awayTeamId: previous.awayTeamId,
+          homeGoals,
+          awayGoals,
+          result,
+          winnerTeamId,
+          wasReverseFixture:
+            previous.homeTeamId === fixture.awayTeamId &&
+            previous.awayTeamId === fixture.homeTeamId,
+        },
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Season rematch context failed for fixture ${fixture?.id}: ${error.message}`,
+      );
+      return { isSeasonRematch: false, previousMeeting: null };
     }
   }
 

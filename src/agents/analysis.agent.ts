@@ -207,6 +207,10 @@ Before adjusting probabilities, classify the match:
 - MISMATCH: max total adjustment is ±15% from base rates
 
 ### Step 4: Apply Contextual Adjustments (MAX ±5% total)
+- Round/rematch context (MANDATORY):
+  - You are given whether this fixture is a same-competition, same-season rematch.
+  - If it is a rematch, explicitly reference the prior meeting scoreline and whether venue order is reversed.
+  - Treat this as context, not destiny (usually only a small adjustment, about ±0-2%).
 - **Key injuries (USE THE IMPACT SCORES)**: The injury data now includes quantified impact scores (0-1 scale) based on goal involvement, starter status, and position. Use these scores directly:
   - CRITICAL impact (0.6+): adjust by ±2-3% — this player's absence materially changes the match
   - HIGH impact (0.4-0.6): adjust by ±1-2%
@@ -249,7 +253,7 @@ Respond with ONLY valid JSON matching this exact schema:
   "keyFactors": [<string>, ...],
   "riskFactors": [<string>, ...],
   "valueBets": [{"market": <string>, "selection": <string>, "reasoning": <string>, "edgePercent": <number>}, ...],
-  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then walk through each adjustment with specific numbers>
+  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) round/rematch context, (3) confirmed unavailable players, (4) overall form last 5, (5) overall form last 10, (6) any extra context>
 }`;
 
 @Injectable()
@@ -491,10 +495,27 @@ export class AnalysisAgent {
       `- Referee: ${fixture.referee ?? 'Unknown'}`,
     );
 
+    const seasonRematch = data.seasonRematch;
+    if (seasonRematch?.isSeasonRematch && seasonRematch.previousMeeting) {
+      const prev = seasonRematch.previousMeeting;
+      sections.push(`\n## Same-season rematch context`);
+      sections.push(
+        `- This is a same-competition, same-season rematch between these clubs.`,
+        `- Previous meeting: ${prev.homeGoals ?? '?'}-${prev.awayGoals ?? '?'} (fixture ${prev.fixtureId}, round ${prev.round ?? 'Unknown'}, date ${new Date(prev.date).toISOString().split('T')[0]}).`,
+        `- Venue order reversed from previous meeting: ${prev.wasReverseFixture ? 'YES' : 'NO'}.`,
+      );
+    } else {
+      sections.push(
+        `\n## Same-season rematch context`,
+        `- No prior same-competition, same-season meeting found for these teams.`,
+      );
+    }
+
     // Home team form + advanced stats
     if (data.homeTeam?.form?.length || data.standings.home) {
       sections.push(`\n## ${homeName} (Home)`);
       const form = data.standings.home;
+      const formWindows = data.formWindows?.home;
       if (form) {
         sections.push(
           `- League Position: ${form.leaguePosition ?? '?'}`,
@@ -505,6 +526,12 @@ export class AnalysisAgent {
           `- Goals Against Avg: ${form.goalsAgainstAvg ?? '?'}`,
           `- Clean Sheets: ${form.cleanSheets ?? '?'}`,
           `- Failed to Score: ${form.failedToScore ?? '?'}`,
+        );
+      }
+      if (formWindows) {
+        sections.push(
+          `- Overall Form (Last 5): W${formWindows.last5.wins} D${formWindows.last5.draws} L${formWindows.last5.losses}, PPG ${formWindows.last5.pointsPerGame}, GF ${formWindows.last5.goalsFor}, GA ${formWindows.last5.goalsAgainst}`,
+          `- Overall Form (Last 10): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}, GF ${formWindows.last10.goalsFor}, GA ${formWindows.last10.goalsAgainst}`,
         );
       }
     }
@@ -546,6 +573,7 @@ export class AnalysisAgent {
     if (data.awayTeam?.form?.length || data.standings.away) {
       sections.push(`\n## ${awayName} (Away)`);
       const form = data.standings.away;
+      const formWindows = data.formWindows?.away;
       if (form) {
         sections.push(
           `- League Position: ${form.leaguePosition ?? '?'}`,
@@ -556,6 +584,12 @@ export class AnalysisAgent {
           `- Goals Against Avg: ${form.goalsAgainstAvg ?? '?'}`,
           `- Clean Sheets: ${form.cleanSheets ?? '?'}`,
           `- Failed to Score: ${form.failedToScore ?? '?'}`,
+        );
+      }
+      if (formWindows) {
+        sections.push(
+          `- Overall Form (Last 5): W${formWindows.last5.wins} D${formWindows.last5.draws} L${formWindows.last5.losses}, PPG ${formWindows.last5.pointsPerGame}, GF ${formWindows.last5.goalsFor}, GA ${formWindows.last5.goalsAgainst}`,
+          `- Overall Form (Last 10): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}, GF ${formWindows.last10.goalsFor}, GA ${formWindows.last10.goalsAgainst}`,
         );
       }
     }
@@ -609,13 +643,14 @@ export class AnalysisAgent {
       }
     }
 
-    // Injuries — with quantified player impact scores when available
+    // Confirmed unavailable players — with quantified player impact scores when available
     if (data.injuries.length > 0) {
       const playerImpact = (data as any).playerImpact;
 
       if (playerImpact) {
-        sections.push(`\n## Injuries & Suspensions (Quantified Impact)`);
+        sections.push(`\n## Confirmed unavailable players (Quantified Impact)`);
         sections.push(
+          `Only confirmed unavailable players are included (no doubtful/questionable players).`,
           `Impact scores are data-driven (0-1 scale based on goal involvement, starter status, and position).`,
         );
 
@@ -683,7 +718,7 @@ export class AnalysisAgent {
         }
       } else {
         // Fallback: no impact scores available, use basic format
-        sections.push(`\n## Injuries & Suspensions`);
+        sections.push(`\n## Confirmed unavailable players`);
         for (const inj of data.injuries) {
           const side = inj.teamId === fixture.homeTeamId ? homeName : awayName;
           sections.push(
@@ -691,6 +726,11 @@ export class AnalysisAgent {
           );
         }
       }
+    } else {
+      sections.push(
+        `\n## Confirmed unavailable players`,
+        `- No confirmed unavailable players reported for either team.`,
+      );
     }
 
     // Lineups
