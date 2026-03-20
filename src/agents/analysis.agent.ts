@@ -201,6 +201,8 @@ Before adjusting probabilities, classify the match:
 ### Step 3: Adjust for Team Strength (respect the match type caps)
 - Use xG differential as THE primary metric (more predictive than goals scored).
 - League position is secondary — it reflects past luck as much as quality.
+- Account for schedule strength: if a team's recent form came mostly vs weak opponents,
+  discount that form; if it came vs strong opponents, upgrade it slightly.
 - A team outperforming xG by >0.3 goals/match WILL regress — factor this in.
 - TIGHT matches: max total adjustment is ±5% from base rates
 - MODERATE matches: max total adjustment is ±10% from base rates
@@ -253,7 +255,7 @@ Respond with ONLY valid JSON matching this exact schema:
   "keyFactors": [<string>, ...],
   "riskFactors": [<string>, ...],
   "valueBets": [{"market": <string>, "selection": <string>, "reasoning": <string>, "edgePercent": <number>}, ...],
-  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) round/rematch context, (3) confirmed unavailable players, (4) overall form last 5, (5) overall form last 10, (6) any extra context>
+  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) overall form last 5, (6) overall form last 10, (7) any extra context>
 }`;
 
 @Injectable()
@@ -534,6 +536,19 @@ export class AnalysisAgent {
           `- Overall Form (Last 10): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}, GF ${formWindows.last10.goalsFor}, GA ${formWindows.last10.goalsAgainst}`,
         );
       }
+      const opponentStrength = data.opponentStrength?.home;
+      if (opponentStrength) {
+        if (opponentStrength.currentOpponent) {
+          const c = opponentStrength.currentOpponent;
+          sections.push(
+            `- Current Opponent Snapshot: position ${c.leaguePosition ?? '?'}, points ${c.points ?? '?'}, GF avg ${c.goalsForAvg ?? '?'}, GA avg ${c.goalsAgainstAvg ?? '?'}, attack ${c.attackRating ?? '?'}, defense ${c.defenseRating ?? '?'}`,
+          );
+        }
+        sections.push(
+          `- Opponents Faced Strength (Last 5): avg pos ${opponentStrength.last5.avgOpponentLeaguePosition ?? '?'}, avg points ${opponentStrength.last5.avgOpponentPoints ?? '?'}, top-6 share ${opponentStrength.last5.top6OpponentShare ?? '?'}, top-10 share ${opponentStrength.last5.top10OpponentShare ?? '?'}`,
+          `- Opponents Faced Strength (Last 10): avg pos ${opponentStrength.last10.avgOpponentLeaguePosition ?? '?'}, avg points ${opponentStrength.last10.avgOpponentPoints ?? '?'}, top-6 share ${opponentStrength.last10.top6OpponentShare ?? '?'}, top-10 share ${opponentStrength.last10.top10OpponentShare ?? '?'}`,
+        );
+      }
     }
 
     // Home team advanced stats (xG-based)
@@ -590,6 +605,19 @@ export class AnalysisAgent {
         sections.push(
           `- Overall Form (Last 5): W${formWindows.last5.wins} D${formWindows.last5.draws} L${formWindows.last5.losses}, PPG ${formWindows.last5.pointsPerGame}, GF ${formWindows.last5.goalsFor}, GA ${formWindows.last5.goalsAgainst}`,
           `- Overall Form (Last 10): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}, GF ${formWindows.last10.goalsFor}, GA ${formWindows.last10.goalsAgainst}`,
+        );
+      }
+      const opponentStrength = data.opponentStrength?.away;
+      if (opponentStrength) {
+        if (opponentStrength.currentOpponent) {
+          const c = opponentStrength.currentOpponent;
+          sections.push(
+            `- Current Opponent Snapshot: position ${c.leaguePosition ?? '?'}, points ${c.points ?? '?'}, GF avg ${c.goalsForAvg ?? '?'}, GA avg ${c.goalsAgainstAvg ?? '?'}, attack ${c.attackRating ?? '?'}, defense ${c.defenseRating ?? '?'}`,
+          );
+        }
+        sections.push(
+          `- Opponents Faced Strength (Last 5): avg pos ${opponentStrength.last5.avgOpponentLeaguePosition ?? '?'}, avg points ${opponentStrength.last5.avgOpponentPoints ?? '?'}, top-6 share ${opponentStrength.last5.top6OpponentShare ?? '?'}, top-10 share ${opponentStrength.last5.top10OpponentShare ?? '?'}`,
+          `- Opponents Faced Strength (Last 10): avg pos ${opponentStrength.last10.avgOpponentLeaguePosition ?? '?'}, avg points ${opponentStrength.last10.avgOpponentPoints ?? '?'}, top-6 share ${opponentStrength.last10.top6OpponentShare ?? '?'}, top-10 share ${opponentStrength.last10.top10OpponentShare ?? '?'}`,
         );
       }
     }

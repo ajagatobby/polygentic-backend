@@ -81,6 +81,32 @@ export interface SeasonRematchContext {
   } | null;
 }
 
+export interface OpponentStrengthSnapshot {
+  teamId: number;
+  leaguePosition: number | null;
+  points: number | null;
+  goalsForAvg: number | null;
+  goalsAgainstAvg: number | null;
+  attackRating: string | null;
+  defenseRating: string | null;
+}
+
+export interface OpponentStrengthWindowSummary {
+  sampleSize: number;
+  avgOpponentLeaguePosition: number | null;
+  avgOpponentPoints: number | null;
+  avgOpponentGoalsForAvg: number | null;
+  avgOpponentGoalsAgainstAvg: number | null;
+  top6OpponentShare: number | null;
+  top10OpponentShare: number | null;
+}
+
+export interface OpponentStrengthProfile {
+  currentOpponent: OpponentStrengthSnapshot | null;
+  last5: OpponentStrengthWindowSummary;
+  last10: OpponentStrengthWindowSummary;
+}
+
 export interface CollectedMatchData {
   fixture: any;
   homeTeam: { team: any; form: any[] } | null;
@@ -101,6 +127,10 @@ export interface CollectedMatchData {
   formWindows: {
     home: TeamFormWindows | null;
     away: TeamFormWindows | null;
+  };
+  opponentStrength: {
+    home: OpponentStrengthProfile | null;
+    away: OpponentStrengthProfile | null;
   };
   seasonRematch: SeasonRematchContext;
   /** Quantified player absence impact scores (set by agents.service after data collection) */
@@ -153,6 +183,8 @@ export class DataCollectorAgent {
       awayRecentStats,
       homeFormWindows,
       awayFormWindows,
+      homeOpponentStrength,
+      awayOpponentStrength,
       seasonRematch,
     ] = await Promise.allSettled([
       this.footballService.getTeamById(fixture.homeTeamId),
@@ -171,6 +203,20 @@ export class DataCollectorAgent {
       this.getTeamRecentStats(fixture.awayTeamId, fixtureId, fixture.leagueId),
       this.getTeamFormWindows(fixture.homeTeamId, fixtureId, fixture.leagueId),
       this.getTeamFormWindows(fixture.awayTeamId, fixtureId, fixture.leagueId),
+      this.getOpponentStrengthProfile(
+        fixture.homeTeamId,
+        fixture.awayTeamId,
+        fixtureId,
+        fixture.leagueId,
+        fixture.season,
+      ),
+      this.getOpponentStrengthProfile(
+        fixture.awayTeamId,
+        fixture.homeTeamId,
+        fixtureId,
+        fixture.leagueId,
+        fixture.season,
+      ),
       this.getSeasonRematchContext(fixture),
     ]);
 
@@ -198,6 +244,10 @@ export class DataCollectorAgent {
         home: this.unwrap(homeFormWindows),
         away: this.unwrap(awayFormWindows),
       },
+      opponentStrength: {
+        home: this.unwrap(homeOpponentStrength),
+        away: this.unwrap(awayOpponentStrength),
+      },
       seasonRematch: this.unwrap(seasonRematch) ?? {
         isSeasonRematch: false,
         previousMeeting: null,
@@ -209,7 +259,8 @@ export class DataCollectorAgent {
         `h2h=${result.h2h.length}, injuries=${result.injuries.length}, ` +
         `lineups=${result.lineups.length}, odds_consensus=${result.odds.consensus.length}, ` +
         `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}, ` +
-        `seasonRematch=${result.seasonRematch.isSeasonRematch}`,
+        `seasonRematch=${result.seasonRematch.isSeasonRematch}, ` +
+        `opponentStrength=${result.opponentStrength.home != null && result.opponentStrength.away != null}`,
     );
 
     return result;
@@ -731,6 +782,183 @@ export class DataCollectorAgent {
           cornerKicks: 0,
         },
       };
+    }
+  }
+
+  /**
+   * Estimates schedule strength from opponent quality in a team's last 5/10
+   * completed league matches, plus a snapshot of the current opponent.
+   */
+  private async getOpponentStrengthProfile(
+    teamId: number,
+    currentOpponentTeamId: number,
+    currentFixtureId: number,
+    leagueId: number,
+    season: number | null,
+  ): Promise<OpponentStrengthProfile | null> {
+    try {
+      const recentFixtures = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+            eq(schema.fixtures.status, 'FT'),
+            eq(schema.fixtures.leagueId, leagueId),
+            sql`${schema.fixtures.id} != ${currentFixtureId}`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(10);
+
+      const opponentIds = new Set<number>([currentOpponentTeamId]);
+      for (const f of recentFixtures) {
+        opponentIds.add(f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId);
+      }
+
+      const teamForms = await this.db
+        .select()
+        .from(schema.teamForm)
+        .where(
+          and(
+            eq(schema.teamForm.leagueId, leagueId),
+            sql`${schema.teamForm.teamId} IN (${sql.join(
+              [...opponentIds].map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+            season != null ? eq(schema.teamForm.season, season) : sql`1 = 1`,
+          ),
+        )
+        .orderBy(desc(schema.teamForm.season), desc(schema.teamForm.updatedAt));
+
+      const formByTeam = new Map<number, any>();
+      for (const tf of teamForms) {
+        if (!formByTeam.has(tf.teamId)) {
+          formByTeam.set(tf.teamId, tf);
+        }
+      }
+
+      const summarizeWindow = (
+        fixtures: any[],
+      ): OpponentStrengthWindowSummary => {
+        if (fixtures.length === 0) {
+          return {
+            sampleSize: 0,
+            avgOpponentLeaguePosition: null,
+            avgOpponentPoints: null,
+            avgOpponentGoalsForAvg: null,
+            avgOpponentGoalsAgainstAvg: null,
+            top6OpponentShare: null,
+            top10OpponentShare: null,
+          };
+        }
+
+        const opponentForms: any[] = fixtures
+          .map((f: any) => {
+            const oppId = f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId;
+            return formByTeam.get(oppId) ?? null;
+          })
+          .filter((tf: any) => tf != null);
+
+        if (opponentForms.length === 0) {
+          return {
+            sampleSize: fixtures.length,
+            avgOpponentLeaguePosition: null,
+            avgOpponentPoints: null,
+            avgOpponentGoalsForAvg: null,
+            avgOpponentGoalsAgainstAvg: null,
+            top6OpponentShare: null,
+            top10OpponentShare: null,
+          };
+        }
+
+        const avg = (arr: number[]) =>
+          arr.length > 0
+            ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2))
+            : null;
+
+        const positions = opponentForms
+          .map((tf: any) =>
+            tf.leaguePosition != null ? Number(tf.leaguePosition) : null,
+          )
+          .filter((v: number | null): v is number => v != null);
+        const points = opponentForms
+          .map((tf: any) => (tf.points != null ? Number(tf.points) : null))
+          .filter((v: number | null): v is number => v != null);
+        const gf = opponentForms
+          .map((tf: any) =>
+            tf.goalsForAvg != null ? Number(tf.goalsForAvg) : null,
+          )
+          .filter((v: number | null): v is number => v != null);
+        const ga = opponentForms
+          .map((tf: any) =>
+            tf.goalsAgainstAvg != null ? Number(tf.goalsAgainstAvg) : null,
+          )
+          .filter((v: number | null): v is number => v != null);
+
+        const positionCount = positions.length;
+        const top6 =
+          positionCount > 0
+            ? Number(
+                (
+                  positions.filter((p) => p <= 6).length / positionCount
+                ).toFixed(2),
+              )
+            : null;
+        const top10 =
+          positionCount > 0
+            ? Number(
+                (
+                  positions.filter((p) => p <= 10).length / positionCount
+                ).toFixed(2),
+              )
+            : null;
+
+        return {
+          sampleSize: fixtures.length,
+          avgOpponentLeaguePosition: avg(positions),
+          avgOpponentPoints: avg(points),
+          avgOpponentGoalsForAvg: avg(gf),
+          avgOpponentGoalsAgainstAvg: avg(ga),
+          top6OpponentShare: top6,
+          top10OpponentShare: top10,
+        };
+      };
+
+      const currentOpponentForm = formByTeam.get(currentOpponentTeamId) ?? null;
+
+      return {
+        currentOpponent: currentOpponentForm
+          ? {
+              teamId: currentOpponentTeamId,
+              leaguePosition:
+                currentOpponentForm.leaguePosition != null
+                  ? Number(currentOpponentForm.leaguePosition)
+                  : null,
+              points:
+                currentOpponentForm.points != null
+                  ? Number(currentOpponentForm.points)
+                  : null,
+              goalsForAvg:
+                currentOpponentForm.goalsForAvg != null
+                  ? Number(currentOpponentForm.goalsForAvg)
+                  : null,
+              goalsAgainstAvg:
+                currentOpponentForm.goalsAgainstAvg != null
+                  ? Number(currentOpponentForm.goalsAgainstAvg)
+                  : null,
+              attackRating: currentOpponentForm.attackRating ?? null,
+              defenseRating: currentOpponentForm.defenseRating ?? null,
+            }
+          : null,
+        last5: summarizeWindow(recentFixtures.slice(0, 5)),
+        last10: summarizeWindow(recentFixtures),
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Opponent strength profile failed for team ${teamId}: ${error.message}`,
+      );
+      return null;
     }
   }
 

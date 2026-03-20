@@ -2367,6 +2367,7 @@ export class AgentsService {
       homeTeam: data.homeTeam?.team?.name ?? null,
       awayTeam: data.awayTeam?.team?.name ?? null,
       overallFormWindows: data.formWindows,
+      opponentStrength: data.opponentStrength,
       h2hCount: data.h2h.length,
       injuriesCount: data.injuries.length,
       lineupsAvailable: data.lineups.length > 0,
