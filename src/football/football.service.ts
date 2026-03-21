@@ -1688,7 +1688,14 @@ export class FootballService {
               riskFactors: bestPrediction.riskFactors,
               valueBets: bestPrediction.valueBets,
               detailedAnalysis: bestPrediction.detailedAnalysis,
-              opponentStrengthProfile:
+              opponentStrengthProfile: this.formatOpponentStrengthProfile(
+                bestPrediction.matchContext?.opponentStrength,
+                {
+                  homeName: homeTeam?.name ?? null,
+                  awayName: awayTeam?.name ?? null,
+                },
+              ),
+              opponentStrengthProfileRaw:
                 bestPrediction.matchContext?.opponentStrength ?? null,
               actualResult: bestPrediction.actualResult,
               wasCorrect: bestPrediction.wasCorrect,
@@ -1704,7 +1711,14 @@ export class FootballService {
           drawProb: p.drawProb,
           awayWinProb: p.awayWinProb,
           confidence: p.confidence,
-          opponentStrengthProfile: p.matchContext?.opponentStrength ?? null,
+          opponentStrengthProfile: this.formatOpponentStrengthProfile(
+            p.matchContext?.opponentStrength,
+            {
+              homeName: homeTeam?.name ?? null,
+              awayName: awayTeam?.name ?? null,
+            },
+          ),
+          opponentStrengthProfileRaw: p.matchContext?.opponentStrength ?? null,
           createdAt: p.createdAt,
         })),
       };
@@ -1919,7 +1933,14 @@ export class FootballService {
             valueBets: bestPrediction.valueBets,
             detailedAnalysis: bestPrediction.detailedAnalysis,
             matchContext: bestPrediction.matchContext,
-            opponentStrengthProfile:
+            opponentStrengthProfile: this.formatOpponentStrengthProfile(
+              bestPrediction.matchContext?.opponentStrength,
+              {
+                homeName: homeTeam?.name ?? null,
+                awayName: awayTeam?.name ?? null,
+              },
+            ),
+            opponentStrengthProfileRaw:
               bestPrediction.matchContext?.opponentStrength ?? null,
             researchContext: bestPrediction.researchContext,
             modelVersion: bestPrediction.modelVersion,
@@ -1941,7 +1962,14 @@ export class FootballService {
         predictedAwayGoals: p.predictedAwayGoals,
         confidence: p.confidence,
         keyFactors: p.keyFactors,
-        opponentStrengthProfile: p.matchContext?.opponentStrength ?? null,
+        opponentStrengthProfile: this.formatOpponentStrengthProfile(
+          p.matchContext?.opponentStrength,
+          {
+            homeName: homeTeam?.name ?? null,
+            awayName: awayTeam?.name ?? null,
+          },
+        ),
+        opponentStrengthProfileRaw: p.matchContext?.opponentStrength ?? null,
         actualResult: p.actualResult,
         wasCorrect: p.wasCorrect,
         resolvedAt: p.resolvedAt,
@@ -2432,6 +2460,134 @@ export class FootballService {
     }
 
     return [europeanSeason];
+  }
+
+  private formatOpponentStrengthProfile(
+    raw: any,
+    teamNames?: { homeName?: string | null; awayName?: string | null },
+  ): any {
+    if (!raw) return null;
+
+    const formatWindow = (window: any) => {
+      const sampleSize = Number(window?.sampleSize ?? 0);
+      const avgPos =
+        window?.avgOpponentLeaguePosition != null
+          ? Number(window.avgOpponentLeaguePosition)
+          : null;
+      const top6Share =
+        window?.top6OpponentShare != null
+          ? Number(window.top6OpponentShare)
+          : null;
+      const top10Share =
+        window?.top10OpponentShare != null
+          ? Number(window.top10OpponentShare)
+          : null;
+
+      let dataQuality: 'very_low' | 'low' | 'medium' | 'high' = 'very_low';
+      if (sampleSize >= 8) dataQuality = 'high';
+      else if (sampleSize >= 5) dataQuality = 'medium';
+      else if (sampleSize >= 3) dataQuality = 'low';
+
+      let difficulty:
+        | 'strong'
+        | 'above_average'
+        | 'average'
+        | 'weak'
+        | 'unknown' = 'unknown';
+      if (avgPos != null) {
+        if (avgPos <= 6) difficulty = 'strong';
+        else if (avgPos <= 10) difficulty = 'above_average';
+        else if (avgPos <= 14) difficulty = 'average';
+        else difficulty = 'weak';
+      }
+
+      return {
+        sampleSize,
+        dataQuality,
+        avgOpponentLeaguePosition: avgPos,
+        avgOpponentPoints:
+          window?.avgOpponentPoints != null
+            ? Number(window.avgOpponentPoints)
+            : null,
+        avgOpponentGoalsForAvg:
+          window?.avgOpponentGoalsForAvg != null
+            ? Number(window.avgOpponentGoalsForAvg)
+            : null,
+        avgOpponentGoalsAgainstAvg:
+          window?.avgOpponentGoalsAgainstAvg != null
+            ? Number(window.avgOpponentGoalsAgainstAvg)
+            : null,
+        top6OpponentShare: top6Share,
+        top10OpponentShare: top10Share,
+        top6OpponentPct:
+          top6Share != null ? Number((top6Share * 100).toFixed(0)) : null,
+        top10OpponentPct:
+          top10Share != null ? Number((top10Share * 100).toFixed(0)) : null,
+        scheduleDifficulty: difficulty,
+      };
+    };
+
+    const homeCurrent = raw.home?.currentOpponent;
+    const awayCurrent = raw.away?.currentOpponent;
+
+    return {
+      home: {
+        currentOpponent: homeCurrent
+          ? {
+              teamId: homeCurrent.teamId,
+              teamName: teamNames?.awayName ?? null,
+              leaguePosition:
+                homeCurrent.leaguePosition != null
+                  ? Number(homeCurrent.leaguePosition)
+                  : null,
+              points:
+                homeCurrent.points != null ? Number(homeCurrent.points) : null,
+              goalsForAvg:
+                homeCurrent.goalsForAvg != null
+                  ? Number(homeCurrent.goalsForAvg)
+                  : null,
+              goalsAgainstAvg:
+                homeCurrent.goalsAgainstAvg != null
+                  ? Number(homeCurrent.goalsAgainstAvg)
+                  : null,
+              attackRating: homeCurrent.attackRating ?? null,
+              defenseRating: homeCurrent.defenseRating ?? null,
+            }
+          : null,
+        opponentsFaced: {
+          last5: formatWindow(raw.home?.last5),
+          last10: formatWindow(raw.home?.last10),
+        },
+      },
+      away: {
+        currentOpponent: awayCurrent
+          ? {
+              teamId: awayCurrent.teamId,
+              teamName: teamNames?.homeName ?? null,
+              leaguePosition:
+                awayCurrent.leaguePosition != null
+                  ? Number(awayCurrent.leaguePosition)
+                  : null,
+              points:
+                awayCurrent.points != null ? Number(awayCurrent.points) : null,
+              goalsForAvg:
+                awayCurrent.goalsForAvg != null
+                  ? Number(awayCurrent.goalsForAvg)
+                  : null,
+              goalsAgainstAvg:
+                awayCurrent.goalsAgainstAvg != null
+                  ? Number(awayCurrent.goalsAgainstAvg)
+                  : null,
+              attackRating: awayCurrent.attackRating ?? null,
+              defenseRating: awayCurrent.defenseRating ?? null,
+            }
+          : null,
+        opponentsFaced: {
+          last5: formatWindow(raw.away?.last5),
+          last10: formatWindow(raw.away?.last10),
+        },
+      },
+    };
   }
 
   private parseStatInt(value: any): number | null {
