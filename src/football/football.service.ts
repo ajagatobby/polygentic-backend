@@ -1595,6 +1595,15 @@ export class FootballService {
       predictionsByFixture.set(p.fixtureId, existing);
     }
 
+    // Preload recent game history for all teams in the fixture set
+    const teamHistoryMap = new Map<number, any[]>();
+    await Promise.all(
+      [...teamIds].map(async (teamId) => {
+        const history = await this.getTeamRecentGameHistory(teamId, 5);
+        teamHistoryMap.set(teamId, history);
+      }),
+    );
+
     // Assemble response
     return fixtures.map((fixture: any) => {
       const homeTeam = teamMap.get(fixture.homeTeamId);
@@ -1643,6 +1652,7 @@ export class FootballService {
           shortName: homeTeam?.shortName ?? null,
           logo: homeTeam?.logo ?? null,
           teamColors: homeLineup?.teamColors ?? null,
+          recentGameHistory: teamHistoryMap.get(fixture.homeTeamId) ?? [],
           injuries: homeInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1656,6 +1666,7 @@ export class FootballService {
           shortName: awayTeam?.shortName ?? null,
           logo: awayTeam?.logo ?? null,
           teamColors: awayLineup?.teamColors ?? null,
+          recentGameHistory: teamHistoryMap.get(fixture.awayTeamId) ?? [],
           injuries: awayInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1784,7 +1795,14 @@ export class FootballService {
     // Fetch predictions, team names, lineups, and injuries in parallel
     const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(Boolean);
 
-    const [predictions, teamRows, lineups, injuries] = await Promise.all([
+    const [
+      predictions,
+      teamRows,
+      lineups,
+      injuries,
+      homeRecentHistory,
+      awayRecentHistory,
+    ] = await Promise.all([
       this.db
         .select()
         .from(schema.predictions)
@@ -1819,6 +1837,8 @@ export class FootballService {
             )
             .orderBy(desc(schema.injuries.updatedAt))
         : [],
+      this.getTeamRecentGameHistory(fixture.homeTeamId, 5),
+      this.getTeamRecentGameHistory(fixture.awayTeamId, 5),
     ]);
 
     const teamMap = new Map<
@@ -1887,6 +1907,7 @@ export class FootballService {
         shortName: homeTeam?.shortName ?? null,
         logo: homeTeam?.logo ?? null,
         teamColors: homeLineup?.teamColors ?? null,
+        recentGameHistory: homeRecentHistory,
         injuries: homeInjuries.map((inj: any) => ({
           playerId: inj.playerId,
           playerName: inj.playerName,
@@ -1900,6 +1921,7 @@ export class FootballService {
         shortName: awayTeam?.shortName ?? null,
         logo: awayTeam?.logo ?? null,
         teamColors: awayLineup?.teamColors ?? null,
+        recentGameHistory: awayRecentHistory,
         injuries: awayInjuries.map((inj: any) => ({
           playerId: inj.playerId,
           playerName: inj.playerName,
@@ -2460,6 +2482,153 @@ export class FootballService {
     }
 
     return [europeanSeason];
+  }
+
+  /**
+   * Returns a club's recent completed matches with compact outcome + stat context.
+   * Used in fixture responses to provide quick history reasoning context.
+   */
+  private async getTeamRecentGameHistory(
+    teamId: number,
+    limit = 5,
+  ): Promise<any[]> {
+    const completed = ['FT', 'AET', 'PEN'];
+
+    const fixtures = await this.db
+      .select()
+      .from(schema.fixtures)
+      .where(
+        and(
+          inArray(schema.fixtures.status, completed),
+          sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+        ),
+      )
+      .orderBy(desc(schema.fixtures.date))
+      .limit(limit);
+
+    if (fixtures.length === 0) return [];
+
+    const fixtureIds = fixtures.map((f: any) => f.id);
+
+    const teamsInFixtures = new Set<number>();
+    for (const f of fixtures) {
+      teamsInFixtures.add(f.homeTeamId);
+      teamsInFixtures.add(f.awayTeamId);
+    }
+
+    const [teamRows, statsRows, lineupRows] = await Promise.all([
+      this.db
+        .select({ id: schema.teams.id, name: schema.teams.name })
+        .from(schema.teams)
+        .where(
+          sql`${schema.teams.id} IN (${sql.join(
+            [...teamsInFixtures].map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      this.db
+        .select()
+        .from(schema.fixtureStatistics)
+        .where(
+          sql`${schema.fixtureStatistics.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      this.db
+        .select({
+          fixtureId: schema.fixtureLineups.fixtureId,
+          teamId: schema.fixtureLineups.teamId,
+          formation: schema.fixtureLineups.formation,
+        })
+        .from(schema.fixtureLineups)
+        .where(
+          sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+    ]);
+
+    const teamNameById = new Map<number, string>();
+    for (const t of teamRows) teamNameById.set(t.id, t.name);
+
+    const statsByFixtureTeam = new Map<string, any>();
+    for (const s of statsRows) {
+      statsByFixtureTeam.set(`${s.fixtureId}:${s.teamId}`, s);
+    }
+
+    const lineupByFixtureTeam = new Map<string, string | null>();
+    for (const l of lineupRows) {
+      lineupByFixtureTeam.set(
+        `${l.fixtureId}:${l.teamId}`,
+        l.formation ?? null,
+      );
+    }
+
+    return fixtures.map((f: any) => {
+      const isHome = f.homeTeamId === teamId;
+      const opponentTeamId = isHome ? f.awayTeamId : f.homeTeamId;
+      const goalsFor = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+      const goalsAgainst = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+
+      let result: 'win' | 'draw' | 'loss' = 'draw';
+      let winnerTeamId: number | null = null;
+      if (goalsFor > goalsAgainst) {
+        result = 'win';
+        winnerTeamId = teamId;
+      } else if (goalsFor < goalsAgainst) {
+        result = 'loss';
+        winnerTeamId = opponentTeamId;
+      }
+
+      const teamStats = statsByFixtureTeam.get(`${f.id}:${teamId}`);
+      const oppStats = statsByFixtureTeam.get(`${f.id}:${opponentTeamId}`);
+
+      return {
+        fixtureId: f.id,
+        date: f.date,
+        leagueId: f.leagueId,
+        leagueName: f.leagueName,
+        round: f.round,
+        venue: isHome ? 'home' : 'away',
+        opponent: {
+          teamId: opponentTeamId,
+          name: teamNameById.get(opponentTeamId) ?? null,
+        },
+        score: {
+          goalsFor,
+          goalsAgainst,
+          homeGoals: f.goalsHome,
+          awayGoals: f.goalsAway,
+        },
+        result,
+        winnerTeamId,
+        formation: lineupByFixtureTeam.get(`${f.id}:${teamId}`) ?? null,
+        opponentFormation:
+          lineupByFixtureTeam.get(`${f.id}:${opponentTeamId}`) ?? null,
+        stats: {
+          shotsOnTarget: teamStats?.shotsOnGoal ?? null,
+          totalShots: teamStats?.totalShots ?? null,
+          possession:
+            teamStats?.possession != null ? Number(teamStats.possession) : null,
+          expectedGoals:
+            teamStats?.expectedGoals != null
+              ? Number(teamStats.expectedGoals)
+              : null,
+        },
+        opponentStats: {
+          shotsOnTarget: oppStats?.shotsOnGoal ?? null,
+          totalShots: oppStats?.totalShots ?? null,
+          possession:
+            oppStats?.possession != null ? Number(oppStats.possession) : null,
+          expectedGoals:
+            oppStats?.expectedGoals != null
+              ? Number(oppStats.expectedGoals)
+              : null,
+        },
+      };
+    });
   }
 
   private formatOpponentStrengthProfile(
