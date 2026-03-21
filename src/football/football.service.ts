@@ -74,6 +74,15 @@ interface ApiFootballResponse<T = any> {
   response: T[];
 }
 
+export type FixtureByIdResult = {
+  fixture: any;
+  statistics: any[];
+  events: any[];
+  injuries: any[];
+  lineups: any[];
+  prediction: any;
+};
+
 @Injectable()
 export class FootballService {
   private readonly logger = new Logger(FootballService.name);
@@ -1679,6 +1688,8 @@ export class FootballService {
               riskFactors: bestPrediction.riskFactors,
               valueBets: bestPrediction.valueBets,
               detailedAnalysis: bestPrediction.detailedAnalysis,
+              opponentStrengthProfile:
+                bestPrediction.matchContext?.opponentStrength ?? null,
               actualResult: bestPrediction.actualResult,
               wasCorrect: bestPrediction.wasCorrect,
               probabilityAccuracy: bestPrediction.probabilityAccuracy,
@@ -1693,6 +1704,7 @@ export class FootballService {
           drawProb: p.drawProb,
           awayWinProb: p.awayWinProb,
           confidence: p.confidence,
+          opponentStrengthProfile: p.matchContext?.opponentStrength ?? null,
           createdAt: p.createdAt,
         })),
       };
@@ -1702,14 +1714,7 @@ export class FootballService {
   /**
    * Get a single fixture by its API-Football ID with all related data.
    */
-  async getFixtureById(id: number): Promise<{
-    fixture: any;
-    statistics: any[];
-    events: any[];
-    injuries: any[];
-    lineups: any[];
-    prediction: any;
-  } | null> {
+  async getFixtureById(id: number): Promise<FixtureByIdResult | null> {
     const fixtureRows = await this.db
       .select()
       .from(schema.fixtures)
@@ -1914,6 +1919,8 @@ export class FootballService {
             valueBets: bestPrediction.valueBets,
             detailedAnalysis: bestPrediction.detailedAnalysis,
             matchContext: bestPrediction.matchContext,
+            opponentStrengthProfile:
+              bestPrediction.matchContext?.opponentStrength ?? null,
             researchContext: bestPrediction.researchContext,
             modelVersion: bestPrediction.modelVersion,
             actualResult: bestPrediction.actualResult,
@@ -1934,6 +1941,7 @@ export class FootballService {
         predictedAwayGoals: p.predictedAwayGoals,
         confidence: p.confidence,
         keyFactors: p.keyFactors,
+        opponentStrengthProfile: p.matchContext?.opponentStrength ?? null,
         actualResult: p.actualResult,
         wasCorrect: p.wasCorrect,
         resolvedAt: p.resolvedAt,
