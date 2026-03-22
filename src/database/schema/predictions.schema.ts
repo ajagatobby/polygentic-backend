@@ -121,6 +121,74 @@ export const alerts = pgTable(
   ],
 );
 
+// ─── prediction_tests ────────────────────────────────────────────────
+
+export const predictionTests = pgTable(
+  'prediction_tests',
+  {
+    id: serial('id').primaryKey(),
+    fixtureId: integer('fixture_id')
+      .notNull()
+      .references(() => fixtures.id),
+    predictionType: varchar('prediction_type', { length: 20 }).notNull(),
+
+    baselinePredictionId: integer('baseline_prediction_id').references(
+      () => predictions.id,
+    ),
+    retestPredictionId: integer('retest_prediction_id').references(
+      () => predictions.id,
+    ),
+
+    actualResult: varchar('actual_result', { length: 20 }).notNull(),
+
+    baselinePredictedResult: varchar('baseline_predicted_result', {
+      length: 20,
+    }),
+    baselineWasCorrect: boolean('baseline_was_correct'),
+    baselineHomeWinProb: numeric('baseline_home_win_prob', {
+      precision: 5,
+      scale: 4,
+    }),
+    baselineDrawProb: numeric('baseline_draw_prob', {
+      precision: 5,
+      scale: 4,
+    }),
+    baselineAwayWinProb: numeric('baseline_away_win_prob', {
+      precision: 5,
+      scale: 4,
+    }),
+    baselineBrier: numeric('baseline_brier', {
+      precision: 8,
+      scale: 6,
+    }),
+
+    retestPredictedResult: varchar('retest_predicted_result', { length: 20 }),
+    retestWasCorrect: boolean('retest_was_correct'),
+    retestHomeWinProb: numeric('retest_home_win_prob', {
+      precision: 5,
+      scale: 4,
+    }),
+    retestDrawProb: numeric('retest_draw_prob', { precision: 5, scale: 4 }),
+    retestAwayWinProb: numeric('retest_away_win_prob', {
+      precision: 5,
+      scale: 4,
+    }),
+    retestBrier: numeric('retest_brier', { precision: 8, scale: 6 }),
+
+    improved: boolean('improved'),
+    runStatus: varchar('run_status', { length: 20 }).default('completed'),
+    errorMessage: text('error_message'),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_prediction_tests_fixture').on(table.fixtureId),
+    index('idx_prediction_tests_type').on(table.predictionType),
+    index('idx_prediction_tests_created').on(table.createdAt),
+    index('idx_prediction_tests_status').on(table.runStatus),
+  ],
+);
+
 // ─── RELATIONS ─────────────────────────────────────────────────────────
 
 export const predictionsRelations = relations(predictions, ({ one, many }) => ({
@@ -139,6 +207,8 @@ export const predictionsRelations = relations(predictions, ({ one, many }) => ({
     relationName: 'predictionAwayTeam',
   }),
   alerts: many(alerts),
+  baselineTests: many(predictionTests, { relationName: 'baselinePrediction' }),
+  retestTests: many(predictionTests, { relationName: 'retestPrediction' }),
 }));
 
 export const alertsRelations = relations(alerts, ({ one }) => ({
@@ -151,3 +221,23 @@ export const alertsRelations = relations(alerts, ({ one }) => ({
     references: [fixtures.id],
   }),
 }));
+
+export const predictionTestsRelations = relations(
+  predictionTests,
+  ({ one }) => ({
+    fixture: one(fixtures, {
+      fields: [predictionTests.fixtureId],
+      references: [fixtures.id],
+    }),
+    baselinePrediction: one(predictions, {
+      fields: [predictionTests.baselinePredictionId],
+      references: [predictions.id],
+      relationName: 'baselinePrediction',
+    }),
+    retestPrediction: one(predictions, {
+      fields: [predictionTests.retestPredictionId],
+      references: [predictions.id],
+      relationName: 'retestPrediction',
+    }),
+  }),
+);
