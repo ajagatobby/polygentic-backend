@@ -28,6 +28,7 @@ import {
   syncCompletedFixturesAndResolveTask,
 } from '../trigger/sync-and-resolve';
 import { rerunPredictionsTask } from '../trigger/rerun-predictions';
+import { testFailedPredictionsTask } from '../trigger/test-failed-predictions';
 
 @ApiTags('Predictions')
 @ApiBearerAuth('firebase-auth')
@@ -476,6 +477,65 @@ export class AgentsController {
     return {
       message: 'Daily prediction generation task triggered',
       taskRunId: handle.id,
+    };
+  }
+
+  @Roles('admin')
+  @Post('test-failed')
+  @ApiOperation({
+    summary:
+      '[Admin] Trigger failed-prediction retest run (writes to prediction_tests table)',
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['daily', 'pre_match', 'on_demand'],
+    description: 'Prediction type slot to retest (default: daily)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max failed predictions to retest (default: 20, max: 200)',
+  })
+  @ApiQuery({
+    name: 'fixtureIds',
+    required: false,
+    type: String,
+    description:
+      'Optional comma-separated fixture IDs to scope retest (e.g. 101,102,103)',
+  })
+  async testFailedPredictions(
+    @Query('type') type?: string,
+    @Query('limit') limit?: string,
+    @Query('fixtureIds') fixtureIds?: string,
+  ) {
+    const predictionType = (type as PredictionType) || 'daily';
+    const parsedLimit = limit ? Math.min(Math.max(Number(limit), 1), 200) : 20;
+
+    const parsedFixtureIds = fixtureIds
+      ? fixtureIds
+          .split(',')
+          .map((v) => Number(v.trim()))
+          .filter((n) => Number.isFinite(n) && n > 0)
+      : undefined;
+
+    this.logger.log(
+      `Triggering failed-prediction test task (type=${predictionType}, limit=${parsedLimit}, fixtureIds=${parsedFixtureIds?.join(',') ?? 'all'})`,
+    );
+
+    const handle = await testFailedPredictionsTask.trigger({
+      predictionType,
+      limit: parsedLimit,
+      fixtureIds: parsedFixtureIds,
+    });
+
+    return {
+      message: 'Failed-prediction test task triggered',
+      taskRunId: handle.id,
+      predictionType,
+      limit: parsedLimit,
+      fixtureIds: parsedFixtureIds ?? 'all',
     };
   }
 
