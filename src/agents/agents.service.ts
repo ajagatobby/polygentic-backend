@@ -1,5 +1,6 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import OpenAI from 'openai';
 import {
   eq,
   and,
@@ -41,6 +42,8 @@ export { PredictionType, PerformanceFeedback } from './types';
 @Injectable()
 export class AgentsService {
   private readonly logger = new Logger(AgentsService.name);
+  private readonly openai?: OpenAI;
+  private readonly insightsModel: string;
 
   constructor(
     @Inject('DRIZZLE') private db: any,
@@ -56,7 +59,12 @@ export class AgentsService {
     private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
     private readonly predictionMemory: PredictionMemoryService,
-  ) {}
+  ) {
+    const openaiKey = this.config.get<string>('OPENAI_API_KEY');
+    if (openaiKey) this.openai = new OpenAI({ apiKey: openaiKey });
+    this.insightsModel =
+      this.config.get<string>('PREDICTION_INSIGHTS_MODEL') || 'gpt-5.4';
+  }
 
   // ─── Core prediction pipeline ───────────────────────────────────────
 
@@ -931,6 +939,345 @@ export class AgentsService {
       .orderBy(desc(schema.predictions.createdAt));
 
     return this.enrichPredictionsWithTeamNames(rows);
+  }
+
+  /**
+   * Data-driven prediction analytics endpoint.
+   * Returns raw metrics + LLM-generated pattern insights.
+   */
+  async getPredictionInsights(filters?: {
+    predictionType?: PredictionType;
+    limit?: number;
+    minLeagueSample?: number;
+  }): Promise<any> {
+    const limit = Math.min(Math.max(filters?.limit ?? 500, 50), 2000);
+    const minLeagueSample = Math.min(
+      Math.max(filters?.minLeagueSample ?? 10, 3),
+      100,
+    );
+
+    const conditions = [eq(schema.predictions.predictionStatus, 'resolved')];
+    if (filters?.predictionType) {
+      conditions.push(
+        eq(schema.predictions.predictionType, filters.predictionType),
+      );
+    }
+
+    const resolved = await this.db
+      .select({
+        prediction: schema.predictions,
+        fixture: schema.fixtures,
+      })
+      .from(schema.predictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.predictions.fixtureId, schema.fixtures.id),
+      )
+      .where(and(...conditions))
+      .orderBy(desc(schema.predictions.resolvedAt))
+      .limit(limit);
+
+    if (resolved.length === 0) {
+      return {
+        generatedAt: new Date().toISOString(),
+        filters: {
+          predictionType: filters?.predictionType ?? 'all',
+          limit,
+          minLeagueSample,
+        },
+        totals: {
+          sampleSize: 0,
+          resolved: 0,
+          correct: 0,
+          accuracy: 0,
+          avgBrier: null,
+        },
+        patterns: {
+          summary: 'No resolved predictions available yet for insights.',
+          keyPatterns: [],
+          strongestLeagues: [],
+          weakestLeagues: [],
+          confidenceCalibration: [],
+          improvementSignals: [],
+        },
+      };
+    }
+
+    const total = resolved.length;
+    const correct = resolved.filter(
+      (r: any) => r.prediction.wasCorrect === true,
+    ).length;
+    const accuracy = total > 0 ? correct / total : 0;
+    const avgBrier =
+      total > 0
+        ? resolved.reduce(
+            (sum: number, r: any) =>
+              sum + (Number(r.prediction.probabilityAccuracy) || 0),
+            0,
+          ) / total
+        : null;
+
+    const byTypeMap: Record<
+      string,
+      { total: number; correct: number; avgBrierSum: number }
+    > = {};
+    const byLeagueMap: Record<
+      string,
+      {
+        total: number;
+        correct: number;
+        avgBrierSum: number;
+        leagueId: number;
+        country: string | null;
+      }
+    > = {};
+
+    const confidenceBuckets = {
+      high: { total: 0, correct: 0 }, // 8-10
+      medium: { total: 0, correct: 0 }, // 5-7
+      low: { total: 0, correct: 0 }, // 1-4
+    };
+
+    const predictedOutcomeCounts = { home_win: 0, draw: 0, away_win: 0 };
+    const actualOutcomeCounts = { home_win: 0, draw: 0, away_win: 0 };
+
+    for (const { prediction, fixture } of resolved) {
+      const type = prediction.predictionType as string;
+      if (!byTypeMap[type]) {
+        byTypeMap[type] = { total: 0, correct: 0, avgBrierSum: 0 };
+      }
+      byTypeMap[type].total++;
+      if (prediction.wasCorrect) byTypeMap[type].correct++;
+      byTypeMap[type].avgBrierSum +=
+        Number(prediction.probabilityAccuracy) || 0;
+
+      const leagueName = fixture.leagueName ?? `League ${fixture.leagueId}`;
+      if (!byLeagueMap[leagueName]) {
+        byLeagueMap[leagueName] = {
+          total: 0,
+          correct: 0,
+          avgBrierSum: 0,
+          leagueId: fixture.leagueId,
+          country: fixture.leagueCountry,
+        };
+      }
+      byLeagueMap[leagueName].total++;
+      if (prediction.wasCorrect) byLeagueMap[leagueName].correct++;
+      byLeagueMap[leagueName].avgBrierSum +=
+        Number(prediction.probabilityAccuracy) || 0;
+
+      const conf = Number(prediction.confidence ?? 5);
+      if (conf >= 8) {
+        confidenceBuckets.high.total++;
+        if (prediction.wasCorrect) confidenceBuckets.high.correct++;
+      } else if (conf >= 5) {
+        confidenceBuckets.medium.total++;
+        if (prediction.wasCorrect) confidenceBuckets.medium.correct++;
+      } else {
+        confidenceBuckets.low.total++;
+        if (prediction.wasCorrect) confidenceBuckets.low.correct++;
+      }
+
+      const predictedResult =
+        prediction.predictedResult ??
+        this.getPredictedResultFromProbs(
+          Number(prediction.homeWinProb),
+          Number(prediction.drawProb),
+          Number(prediction.awayWinProb),
+        );
+
+      if (
+        predictedResult === 'home_win' ||
+        predictedResult === 'draw' ||
+        predictedResult === 'away_win'
+      ) {
+        predictedOutcomeCounts[predictedResult]++;
+      }
+
+      if (
+        prediction.actualResult === 'home_win' ||
+        prediction.actualResult === 'draw' ||
+        prediction.actualResult === 'away_win'
+      ) {
+        actualOutcomeCounts[prediction.actualResult]++;
+      }
+    }
+
+    const byType = Object.entries(byTypeMap).map(([type, v]) => ({
+      predictionType: type,
+      total: v.total,
+      correct: v.correct,
+      accuracy: v.total > 0 ? Number((v.correct / v.total).toFixed(4)) : 0,
+      avgBrier:
+        v.total > 0 ? Number((v.avgBrierSum / v.total).toFixed(6)) : null,
+    }));
+
+    const leagueRows = Object.entries(byLeagueMap).map(([league, v]) => ({
+      league,
+      leagueId: v.leagueId,
+      country: v.country,
+      total: v.total,
+      correct: v.correct,
+      accuracy: v.total > 0 ? Number((v.correct / v.total).toFixed(4)) : 0,
+      avgBrier:
+        v.total > 0 ? Number((v.avgBrierSum / v.total).toFixed(6)) : null,
+    }));
+
+    const leaguesWithSample = leagueRows.filter(
+      (r) => r.total >= minLeagueSample,
+    );
+
+    const strongestLeagues = [...leaguesWithSample]
+      .sort((a, b) => b.accuracy - a.accuracy)
+      .slice(0, 5);
+
+    const weakestLeagues = [...leaguesWithSample]
+      .sort((a, b) => a.accuracy - b.accuracy)
+      .slice(0, 5);
+
+    // Simple time trend: recent half vs previous half
+    const midpoint = Math.floor(resolved.length / 2);
+    const recentHalf = resolved.slice(0, midpoint);
+    const previousHalf = resolved.slice(midpoint);
+
+    const calcAcc = (rows: any[]) =>
+      rows.length > 0
+        ? rows.filter((r: any) => r.prediction.wasCorrect === true).length /
+          rows.length
+        : 0;
+
+    const calcBrier = (rows: any[]) =>
+      rows.length > 0
+        ? rows.reduce(
+            (sum: number, r: any) =>
+              sum + (Number(r.prediction.probabilityAccuracy) || 0),
+            0,
+          ) / rows.length
+        : null;
+
+    const recentAccuracy = calcAcc(recentHalf);
+    const previousAccuracy = calcAcc(previousHalf);
+    const recentBrier = calcBrier(recentHalf);
+    const previousBrier = calcBrier(previousHalf);
+
+    const predictionTestRows = await this.db
+      .select({
+        test: schema.predictionTests,
+        fixture: schema.fixtures,
+      })
+      .from(schema.predictionTests)
+      .leftJoin(
+        schema.fixtures,
+        eq(schema.predictionTests.fixtureId, schema.fixtures.id),
+      )
+      .orderBy(desc(schema.predictionTests.createdAt))
+      .limit(1000);
+
+    const testsTotal = predictionTestRows.length;
+    const testsImproved = predictionTestRows.filter(
+      (r: any) => r.test.improved === true,
+    ).length;
+    const testsRetestCorrect = predictionTestRows.filter(
+      (r: any) => r.test.retestWasCorrect === true,
+    ).length;
+
+    const rawMetrics = {
+      sampleSize: total,
+      overall: {
+        accuracy: Number(accuracy.toFixed(4)),
+        avgBrier: avgBrier != null ? Number(avgBrier.toFixed(6)) : null,
+      },
+      trend: {
+        recentHalfSize: recentHalf.length,
+        previousHalfSize: previousHalf.length,
+        recentAccuracy: Number(recentAccuracy.toFixed(4)),
+        previousAccuracy: Number(previousAccuracy.toFixed(4)),
+        accuracyDelta: Number((recentAccuracy - previousAccuracy).toFixed(4)),
+        recentBrier:
+          recentBrier != null ? Number(recentBrier.toFixed(6)) : null,
+        previousBrier:
+          previousBrier != null ? Number(previousBrier.toFixed(6)) : null,
+        brierDelta:
+          recentBrier != null && previousBrier != null
+            ? Number((recentBrier - previousBrier).toFixed(6))
+            : null,
+      },
+      byType,
+      leagueCount: leagueRows.length,
+      strongestLeagues,
+      weakestLeagues,
+      confidenceBuckets: {
+        high: {
+          ...confidenceBuckets.high,
+          accuracy:
+            confidenceBuckets.high.total > 0
+              ? Number(
+                  (
+                    confidenceBuckets.high.correct /
+                    confidenceBuckets.high.total
+                  ).toFixed(4),
+                )
+              : 0,
+        },
+        medium: {
+          ...confidenceBuckets.medium,
+          accuracy:
+            confidenceBuckets.medium.total > 0
+              ? Number(
+                  (
+                    confidenceBuckets.medium.correct /
+                    confidenceBuckets.medium.total
+                  ).toFixed(4),
+                )
+              : 0,
+        },
+        low: {
+          ...confidenceBuckets.low,
+          accuracy:
+            confidenceBuckets.low.total > 0
+              ? Number(
+                  (
+                    confidenceBuckets.low.correct / confidenceBuckets.low.total
+                  ).toFixed(4),
+                )
+              : 0,
+        },
+      },
+      predictedOutcomeCounts,
+      actualOutcomeCounts,
+      retestSummary: {
+        total: testsTotal,
+        improved: testsImproved,
+        improvedRate:
+          testsTotal > 0 ? Number((testsImproved / testsTotal).toFixed(4)) : 0,
+        retestCorrect: testsRetestCorrect,
+        retestCorrectRate:
+          testsTotal > 0
+            ? Number((testsRetestCorrect / testsTotal).toFixed(4))
+            : 0,
+      },
+    };
+
+    const patterns = await this.generateInsightsWithOpenAI(rawMetrics);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      model: this.insightsModel,
+      filters: {
+        predictionType: filters?.predictionType ?? 'all',
+        limit,
+        minLeagueSample,
+      },
+      totals: {
+        sampleSize: total,
+        resolved: total,
+        correct,
+        accuracy: Number(accuracy.toFixed(4)),
+        avgBrier: avgBrier != null ? Number(avgBrier.toFixed(6)) : null,
+      },
+      rawMetrics,
+      patterns,
+    };
   }
 
   /**
@@ -2586,5 +2933,115 @@ export class AgentsService {
       riskFactors: riskFactors.slice(0, 8),
       detailedAnalysis: lines.join(' '),
     };
+  }
+
+  private async generateInsightsWithOpenAI(rawMetrics: any): Promise<any> {
+    if (!this.openai) {
+      return {
+        summary:
+          'OpenAI insights unavailable because OPENAI_API_KEY is not configured.',
+        keyPatterns: [],
+        strongestLeagues: [],
+        weakestLeagues: [],
+        confidenceCalibration: [],
+        improvementSignals: [],
+      };
+    }
+
+    const prompt = `You are a football prediction performance analyst.
+
+Analyze the metrics and return ONLY JSON with this shape:
+{
+  "summary": "short executive summary",
+  "keyPatterns": ["..."],
+  "strongestLeagues": ["..."],
+  "weakestLeagues": ["..."],
+  "confidenceCalibration": ["..."],
+  "improvementSignals": ["..."]
+}
+
+Requirements:
+- Be strictly data-driven from the supplied metrics.
+- Mention trend direction (accuracy/brier improving or worsening) with exact numbers when possible.
+- Mention best/worst leagues by accuracy.
+- Mention where confidence appears over/under calibrated.
+- Keep each bullet short and concrete.
+
+Metrics JSON:
+${JSON.stringify(rawMetrics)}`;
+
+    try {
+      const model = this.insightsModel;
+      const lower = model.toLowerCase();
+      const isReasoning =
+        lower.startsWith('o1') ||
+        lower.startsWith('o3') ||
+        lower.startsWith('o4') ||
+        lower.startsWith('gpt-5');
+
+      let content = '';
+      if (isReasoning) {
+        const response = await this.openai.chat.completions.create({
+          model,
+          messages: [{ role: 'developer', content: prompt }],
+          reasoning_effort: 'high',
+          max_completion_tokens: 1400,
+        } as any);
+        content = response.choices[0]?.message?.content ?? '';
+      } else {
+        const response = await this.openai.chat.completions.create({
+          model,
+          messages: [{ role: 'system', content: prompt }],
+          temperature: 0.2,
+          max_tokens: 1400,
+        });
+        content = response.choices[0]?.message?.content ?? '';
+      }
+
+      const parsed = this.parseJsonLoose(content);
+      return {
+        summary: parsed?.summary ?? 'No summary returned by model.',
+        keyPatterns: Array.isArray(parsed?.keyPatterns)
+          ? parsed.keyPatterns.slice(0, 8).map(String)
+          : [],
+        strongestLeagues: Array.isArray(parsed?.strongestLeagues)
+          ? parsed.strongestLeagues.slice(0, 6).map(String)
+          : [],
+        weakestLeagues: Array.isArray(parsed?.weakestLeagues)
+          ? parsed.weakestLeagues.slice(0, 6).map(String)
+          : [],
+        confidenceCalibration: Array.isArray(parsed?.confidenceCalibration)
+          ? parsed.confidenceCalibration.slice(0, 6).map(String)
+          : [],
+        improvementSignals: Array.isArray(parsed?.improvementSignals)
+          ? parsed.improvementSignals.slice(0, 8).map(String)
+          : [],
+      };
+    } catch (error) {
+      this.logger.warn(`OpenAI insights generation failed: ${error.message}`);
+      return {
+        summary: 'OpenAI insights generation failed; raw metrics are returned.',
+        keyPatterns: [],
+        strongestLeagues: [],
+        weakestLeagues: [],
+        confidenceCalibration: [],
+        improvementSignals: [],
+        error: error.message,
+      };
+    }
+  }
+
+  private parseJsonLoose(raw: string): any {
+    const cleaned = String(raw ?? '').trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      const firstBrace = cleaned.indexOf('{');
+      const lastBrace = cleaned.lastIndexOf('}');
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+      }
+      throw new Error('Invalid JSON response from model');
+    }
   }
 }

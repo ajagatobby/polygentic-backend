@@ -58,6 +58,47 @@ export class AgentsController {
     return this.agentsService.getAccuracyStats();
   }
 
+  @Get('insights')
+  @ApiOperation({
+    summary:
+      'Get data-driven prediction pattern insights (OpenAI-powered analytics)',
+    description:
+      'Analyzes resolved predictions to surface trend shifts, strongest/weakest leagues, ' +
+      'confidence calibration patterns, and retest improvement signals.',
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['daily', 'pre_match', 'on_demand'],
+    description: 'Optional prediction type filter',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description:
+      'How many most-recent resolved predictions to analyze (50-2000)',
+  })
+  @ApiQuery({
+    name: 'minLeagueSample',
+    required: false,
+    type: Number,
+    description:
+      'Minimum resolved predictions required for a league to be included in best/worst league ranking',
+  })
+  async getInsights(
+    @Query('type') type?: string,
+    @Query('limit') limit?: string,
+    @Query('minLeagueSample') minLeagueSample?: string,
+  ) {
+    const predictionType = type as PredictionType | undefined;
+    return this.agentsService.getPredictionInsights({
+      predictionType,
+      limit: limit ? Number(limit) : undefined,
+      minLeagueSample: minLeagueSample ? Number(minLeagueSample) : undefined,
+    });
+  }
+
   @Get('bullish')
   @ApiOperation({
     summary:
