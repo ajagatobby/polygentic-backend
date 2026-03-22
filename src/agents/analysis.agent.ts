@@ -203,6 +203,8 @@ Before adjusting probabilities, classify the match:
 - League position is secondary — it reflects past luck as much as quality.
 - Account for schedule strength: if a team's recent form came mostly vs weak opponents,
   discount that form; if it came vs strong opponents, upgrade it slightly.
+- Use match-by-match history (last few games) to check if form is consistent:
+  scoreline, winner, formation, shots on target, total shots, and xG trends.
 - A team outperforming xG by >0.3 goals/match WILL regress — factor this in.
 - TIGHT matches: max total adjustment is ±5% from base rates
 - MODERATE matches: max total adjustment is ±10% from base rates
@@ -255,7 +257,7 @@ Respond with ONLY valid JSON matching this exact schema:
   "keyFactors": [<string>, ...],
   "riskFactors": [<string>, ...],
   "valueBets": [{"market": <string>, "selection": <string>, "reasoning": <string>, "edgePercent": <number>}, ...],
-  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) overall form last 5, (6) overall form last 10, (7) any extra context>
+  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) overall form last 5, (6) overall form last 10, (7) match-by-match recent game history, (8) any extra context>
 }`;
 
 @Injectable()
@@ -654,6 +656,41 @@ export class AnalysisAgent {
         }
       }
     }
+
+    const pushRecentGameHistory = (
+      teamLabel: string,
+      games: any[] | undefined,
+    ) => {
+      if (!games || games.length === 0) return;
+      sections.push(
+        `\n## ${teamLabel} — Match-by-match recent games (Last ${games.length})`,
+      );
+      for (const g of games) {
+        const date = g.date
+          ? new Date(g.date).toISOString().split('T')[0]
+          : '?';
+        const opponent =
+          g.opponent?.name ?? `Team ${g.opponent?.teamId ?? '?'}`;
+        const venue = g.venue === 'home' ? 'H' : 'A';
+        const gf = g.score?.goalsFor ?? '?';
+        const ga = g.score?.goalsAgainst ?? '?';
+        const result = String(g.result ?? 'draw').toUpperCase();
+        const formation = g.formation ?? '?';
+        const oppFormation = g.opponentFormation ?? '?';
+        const sot = g.stats?.shotsOnTarget ?? '?';
+        const oppSot = g.opponentStats?.shotsOnTarget ?? '?';
+        const ts = g.stats?.totalShots ?? '?';
+        const oppTs = g.opponentStats?.totalShots ?? '?';
+        const xg = g.stats?.expectedGoals ?? '?';
+        const oppXg = g.opponentStats?.expectedGoals ?? '?';
+        sections.push(
+          `- ${date} (${venue}) vs ${opponent}: ${gf}-${ga} [${result}] | formations ${formation} vs ${oppFormation} | shots OT ${sot}-${oppSot} | total shots ${ts}-${oppTs} | xG ${xg}-${oppXg}`,
+        );
+      }
+    };
+
+    pushRecentGameHistory(homeName, data.recentGameHistory?.home);
+    pushRecentGameHistory(awayName, data.recentGameHistory?.away);
 
     // H2H
     if (data.h2h.length > 0) {

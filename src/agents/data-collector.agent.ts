@@ -1,5 +1,5 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
@@ -107,6 +107,41 @@ export interface OpponentStrengthProfile {
   last10: OpponentStrengthWindowSummary;
 }
 
+export interface TeamRecentGameHistoryItem {
+  fixtureId: number;
+  date: string;
+  leagueId: number | null;
+  leagueName: string | null;
+  round: string | null;
+  venue: 'home' | 'away';
+  opponent: {
+    teamId: number;
+    name: string | null;
+  };
+  score: {
+    goalsFor: number;
+    goalsAgainst: number;
+    homeGoals: number | null;
+    awayGoals: number | null;
+  };
+  result: 'win' | 'draw' | 'loss';
+  winnerTeamId: number | null;
+  formation: string | null;
+  opponentFormation: string | null;
+  stats: {
+    shotsOnTarget: number | null;
+    totalShots: number | null;
+    possession: number | null;
+    expectedGoals: number | null;
+  };
+  opponentStats: {
+    shotsOnTarget: number | null;
+    totalShots: number | null;
+    possession: number | null;
+    expectedGoals: number | null;
+  };
+}
+
 export interface CollectedMatchData {
   fixture: any;
   homeTeam: { team: any; form: any[] } | null;
@@ -127,6 +162,10 @@ export interface CollectedMatchData {
   formWindows: {
     home: TeamFormWindows | null;
     away: TeamFormWindows | null;
+  };
+  recentGameHistory: {
+    home: TeamRecentGameHistoryItem[];
+    away: TeamRecentGameHistoryItem[];
   };
   opponentStrength: {
     home: OpponentStrengthProfile | null;
@@ -183,6 +222,8 @@ export class DataCollectorAgent {
       awayRecentStats,
       homeFormWindows,
       awayFormWindows,
+      homeRecentHistory,
+      awayRecentHistory,
       homeOpponentStrength,
       awayOpponentStrength,
       seasonRematch,
@@ -203,6 +244,8 @@ export class DataCollectorAgent {
       this.getTeamRecentStats(fixture.awayTeamId, fixtureId, fixture.leagueId),
       this.getTeamFormWindows(fixture.homeTeamId, fixtureId, fixture.leagueId),
       this.getTeamFormWindows(fixture.awayTeamId, fixtureId, fixture.leagueId),
+      this.getTeamRecentGameHistory(fixture.homeTeamId, fixtureId, 5),
+      this.getTeamRecentGameHistory(fixture.awayTeamId, fixtureId, 5),
       this.getOpponentStrengthProfile(
         fixture.homeTeamId,
         fixture.awayTeamId,
@@ -244,6 +287,10 @@ export class DataCollectorAgent {
         home: this.unwrap(homeFormWindows),
         away: this.unwrap(awayFormWindows),
       },
+      recentGameHistory: {
+        home: this.unwrap(homeRecentHistory) ?? [],
+        away: this.unwrap(awayRecentHistory) ?? [],
+      },
       opponentStrength: {
         home: this.unwrap(homeOpponentStrength),
         away: this.unwrap(awayOpponentStrength),
@@ -259,6 +306,7 @@ export class DataCollectorAgent {
         `h2h=${result.h2h.length}, injuries=${result.injuries.length}, ` +
         `lineups=${result.lineups.length}, odds_consensus=${result.odds.consensus.length}, ` +
         `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}, ` +
+        `homeHistory=${result.recentGameHistory.home.length}, awayHistory=${result.recentGameHistory.away.length}, ` +
         `seasonRematch=${result.seasonRematch.isSeasonRematch}, ` +
         `opponentStrength=${result.opponentStrength.home != null && result.opponentStrength.away != null}`,
     );
@@ -610,6 +658,166 @@ export class DataCollectorAgent {
         `Season rematch context failed for fixture ${fixture?.id}: ${error.message}`,
       );
       return { isSeasonRematch: false, previousMeeting: null };
+    }
+  }
+
+  /**
+   * Returns team-level recent games with match result + key stat context.
+   */
+  private async getTeamRecentGameHistory(
+    teamId: number,
+    currentFixtureId: number,
+    limit = 5,
+  ): Promise<TeamRecentGameHistoryItem[]> {
+    try {
+      const completedStatuses = ['FT', 'AET', 'PEN'];
+
+      const fixtures = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            inArray(schema.fixtures.status, completedStatuses),
+            sql`${schema.fixtures.id} != ${currentFixtureId}`,
+            sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(limit);
+
+      if (fixtures.length === 0) return [];
+
+      const fixtureIds = fixtures.map((f: any) => f.id);
+
+      const opponentIds = new Set<number>();
+      for (const f of fixtures) {
+        opponentIds.add(f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId);
+      }
+
+      const [teamRows, statRows, lineupRows] = await Promise.all([
+        this.db
+          .select({ id: schema.teams.id, name: schema.teams.name })
+          .from(schema.teams)
+          .where(
+            sql`${schema.teams.id} IN (${sql.join(
+              [...opponentIds].map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+        this.db
+          .select()
+          .from(schema.fixtureStatistics)
+          .where(
+            sql`${schema.fixtureStatistics.fixtureId} IN (${sql.join(
+              fixtureIds.map((id: number) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+        this.db
+          .select({
+            fixtureId: schema.fixtureLineups.fixtureId,
+            teamId: schema.fixtureLineups.teamId,
+            formation: schema.fixtureLineups.formation,
+          })
+          .from(schema.fixtureLineups)
+          .where(
+            sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+              fixtureIds.map((id: number) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+      ]);
+
+      const opponentNameById = new Map<number, string>();
+      for (const t of teamRows) opponentNameById.set(t.id, t.name);
+
+      const statByFixtureTeam = new Map<string, any>();
+      for (const s of statRows) {
+        statByFixtureTeam.set(`${s.fixtureId}:${s.teamId}`, s);
+      }
+
+      const formationByFixtureTeam = new Map<string, string | null>();
+      for (const l of lineupRows) {
+        formationByFixtureTeam.set(
+          `${l.fixtureId}:${l.teamId}`,
+          l.formation ?? null,
+        );
+      }
+
+      return fixtures.map((f: any) => {
+        const isHome = f.homeTeamId === teamId;
+        const opponentTeamId = isHome ? f.awayTeamId : f.homeTeamId;
+        const goalsFor = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+        const goalsAgainst = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+
+        let result: 'win' | 'draw' | 'loss' = 'draw';
+        let winnerTeamId: number | null = null;
+        if (goalsFor > goalsAgainst) {
+          result = 'win';
+          winnerTeamId = teamId;
+        } else if (goalsFor < goalsAgainst) {
+          result = 'loss';
+          winnerTeamId = opponentTeamId;
+        }
+
+        const teamStats = statByFixtureTeam.get(`${f.id}:${teamId}`);
+        const opponentStats = statByFixtureTeam.get(
+          `${f.id}:${opponentTeamId}`,
+        );
+
+        return {
+          fixtureId: f.id,
+          date: new Date(f.date).toISOString(),
+          leagueId: f.leagueId ?? null,
+          leagueName: f.leagueName ?? null,
+          round: f.round ?? null,
+          venue: isHome ? 'home' : 'away',
+          opponent: {
+            teamId: opponentTeamId,
+            name: opponentNameById.get(opponentTeamId) ?? null,
+          },
+          score: {
+            goalsFor,
+            goalsAgainst,
+            homeGoals: f.goalsHome ?? null,
+            awayGoals: f.goalsAway ?? null,
+          },
+          result,
+          winnerTeamId,
+          formation: formationByFixtureTeam.get(`${f.id}:${teamId}`) ?? null,
+          opponentFormation:
+            formationByFixtureTeam.get(`${f.id}:${opponentTeamId}`) ?? null,
+          stats: {
+            shotsOnTarget: teamStats?.shotsOnGoal ?? null,
+            totalShots: teamStats?.totalShots ?? null,
+            possession:
+              teamStats?.possession != null
+                ? Number(teamStats.possession)
+                : null,
+            expectedGoals:
+              teamStats?.expectedGoals != null
+                ? Number(teamStats.expectedGoals)
+                : null,
+          },
+          opponentStats: {
+            shotsOnTarget: opponentStats?.shotsOnGoal ?? null,
+            totalShots: opponentStats?.totalShots ?? null,
+            possession:
+              opponentStats?.possession != null
+                ? Number(opponentStats.possession)
+                : null,
+            expectedGoals:
+              opponentStats?.expectedGoals != null
+                ? Number(opponentStats.expectedGoals)
+                : null,
+          },
+        };
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Recent game history fetch failed for team ${teamId}: ${error.message}`,
+      );
+      return [];
     }
   }
 
