@@ -24,7 +24,12 @@ function detectProvider(model: string): ModelProvider {
 
 function isReasoningModel(model: string): boolean {
   const m = model.toLowerCase();
-  return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4');
+  return (
+    m.startsWith('o1') ||
+    m.startsWith('o3') ||
+    m.startsWith('o4') ||
+    m.startsWith('gpt-5')
+  );
 }
 
 export interface CriticOutput {

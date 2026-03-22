@@ -29,13 +29,17 @@ function detectProvider(model: string): ModelProvider {
 }
 
 /**
- * Detect if the model is an OpenAI reasoning model (o-series).
- * Reasoning models use `reasoning_effort` instead of `temperature`,
- * and use `developer` role instead of `system` role.
+ * Detect if the model should run in explicit reasoning mode.
+ * Currently supports OpenAI o-series + GPT-5 family.
  */
 function isReasoningModel(model: string): boolean {
   const m = model.toLowerCase();
-  return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4');
+  return (
+    m.startsWith('o1') ||
+    m.startsWith('o3') ||
+    m.startsWith('o4') ||
+    m.startsWith('gpt-5')
+  );
 }
 
 export interface PredictionOutput {
