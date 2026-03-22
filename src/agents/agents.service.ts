@@ -15,6 +15,11 @@ import * as schema from '../database/schema';
 import { DataCollectorAgent, CollectedMatchData } from './data-collector.agent';
 import { ResearchAgent, ResearchResult } from './research.agent';
 import { AnalysisAgent, PredictionOutput } from './analysis.agent';
+import { CriticAgent, CriticOutput } from './critic.agent';
+import {
+  FirstPrinciplesAgent,
+  FirstPrinciplesOutput,
+} from './first-principles.agent';
 import { PoissonModelService } from './poisson-model.service';
 import {
   PlayerImpactService,
@@ -43,6 +48,8 @@ export class AgentsService {
     private readonly dataCollector: DataCollectorAgent,
     private readonly researchAgent: ResearchAgent,
     private readonly analysisAgent: AnalysisAgent,
+    private readonly criticAgent: CriticAgent,
+    private readonly firstPrinciplesAgent: FirstPrinciplesAgent,
     private readonly poissonModel: PoissonModelService,
     private readonly playerImpact: PlayerImpactService,
     private readonly footballService: FootballService,
@@ -209,7 +216,7 @@ export class AgentsService {
       };
     }
 
-    // Step 3: Analysis (Claude reasons independently, memories provide context)
+    // Step 3: Analysis (main reasoner)
     let prediction: PredictionOutput;
     try {
       prediction = await this.analysisAgent.analyze(
@@ -224,6 +231,33 @@ export class AgentsService {
         `Analysis failed for fixture ${fixtureId}: ${error.message}`,
       );
       throw error;
+    }
+
+    // Step 3a: Critic + First-principles challenge pass
+    let criticReview: CriticOutput | null = null;
+    let firstPrinciples: FirstPrinciplesOutput | null = null;
+    try {
+      const [criticResult, fpResult] = await Promise.allSettled([
+        this.criticAgent.review(matchData, research, prediction),
+        this.firstPrinciplesAgent.rethink(matchData),
+      ]);
+
+      if (criticResult.status === 'fulfilled') {
+        criticReview = criticResult.value;
+      }
+      if (fpResult.status === 'fulfilled') {
+        firstPrinciples = fpResult.value;
+      }
+
+      prediction = this.applyChallengePass(
+        prediction,
+        firstPrinciples,
+        criticReview,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Challenge pass failed for fixture ${fixtureId}: ${error.message}`,
+      );
     }
 
     // Step 3b: Ensemble — blend Claude + Poisson + Bookmaker odds
@@ -2469,5 +2503,88 @@ export class AgentsService {
       Math.pow(drawProb - actual.draw, 2) +
       Math.pow(awayProb - actual.away_win, 2)
     );
+  }
+
+  /**
+   * Blends the main prediction with first-principles re-estimate and applies
+   * critic-derived confidence penalty and risk annotations.
+   */
+  private applyChallengePass(
+    base: PredictionOutput,
+    firstPrinciples: FirstPrinciplesOutput | null,
+    critic: CriticOutput | null,
+  ): PredictionOutput {
+    let home = base.homeWinProb;
+    let draw = base.drawProb;
+    let away = base.awayWinProb;
+
+    if (firstPrinciples) {
+      const wBase = 0.75;
+      const wFp = 0.25;
+      home = home * wBase + firstPrinciples.homeWinProb * wFp;
+      draw = draw * wBase + firstPrinciples.drawProb * wFp;
+      away = away * wBase + firstPrinciples.awayWinProb * wFp;
+    }
+
+    const total = home + draw + away;
+    if (total > 0) {
+      home /= total;
+      draw /= total;
+      away /= total;
+    }
+
+    let confidence = base.confidence;
+    if (firstPrinciples) {
+      confidence =
+        Math.round((confidence * 0.7 + firstPrinciples.confidence * 0.3) * 10) /
+        10;
+    }
+    if (critic) {
+      confidence = confidence - critic.confidencePenalty;
+    }
+
+    const keyFactors = [...base.keyFactors];
+    const riskFactors = [...base.riskFactors];
+
+    if (firstPrinciples?.rationale?.length) {
+      for (const r of firstPrinciples.rationale.slice(0, 2)) {
+        keyFactors.push(`First-principles check: ${r}`);
+      }
+    }
+
+    if (critic?.concerns?.length) {
+      for (const c of critic.concerns.slice(0, 3)) {
+        riskFactors.push(`Critic concern: ${c}`);
+      }
+    }
+
+    if (critic?.missedFactors?.length) {
+      for (const m of critic.missedFactors.slice(0, 2)) {
+        riskFactors.push(`Potential missed factor: ${m}`);
+      }
+    }
+
+    const lines: string[] = [base.detailedAnalysis];
+    if (firstPrinciples) {
+      lines.push(
+        `First-principles cross-check blended at 25%: H=${firstPrinciples.homeWinProb.toFixed(2)} D=${firstPrinciples.drawProb.toFixed(2)} A=${firstPrinciples.awayWinProb.toFixed(2)} (conf ${firstPrinciples.confidence}/10).`,
+      );
+    }
+    if (critic) {
+      lines.push(
+        `Critic review verdict=${critic.verdict}, confidence penalty=${critic.confidencePenalty.toFixed(1)}.`,
+      );
+    }
+
+    return {
+      ...base,
+      homeWinProb: Number(home.toFixed(4)),
+      drawProb: Number(draw.toFixed(4)),
+      awayWinProb: Number(away.toFixed(4)),
+      confidence: Math.max(1, Math.min(10, Math.round(confidence))),
+      keyFactors: keyFactors.slice(0, 8),
+      riskFactors: riskFactors.slice(0, 8),
+      detailedAnalysis: lines.join(' '),
+    };
   }
 }

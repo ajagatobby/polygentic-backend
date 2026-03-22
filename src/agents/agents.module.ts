@@ -7,6 +7,8 @@ import { PerplexityService } from './perplexity.service';
 import { DataCollectorAgent } from './data-collector.agent';
 import { ResearchAgent } from './research.agent';
 import { AnalysisAgent } from './analysis.agent';
+import { CriticAgent } from './critic.agent';
+import { FirstPrinciplesAgent } from './first-principles.agent';
 import { PoissonModelService } from './poisson-model.service';
 import { PlayerImpactService } from './player-impact.service';
 import { PredictionMemoryService } from './prediction-memory.service';
@@ -21,6 +23,8 @@ import { AgentsController } from './agents.controller';
     DataCollectorAgent,
     ResearchAgent,
     AnalysisAgent,
+    CriticAgent,
+    FirstPrinciplesAgent,
     PoissonModelService,
     PlayerImpactService,
     PredictionMemoryService,

@@ -19,6 +19,8 @@ import { PerplexityService } from '../agents/perplexity.service';
 import { DataCollectorAgent } from '../agents/data-collector.agent';
 import { ResearchAgent } from '../agents/research.agent';
 import { AnalysisAgent } from '../agents/analysis.agent';
+import { CriticAgent } from '../agents/critic.agent';
+import { FirstPrinciplesAgent } from '../agents/first-principles.agent';
 import { PoissonModelService } from '../agents/poisson-model.service';
 import { PlayerImpactService } from '../agents/player-impact.service';
 import { AgentsService } from '../agents/agents.service';
@@ -69,6 +71,8 @@ export interface Services {
   dataCollector: DataCollectorAgent;
   researchAgent: ResearchAgent;
   analysisAgent: AnalysisAgent;
+  criticAgent: CriticAgent;
+  firstPrinciplesAgent: FirstPrinciplesAgent;
   poissonModel: PoissonModelService;
   agentsService: AgentsService;
   syncService: SyncService;
@@ -96,6 +100,8 @@ export function initServices(): Services {
   );
   const researchAgent = new ResearchAgent(perplexityService);
   const analysisAgent = new AnalysisAgent(config);
+  const criticAgent = new CriticAgent(config);
+  const firstPrinciplesAgent = new FirstPrinciplesAgent(config);
   const poissonModel = new PoissonModelService(db as any);
   const playerImpactService = new PlayerImpactService(db as any);
 
@@ -107,6 +113,8 @@ export function initServices(): Services {
     dataCollector,
     researchAgent,
     analysisAgent,
+    criticAgent,
+    firstPrinciplesAgent,
     poissonModel,
     playerImpactService,
     footballService,
@@ -147,6 +155,8 @@ export function initServices(): Services {
     dataCollector,
     researchAgent,
     analysisAgent,
+    criticAgent,
+    firstPrinciplesAgent,
     poissonModel,
     agentsService,
     syncService,
