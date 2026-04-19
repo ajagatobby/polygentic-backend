@@ -10,6 +10,7 @@ import {
   syncInjuriesTask,
   syncStandingsTask,
   syncOddsTask,
+  snapshotPolymarketHoldersTask,
 } from './sync-data';
 import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
 import {
@@ -154,6 +155,25 @@ export const oddsSyncSchedule = schedules.task({
     logger.info('Scheduled: odds sync');
     const handle = await syncOddsTask.trigger(undefined as void);
     logger.info('Triggered odds sync task', { runId: handle.id });
+  },
+});
+
+/**
+ * Once per day at 5 AM UTC: snapshot Polymarket holders for every open
+ * tracked market. Required for walk-forward backtesting of the
+ * smart-money signal (the live API only returns CURRENT holders).
+ */
+export const polymarketHoldersSnapshotSchedule = schedules.task({
+  id: 'scheduled-snapshot-polymarket-holders',
+  cron: '0 5 * * *',
+  run: async () => {
+    logger.info('Scheduled: snapshot polymarket holders');
+    const handle = await snapshotPolymarketHoldersTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered polymarket holder snapshot task', {
+      runId: handle.id,
+    });
   },
 });
 

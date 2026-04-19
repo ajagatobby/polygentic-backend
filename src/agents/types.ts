@@ -3,7 +3,11 @@
  * Placed here to avoid circular dependencies between agents.service and analysis.agent.
  */
 
-export type PredictionType = 'daily' | 'pre_match' | 'on_demand';
+export type PredictionType =
+  | 'daily'
+  | 'pre_match'
+  | 'on_demand'
+  | 'smart_money';
 
 export interface PerformanceFeedback {
   totalResolved: number;

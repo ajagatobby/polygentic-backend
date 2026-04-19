@@ -5,6 +5,7 @@ import OpenAI from 'openai';
 import { CollectedMatchData } from './data-collector.agent';
 import { ResearchResult } from './research.agent';
 import { PerformanceFeedback, PoissonModelOutput } from './types';
+import type { LeaguePriors } from './league-priors.service';
 
 // ─── Provider detection ─────────────────────────────────────────────
 type ModelProvider = 'anthropic' | 'openai';
@@ -139,7 +140,33 @@ const PREDICTION_JSON_SCHEMA = {
   ],
 };
 
-const SYSTEM_PROMPT = `You are an elite football/soccer match prediction analyst. Your ONLY job is probability calibration — when you say 60%, it should happen ~60% of the time. You are evaluated EXCLUSIVELY on Brier score (lower = better) and calibration accuracy.
+/**
+ * Build the analyst system prompt. When `priors` is supplied, per-league
+ * empirical rates are injected as the Step-1 anchor so the model doesn't
+ * regress to a one-size-fits-all 44/27/29 that's wrong for Bundesliga,
+ * Serie A, Argentine Primera, etc.
+ */
+function buildSystemPrompt(priors?: LeaguePriors | null): string {
+  const hasLeaguePrior = priors && priors.isReliable;
+  const baseRateLine = hasLeaguePrior
+    ? `H=${Math.round(priors!.homeRate * 100)}% D=${Math.round(priors!.drawRate * 100)}% A=${Math.round(priors!.awayRate * 100)}% (league-specific, n=${priors!.sampleSize})`
+    : `H=44% D=27% A=29% (global default — league-specific rate not yet reliable)`;
+  const baseRatesStep1 = hasLeaguePrior
+    ? `- Begin with this league's empirical rates: Home Win ${Math.round(priors!.homeRate * 100)}%, Draw ${Math.round(priors!.drawRate * 100)}%, Away Win ${Math.round(priors!.awayRate * 100)}%.
+- Sample size: ${priors!.sampleSize} completed matches in this league.
+- These rates are specific to this league and have been shrunk toward the global mean for stability. Treat them as YOUR starting point for this match.
+- Write them down in your analysis. ALL adjustments are RELATIVE to these.
+- State explicitly: "Base rates: ${baseRateLine}"`
+    : `- Begin with: Home Win 44%, Draw 27%, Away Win 29%
+- Write these down in your analysis. ALL adjustments are RELATIVE to these.
+- State explicitly: "Base rates: ${baseRateLine}"`;
+  const drawCalibrationLine = hasLeaguePrior
+    ? `- This league's empirical draw rate is ${Math.round(priors!.drawRate * 100)}% (over ${priors!.sampleSize} matches).
+- Your draw probability should AVERAGE around ${Math.round(priors!.drawRate * 100)}% across predictions in this league.
+- Across ALL football leagues globally, 25-28% of matches end in draws — your league may differ significantly.`
+    : `- Across ALL major football leagues, 25-28% of matches end in draws.
+- Your draw probability should AVERAGE 0.26-0.30 across all predictions.`;
+  return `You are an elite football/soccer match prediction analyst. Your ONLY job is probability calibration — when you say 60%, it should happen ~60% of the time. You are evaluated EXCLUSIVELY on Brier score (lower = better) and calibration accuracy.
 
 ## THE FUNDAMENTAL TRUTH ABOUT FOOTBALL PREDICTIONS
 
@@ -154,9 +181,8 @@ Key empirical facts you MUST internalise:
 ## CRITICAL CALIBRATION RULES
 
 ### DRAW PROBABILITY — YOUR #1 PRIORITY
-- Across ALL major football leagues, 25-28% of matches end in draws.
+${drawCalibrationLine}
 - You have been SYSTEMATICALLY UNDERESTIMATING draw probability.
-- Your draw probability should AVERAGE 0.26-0.30 across all predictions.
 - SPECIFIC RULES:
   - Teams within 3 league positions: draw >= 0.30
   - Teams within 5 league positions: draw >= 0.28
@@ -191,9 +217,7 @@ Key empirical facts you MUST internalise:
 ## ANALYTICAL PROCESS
 
 ### Step 1: Start With Base Rates (MANDATORY)
-- Begin with: Home Win 44%, Draw 27%, Away Win 29%
-- Write these down in your analysis. ALL adjustments are RELATIVE to these.
-- State explicitly: "Base rates: H=44% D=27% A=29%"
+${baseRatesStep1}
 
 ### Step 2: Classify the Match Type
 Before adjusting probabilities, classify the match:
@@ -241,12 +265,20 @@ Before outputting, verify ALL of these:
 6. You have not been swayed by team reputation — use THIS SEASON'S data only
 7. If you are predicting a win, check: "Is the draw probability at least 0.24?" If not, raise it.
 
-## CONFIDENCE SCORING (BE BRUTALLY CONSERVATIVE)
-- 3-4: Standard match with typical uncertainty (THIS IS YOUR DEFAULT — use for 70% of predictions)
-- 5: Good data convergence, moderate strength differential
-- 6: Clear strength differential confirmed by xG, form, AND bookmaker odds
-- 7: RARE. All signals strongly converge. Clear mismatch with full data.
-- 8-10: DO NOT USE. No football match warrants this level of confidence.
+## CONFIDENCE SCORING (USE THE FULL RANGE)
+Your confidence score must have dynamic range — if every prediction gets the
+same score, confidence is useless as a signal downstream. Use this scale:
+- 2: High-uncertainty match — thin data, both teams volatile, tight strength
+- 3: Tight match, unclear favourite, standard uncertainty
+- 4: Mild favourite, some data convergence (the typical mid-range)
+- 5: Clear but not extreme favourite, signals align
+- 6: Strong favourite, xG + form + league position all agree
+- 7: Very strong signal — clear mismatch with full data convergence
+- 8: Rare — dominant favourite (top-3 vs bottom-3, at home) with all signals
+- 9-10: Reserve for extreme mismatches only
+The distribution across many predictions should look roughly like a bell
+centred on 4–5, with a real tail on both sides. If you keep outputting the
+same number, you are NOT using the range — force yourself to differentiate.
 
 ## OUTPUT FORMAT
 
@@ -261,8 +293,9 @@ Respond with ONLY valid JSON matching this exact schema:
   "keyFactors": [<string>, ...],
   "riskFactors": [<string>, ...],
   "valueBets": [{"market": <string>, "selection": <string>, "reasoning": <string>, "edgePercent": <number>}, ...],
-  "detailedAnalysis": <string — MUST start with "Base rates: H=44% D=27% A=29%. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) overall form last 5, (6) overall form last 10, (7) match-by-match recent game history, (8) any extra context>
+  "detailedAnalysis": <string — MUST start with "Base rates: ${baseRateLine}. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) overall form last 5, (6) overall form last 10, (7) match-by-match recent game history, (8) any extra context>
 }`;
+}
 
 @Injectable()
 export class AnalysisAgent {
@@ -304,6 +337,7 @@ export class AnalysisAgent {
     feedback?: PerformanceFeedback | null,
     poissonModel?: PoissonModelOutput | null,
     memories?: string | null,
+    leaguePriors?: LeaguePriors | null,
   ): Promise<PredictionOutput> {
     const homeName =
       data.homeTeam?.team?.name ?? `Team ${data.fixture.homeTeamId}`;
@@ -311,7 +345,10 @@ export class AnalysisAgent {
       data.awayTeam?.team?.name ?? `Team ${data.fixture.awayTeamId}`;
 
     this.logger.log(
-      `Analyzing: ${homeName} vs ${awayName} with model ${this.model} (${this.provider})`,
+      `Analyzing: ${homeName} vs ${awayName} with model ${this.model} (${this.provider})` +
+        (leaguePriors?.isReliable
+          ? ` [league priors n=${leaguePriors.sampleSize}: H=${(leaguePriors.homeRate * 100).toFixed(0)}% D=${(leaguePriors.drawRate * 100).toFixed(0)}% A=${(leaguePriors.awayRate * 100).toFixed(0)}%]`
+          : ''),
     );
 
     const userPrompt = this.buildPrompt(
@@ -321,11 +358,12 @@ export class AnalysisAgent {
       poissonModel,
       memories,
     );
+    const systemPrompt = buildSystemPrompt(leaguePriors);
 
     const rawText =
       this.provider === 'openai'
-        ? await this.callOpenAI(userPrompt)
-        : await this.callAnthropic(userPrompt);
+        ? await this.callOpenAI(userPrompt, systemPrompt)
+        : await this.callAnthropic(userPrompt, systemPrompt);
 
     // Parse JSON from response
     const prediction = this.parseResponse(rawText);
@@ -339,13 +377,16 @@ export class AnalysisAgent {
   /**
    * Call Anthropic (Claude) with extended thinking and structured output.
    */
-  private async callAnthropic(userPrompt: string): Promise<string> {
+  private async callAnthropic(
+    userPrompt: string,
+    systemPrompt: string,
+  ): Promise<string> {
     const response = await this.anthropic!.messages.create({
       model: this.model,
       max_tokens: 16000,
       temperature: 1,
       thinking: { type: 'adaptive' },
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
       // Structured output — guarantees valid JSON
       output_config: {
@@ -373,7 +414,10 @@ export class AnalysisAgent {
    * - GPT models: use `system` role, support `temperature`
    * - Both: structured output via `response_format.type = 'json_schema'`
    */
-  private async callOpenAI(userPrompt: string): Promise<string> {
+  private async callOpenAI(
+    userPrompt: string,
+    systemPrompt: string,
+  ): Promise<string> {
     const reasoning = isReasoningModel(this.model);
 
     // OpenAI's structured output wraps the schema in a named container
@@ -391,7 +435,7 @@ export class AnalysisAgent {
       {
         // Reasoning models use 'developer' role; GPT models use 'system'
         role: reasoning ? 'developer' : 'system',
-        content: SYSTEM_PROMPT,
+        content: systemPrompt,
       },
       {
         role: 'user',

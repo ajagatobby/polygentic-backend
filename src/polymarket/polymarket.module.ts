@@ -4,6 +4,8 @@ import { PolymarketGammaService } from './services/polymarket-gamma.service';
 import { PolymarketClobService } from './services/polymarket-clob.service';
 import { PolymarketMatcherService } from './services/polymarket-matcher.service';
 import { PolymarketTradingAgent } from './services/polymarket-trading.agent';
+import { PolymarketDataService } from './services/polymarket-data.service';
+import { SmartMoneySignalService } from './services/smart-money-signal.service';
 import { PolymarketService } from './polymarket.service';
 import { PolymarketController } from './polymarket.controller';
 
@@ -15,8 +17,10 @@ import { PolymarketController } from './polymarket.controller';
     PolymarketClobService,
     PolymarketMatcherService,
     PolymarketTradingAgent,
+    PolymarketDataService,
+    SmartMoneySignalService,
     PolymarketService,
   ],
-  exports: [PolymarketService],
+  exports: [PolymarketService, PolymarketDataService, SmartMoneySignalService],
 })
 export class PolymarketModule {}

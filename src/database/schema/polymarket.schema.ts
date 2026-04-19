@@ -301,6 +301,33 @@ export const polymarketConfig = pgTable(
   (table) => [uniqueIndex('uq_polymarket_config_mode').on(table.mode)],
 );
 
+// ─── polymarket_holder_snapshots ───────────────────────────────────────
+// Daily snapshot of /holders for tracked Polymarket markets. Required for
+// walk-forward backtesting of the smart-money signal — without these,
+// historical holder distribution is unrecoverable from the public API.
+
+export const polymarketHolderSnapshots = pgTable(
+  'polymarket_holder_snapshots',
+  {
+    id: serial('id').primaryKey(),
+    conditionId: varchar('condition_id', { length: 255 }).notNull(),
+    snapshotAt: timestamp('snapshot_at').defaultNow().notNull(),
+    payload: jsonb('payload').notNull(),
+    totalHolders: integer('total_holders').default(0).notNull(),
+    totalDollars: numeric('total_dollars', { precision: 18, scale: 2 })
+      .default('0')
+      .notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_pm_holder_snapshots_condition').on(
+      table.conditionId,
+      table.snapshotAt,
+    ),
+    index('idx_pm_holder_snapshots_taken').on(table.snapshotAt),
+  ],
+);
+
 // ─── RELATIONS ─────────────────────────────────────────────────────────
 
 export const polymarketMarketsRelations = relations(

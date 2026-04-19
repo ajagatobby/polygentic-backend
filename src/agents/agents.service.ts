@@ -8,6 +8,7 @@ import {
   lte,
   desc,
   isNull,
+  isNotNull,
   sql,
   asc,
   inArray,
@@ -30,6 +31,13 @@ import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
 import { PredictionMemoryService } from './prediction-memory.service';
+import {
+  LeaguePriorsService,
+  type LeaguePriors,
+} from './league-priors.service';
+import { SmartMoneySignalService } from '../polymarket/services/smart-money-signal.service';
+import type { SmartMoneySignal } from '../polymarket/services/smart-money-signal.service';
+import { PolymarketService } from '../polymarket/polymarket.service';
 import {
   PredictionType,
   PerformanceFeedback,
@@ -59,6 +67,9 @@ export class AgentsService {
     private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
     private readonly predictionMemory: PredictionMemoryService,
+    private readonly leaguePriorsService: LeaguePriorsService,
+    private readonly smartMoneySignalService: SmartMoneySignalService,
+    private readonly polymarketService: PolymarketService,
   ) {
     const openaiKey = this.config.get<string>('OPENAI_API_KEY');
     if (openaiKey) this.openai = new OpenAI({ apiKey: openaiKey });
@@ -134,11 +145,12 @@ export class AgentsService {
     // Attach player impact to matchData so downstream agents can use it
     matchData.playerImpact = playerImpactScores;
 
-    // Step 2: Web research + performance feedback + Poisson model + memory recall (in parallel)
+    // Step 2: Web research + performance feedback + Poisson model + memory recall + league priors (in parallel)
     let research: ResearchResult;
     let feedback: PerformanceFeedback | null = null;
     let poissonOutput: PoissonModelOutput | null = null;
     let memories: string | null = null;
+    let leaguePriors: LeaguePriors | null = null;
     try {
       const homeName =
         matchData.homeTeam?.team?.name ??
@@ -147,28 +159,36 @@ export class AgentsService {
         matchData.awayTeam?.team?.name ??
         `Team ${matchData.fixture.awayTeamId}`;
 
-      const [researchResult, feedbackResult, poissonResult, memoriesResult] =
-        await Promise.allSettled([
-          this.researchAgent.research(matchData),
-          this.getPerformanceFeedback(),
-          this.poissonModel.predict(
-            matchData.fixture.homeTeamId,
-            matchData.fixture.awayTeamId,
-            matchData.fixture.leagueId,
-            fixtureId,
-            playerImpactScores ?? undefined,
-          ),
-          this.predictionMemory.recallForPrediction({
-            homeTeamName: homeName,
-            awayTeamName: awayName,
-            homeTeamId: matchData.fixture.homeTeamId,
-            awayTeamId: matchData.fixture.awayTeamId,
-            leagueId: matchData.fixture.leagueId,
-            leagueName:
-              matchData.fixture.leagueName ??
-              `League ${matchData.fixture.leagueId}`,
-          }),
-        ]);
+      const [
+        researchResult,
+        feedbackResult,
+        poissonResult,
+        memoriesResult,
+        priorsResult,
+      ] = await Promise.allSettled([
+        this.researchAgent.research(matchData),
+        this.getPerformanceFeedback(),
+        this.poissonModel.predict(
+          matchData.fixture.homeTeamId,
+          matchData.fixture.awayTeamId,
+          matchData.fixture.leagueId,
+          fixtureId,
+          playerImpactScores ?? undefined,
+        ),
+        this.predictionMemory.recallForPrediction({
+          homeTeamName: homeName,
+          awayTeamName: awayName,
+          homeTeamId: matchData.fixture.homeTeamId,
+          awayTeamId: matchData.fixture.awayTeamId,
+          leagueId: matchData.fixture.leagueId,
+          leagueName:
+            matchData.fixture.leagueName ??
+            `League ${matchData.fixture.leagueId}`,
+        }),
+        this.leaguePriorsService.getLeaguePriors(matchData.fixture.leagueId),
+      ]);
+      leaguePriors =
+        priorsResult.status === 'fulfilled' ? priorsResult.value : null;
 
       research =
         researchResult.status === 'fulfilled'
@@ -233,6 +253,7 @@ export class AgentsService {
         feedback,
         poissonOutput,
         memories,
+        leaguePriors,
       );
     } catch (error) {
       this.logger.error(
@@ -271,6 +292,29 @@ export class AgentsService {
     // Step 3b: Ensemble — blend Claude + Poisson + Bookmaker odds
     prediction = this.ensemblePredictions(prediction, poissonOutput, matchData);
 
+    // Step 3c: Smart-money signal (when fixture is linked to a Polymarket
+    // market). This does not directly modify probabilities — instead it
+    // adjusts confidence: agreement with sharp money → bonus, disagreement
+    // → penalty, no signal → no change. Probabilities will be revisited
+    // once the backtest confirms the signal carries usable predictive value.
+    let smartMoneySignal: SmartMoneySignal | null = null;
+    try {
+      smartMoneySignal = await this.computeSmartMoneySignal(fixtureId);
+      if (smartMoneySignal && smartMoneySignal.leanScore != null) {
+        prediction = this.applySmartMoneyConfidenceAdjustment(
+          prediction,
+          smartMoneySignal,
+          matchData,
+        );
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Smart-money signal unavailable for ${fixtureId}: ${
+          (error as Error).message
+        }`,
+      );
+    }
+
     // TODO [Phase 3]: Apply isotonic regression calibration to final probabilities
     // once we have 200+ resolved predictions. Isotonic regression maps raw model
     // probabilities to empirically calibrated ones, fixing systematic miscalibration.
@@ -287,6 +331,7 @@ export class AgentsService {
       prediction,
       predictionType,
       modelVersion,
+      smartMoneySignal,
     );
 
     const durationMs = Date.now() - startTime;
@@ -728,8 +773,8 @@ export class AgentsService {
    *  - Date range:  `from` + `to` (YYYY-MM-DD)
    *  - Shorthand:   `days` (e.g. 2 = today + next 2 days)
    *
-   * For each fixture, picks the "best" prediction by priority:
-   * pre_match > daily > on_demand.
+   * For each fixture, picks the most recent prediction — an on_demand
+   * rerun supersedes older pre_match / daily runs.
    */
   async getPredictionsByMatchDate(filters: {
     date?: string;
@@ -901,20 +946,21 @@ export class AgentsService {
       entry.allPredictions.push(row.prediction);
     }
 
-    // Pick best prediction per fixture (pre_match > daily > on_demand)
-    const typePriority: Record<string, number> = {
-      pre_match: 0,
-      daily: 1,
-      on_demand: 2,
-    };
-
+    // Pick best prediction per fixture: the most recent run wins. An
+    // on_demand rerun is explicitly triggered with fresher data, so it
+    // should supersede older pre_match / daily predictions.
     for (const entry of fixtureMap.values()) {
       entry.allPredictions.sort(
         (a: any, b: any) =>
-          (typePriority[a.predictionType] ?? 99) -
-          (typePriority[b.predictionType] ?? 99),
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       );
       entry.prediction = entry.allPredictions[0] ?? null;
+      entry.allPredictions = entry.allPredictions.map((p: any) => ({
+        id: p.id,
+        predictionType: p.predictionType,
+        confidence: p.confidence,
+        createdAt: p.createdAt,
+      }));
     }
 
     const data = Array.from(fixtureMap.values());
@@ -1419,20 +1465,12 @@ export class AgentsService {
       )
       .orderBy(asc(schema.fixtures.date), desc(schema.predictions.createdAt));
 
-    // Deduplicate: keep best prediction per fixture (pre_match > daily > on_demand)
-    const typePriority: Record<string, number> = {
-      pre_match: 0,
-      daily: 1,
-      on_demand: 2,
-    };
+    // Deduplicate: keep the most recent prediction per fixture. Rows come
+    // back ordered by createdAt DESC, so the first row per fixtureId is
+    // already the newest — an on_demand rerun supersedes older runs.
     const fixtureMap = new Map<number, (typeof rows)[0]>();
     for (const row of rows) {
-      const existing = fixtureMap.get(row.fixtureId);
-      if (
-        !existing ||
-        (typePriority[row.prediction.predictionType] ?? 99) <
-          (typePriority[existing.prediction.predictionType] ?? 99)
-      ) {
+      if (!fixtureMap.has(row.fixtureId)) {
         fixtureMap.set(row.fixtureId, row);
       }
     }
@@ -2530,28 +2568,24 @@ export class AgentsService {
     }
 
     // ── Confidence adjustment ─────────────────────────────────────────
-    // Confidence should correlate with actual prediction difficulty, not
-    // just Claude's self-assessment. We use multiple signals:
-    //
-    // 1. Signal agreement: do Claude, Poisson, and bookmakers agree?
-    // 2. Match decisiveness: how much higher is the favourite vs alternatives?
-    // 3. Probability magnitude: is any outcome clearly dominant?
-    //
-    // Tight matches (max prob < 0.45) should NEVER have confidence > 5
-    // because the model is essentially guessing between three close outcomes.
+    // Confidence should correlate with actual prediction difficulty.
+    // Previous logic used hard caps by ensembleMaxProb that collapsed ~80%
+    // of predictions to confidence=4 — confidence became a useless signal.
+    // New logic: softer nudges (±1 each) so the final distribution has
+    // actual dynamic range while still punishing genuinely uncertain
+    // predictions.
     let adjustedConfidence = claudePrediction.confidence;
 
-    // Decisiveness penalty: tight matches get lower confidence
+    // Decisiveness nudge: tight matches get a single point off, not a hard
+    // cap. Very competitive matches get two points off. Clear favourites get
+    // a small boost.
     const ensembleMaxProb = Math.max(homeWinProb, drawProb, awayWinProb);
     if (ensembleMaxProb < 0.4) {
-      // Very tight match — cap confidence at 4
-      adjustedConfidence = Math.min(adjustedConfidence, 4);
+      adjustedConfidence = adjustedConfidence - 2;
     } else if (ensembleMaxProb < 0.48) {
-      // Competitive match — cap confidence at 5
-      adjustedConfidence = Math.min(adjustedConfidence, 5);
-    } else if (ensembleMaxProb < 0.55) {
-      // Moderate favourite — cap confidence at 6
-      adjustedConfidence = Math.min(adjustedConfidence, 6);
+      adjustedConfidence = adjustedConfidence - 1;
+    } else if (ensembleMaxProb >= 0.6) {
+      adjustedConfidence = adjustedConfidence + 1;
     }
 
     if (hasBookmakerData) {
@@ -2568,10 +2602,12 @@ export class AgentsService {
       );
 
       if (claudePredResult !== bookPredResult) {
-        // Claude and bookmakers disagree on the outcome — reduce confidence
-        adjustedConfidence = Math.max(3, adjustedConfidence - 2);
+        // Claude and bookmakers disagree on the outcome — reduce (but don't
+        // demolish) confidence. Previous −2 was too aggressive given
+        // bookmaker odds are often absent.
+        adjustedConfidence = adjustedConfidence - 1;
       } else {
-        // They agree — but check probability divergence
+        // They agree — check probability magnitude alignment
         const claudeMaxOutcome = Math.max(
           claudePrediction.homeWinProb,
           claudePrediction.drawProb,
@@ -2584,12 +2620,16 @@ export class AgentsService {
         );
         const probDivergence = Math.abs(claudeMaxOutcome - bookmakerMaxOutcome);
         if (probDivergence > 0.15) {
-          // Large disagreement on probability magnitude
-          adjustedConfidence = Math.max(4, adjustedConfidence - 1);
+          // Large magnitude disagreement
+          adjustedConfidence = adjustedConfidence - 1;
+        } else {
+          // They agree on outcome AND magnitude — bonus
+          adjustedConfidence = adjustedConfidence + 1;
         }
       }
 
-      // Poisson agreement bonus: if all three signals point the same way, +1
+      // Poisson agreement bonus: if all three signals converge strongly,
+      // allow confidence to climb higher than the old +1 cap at 8.
       if (hasPoissonData) {
         const poissonPredResult = this.getArgmax(
           poissonOutput!.homeWinProb,
@@ -2601,11 +2641,18 @@ export class AgentsService {
           claudePredResult === poissonPredResult &&
           ensembleMaxProb >= 0.5
         ) {
-          // All three signals agree AND the prediction is reasonably decisive
-          adjustedConfidence = Math.min(8, adjustedConfidence + 1);
+          adjustedConfidence = adjustedConfidence + 1;
         }
       }
     }
+
+    // Final clamp to the 1..9 range. We exclude 10 (per prompt guidance "no
+    // football match warrants 10") but allow the upper band so confidence
+    // is a real signal.
+    adjustedConfidence = Math.max(
+      1,
+      Math.min(9, Math.round(adjustedConfidence)),
+    );
 
     this.logger.log(
       `Ensemble: Bookmaker(${(bookmakerWeight * 100).toFixed(0)}%) + ` +
@@ -2687,6 +2734,7 @@ export class AgentsService {
     prediction: PredictionOutput,
     predictionType: PredictionType,
     modelVersion: string,
+    smartMoneySignal: SmartMoneySignal | null = null,
   ): Promise<any> {
     // Lock in the predicted result at prediction time — never re-derived later
     const predictedResult = this.getPredictedResult(prediction);
@@ -2712,6 +2760,7 @@ export class AgentsService {
         citations: research.citations,
       },
       detailedAnalysis: prediction.detailedAnalysis,
+      smartMoneySignal: smartMoneySignal as any,
       modelVersion,
       predictionStatus: 'pending' as const,
       updatedAt: new Date(),
@@ -2733,6 +2782,422 @@ export class AgentsService {
       .returning();
 
     return stored;
+  }
+
+  /**
+   * Look up Polymarket markets linked to this fixture and compute the
+   * smart-money signal across them. Returns null when no Polymarket
+   * market exists or the signal can't be formed (insufficient sharps).
+   *
+   * The output is stored on `predictions.smart_money_signal` so we can
+   * analyse the signal's value retrospectively without re-fetching from
+   * Polymarket — and crucially, without any walk-forward leakage.
+   */
+  /**
+   * Fetch all Polymarket markets linked to a fixture, then pick the one we
+   * can actually use for direction-matching: a "Will TEAM win on DATE?"
+   * moneyline where the team name matches either the home or away team of
+   * the fixture. O/U, spreads, draw, BTTS markets are intentionally skipped
+   * — they don't answer the 1X2 question we care about.
+   *
+   * We prefer the HOME-team moneyline (so outcome 0 = home win) so the
+   * direction mapping downstream is consistent across fixtures. If only an
+   * away-team moneyline exists, we use that and flip the interpretation.
+   *
+   * Returns null when no usable market exists.
+   */
+  private async computeSmartMoneySignal(
+    fixtureId: number,
+  ): Promise<(SmartMoneySignal & { marketTeamId?: number | null }) | null> {
+    // Step 0: on-demand linking.
+    // If this fixture isn't in polymarket_markets yet, try to discover it on
+    // Polymarket right now instead of waiting for the 30-min scheduled scan.
+    // Polymarket may have added the market between the last scan and this
+    // prediction, and lower-league fixtures often don't get caught by the
+    // league-specific tag scan. `linkFixtureOnDemand` handles both cases,
+    // caches negative lookups for 2h to avoid hammering Gamma, and persists
+    // any matches so subsequent predictions / scans see the link.
+    const initialCheck = await this.db
+      .select({ id: schema.polymarketMarkets.id })
+      .from(schema.polymarketMarkets)
+      .where(eq(schema.polymarketMarkets.fixtureId, fixtureId))
+      .limit(1);
+    if (initialCheck.length === 0) {
+      const result = await this.polymarketService.linkFixtureOnDemand(
+        fixtureId,
+      );
+      if (result.linked > 0) {
+        this.logger.log(
+          `Smart-money: on-demand linked fixture ${fixtureId} to ${result.linked} Polymarket market(s)`,
+        );
+      } else if (!result.alreadyLinked && !result.cached) {
+        // Fresh miss — Polymarket simply doesn't have this fixture.
+        this.logger.debug(
+          `Smart-money: fixture ${fixtureId} not on Polymarket (no signal available)`,
+        );
+      }
+    }
+
+    const linkedMarkets = await this.db
+      .select({
+        conditionId: schema.polymarketMarkets.conditionId,
+        teamId: schema.polymarketMarkets.teamId,
+        marketQuestion: schema.polymarketMarkets.marketQuestion,
+      })
+      .from(schema.polymarketMarkets)
+      .where(
+        and(
+          eq(schema.polymarketMarkets.fixtureId, fixtureId),
+          isNotNull(schema.polymarketMarkets.conditionId),
+        ),
+      );
+    if (linkedMarkets.length === 0) return null;
+
+    // Look up the fixture's home + away team names so we can match the
+    // market question against them.
+    const [fixture] = await this.db
+      .select({
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+      })
+      .from(schema.fixtures)
+      .where(eq(schema.fixtures.id, fixtureId))
+      .limit(1);
+    if (!fixture) return null;
+    const teamRows = await this.db
+      .select({ id: schema.teams.id, name: schema.teams.name })
+      .from(schema.teams)
+      .where(
+        sql`${schema.teams.id} IN (${fixture.homeTeamId}, ${fixture.awayTeamId})`,
+      );
+    const homeName =
+      teamRows.find((t: any) => t.id === fixture.homeTeamId)?.name ?? '';
+    const awayName =
+      teamRows.find((t: any) => t.id === fixture.awayTeamId)?.name ?? '';
+    if (!homeName || !awayName) return null;
+
+    // Parse each market's question to find usable moneyline markets.
+    // Expected form: "Will TEAM_NAME win on YYYY-MM-DD?"
+    const candidates: Array<{
+      conditionId: string;
+      storedTeamId: number | null;
+      teamName: string;
+      matchSide: 'home' | 'away';
+      similarity: number;
+    }> = [];
+    const MONEYLINE_RX = /^Will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}\??$/i;
+    for (const m of linkedMarkets) {
+      const q = String(m.marketQuestion ?? '').trim();
+      const match = q.match(MONEYLINE_RX);
+      if (!match) continue; // skip O/U, spreads, draw, BTTS, season-long
+      const teamInQuestion = match[1].trim();
+      const homeSim = this.nameSimilarity(teamInQuestion, homeName);
+      const awaySim = this.nameSimilarity(teamInQuestion, awayName);
+      if (homeSim < 0.5 && awaySim < 0.5) continue;
+      const matchSide: 'home' | 'away' = homeSim >= awaySim ? 'home' : 'away';
+      candidates.push({
+        conditionId: m.conditionId as string,
+        storedTeamId: m.teamId as number | null,
+        teamName: teamInQuestion,
+        matchSide,
+        similarity: Math.max(homeSim, awaySim),
+      });
+    }
+    if (candidates.length === 0) return null;
+
+    // Prefer home-team moneyline (so outcome 0 = YES = home team wins).
+    candidates.sort((a, b) => {
+      // HOME before AWAY, then higher similarity wins
+      if (a.matchSide !== b.matchSide) return a.matchSide === 'home' ? -1 : 1;
+      return b.similarity - a.similarity;
+    });
+    const chosen = candidates[0];
+    const marketTeamId =
+      chosen.matchSide === 'home'
+        ? fixture.homeTeamId
+        : fixture.awayTeamId;
+
+    this.logger.debug(
+      `Smart-money market selected for fixture ${fixtureId}: ` +
+        `"${chosen.teamName}" (${chosen.matchSide}, sim=${chosen.similarity.toFixed(2)})`,
+    );
+
+    const signal = await this.smartMoneySignalService.computeSignal(
+      chosen.conditionId,
+    );
+    // Direct signal found — return it. If the direct market yielded no
+    // qualifying sharps (leanScore null) we still prefer the direct
+    // source rather than falling back to backdrop for the same fixture —
+    // the direct market is the most relevant evidence and its absence of
+    // sharp conviction is itself informative.
+    if (signal.leanScore != null) {
+      return { ...signal, marketTeamId };
+    }
+
+    // No qualifying sharps on the direct market — fall back to backdrop.
+    const backdrop = await this.computeBackdropSignal(
+      fixture.homeTeamId,
+      fixture.awayTeamId,
+    );
+    if (backdrop && backdrop.leanScore != null) {
+      return backdrop;
+    }
+    // Return the direct signal with null leanScore (informative "no read").
+    return { ...signal, marketTeamId };
+  }
+
+  /**
+   * Backdrop smart-money signal built from season-long outright markets.
+   *
+   * When no per-match Polymarket moneyline exists for a fixture, we can
+   * still learn something about the teams' relative standing by reading
+   * sharp-money positioning on their season-long outrights: league_winner,
+   * qualification (UCL/UEL/UECL), top_4, tournament_winner.
+   *
+   * Logic:
+   *   1. Pull outright markets linked (via polymarket_markets.team_id) to
+   *      either the home or away team of this fixture.
+   *   2. For each market, compute the per-market smart-money signal.
+   *      A positive leanScore means sharps are bullish on the team that
+   *      market is about (since outcome 0 = YES = "Will X happen?"),
+   *      negative means bearish.
+   *   3. Aggregate per team: sum sharp dollars × leanScore across markets.
+   *   4. Compare homeConviction vs awayConviction to get a fixture-level
+   *      lean (home-biased +1 to away-biased -1).
+   *
+   * Returns null when there aren't enough sharps across any of the
+   * involved outright markets to form a signal.
+   *
+   * Intentionally skips any market whose question contains "relegate" —
+   * polarity on that is negative (YES = team loses) and requires inversion
+   * the first cut doesn't attempt.
+   */
+  private async computeBackdropSignal(
+    homeTeamId: number,
+    awayTeamId: number,
+  ): Promise<
+    | (SmartMoneySignal & { marketTeamId?: number | null })
+    | null
+  > {
+    // Outright market types we trust to have YES = positive-for-team polarity.
+    const POSITIVE_OUTRIGHT_TYPES = [
+      'league_winner',
+      'qualification',
+      'top_4',
+      'tournament_winner',
+    ];
+
+    const markets = await this.db
+      .select({
+        conditionId: schema.polymarketMarkets.conditionId,
+        teamId: schema.polymarketMarkets.teamId,
+        marketType: schema.polymarketMarkets.marketType,
+        marketQuestion: schema.polymarketMarkets.marketQuestion,
+      })
+      .from(schema.polymarketMarkets)
+      .where(
+        and(
+          isNotNull(schema.polymarketMarkets.conditionId),
+          isNotNull(schema.polymarketMarkets.teamId),
+          inArray(schema.polymarketMarkets.teamId, [homeTeamId, awayTeamId]),
+          inArray(schema.polymarketMarkets.marketType, POSITIVE_OUTRIGHT_TYPES),
+        ),
+      );
+
+    if (markets.length === 0) return null;
+
+    // Per-team conviction aggregation. conviction = Σ leanScore × dollars
+    //   (higher = more sharp bullishness on that team)
+    let homeConviction = 0;
+    let awayConviction = 0;
+    let homeSharpDollars = 0;
+    let awaySharpDollars = 0;
+    let totalSharps = 0;
+    let contributingMarkets = 0;
+    const allTopSharps: SmartMoneySignal['topSharps'] = [];
+
+    for (const m of markets) {
+      // Skip relegation-style markets (negative polarity) defensively even
+      // if they were accidentally tagged with a positive market_type.
+      const q = String(m.marketQuestion ?? '').toLowerCase();
+      if (q.includes('relegat')) continue;
+
+      const sig = await this.smartMoneySignalService.computeSignal(
+        m.conditionId as string,
+      );
+      if (sig.leanScore == null) continue;
+      contributingMarkets++;
+      // Dollars that were on YES (outcome 0 = "Will this team do the thing?")
+      const teamId = m.teamId as number;
+      const yesDollars = sig.sharpDollarsOutcome0;
+      const noDollars = sig.sharpDollarsOutcome1;
+      // Sharp conviction on this team = leanScore × dollars behind signal.
+      // Positive leanScore → YES = team achieves it → bullish.
+      const conviction = sig.leanScore * (yesDollars + noDollars);
+      if (teamId === homeTeamId) {
+        homeConviction += conviction;
+        homeSharpDollars += yesDollars + noDollars;
+      } else if (teamId === awayTeamId) {
+        awayConviction += conviction;
+        awaySharpDollars += yesDollars + noDollars;
+      }
+      totalSharps += sig.sharpCount;
+      for (const s of sig.topSharps) allTopSharps.push(s);
+    }
+
+    if (contributingMarkets === 0) return null;
+
+    // Normalise conviction to a comparable scale per team then compute
+    // fixture-level lean: +1 = home strongly favoured by sharps, -1 = away.
+    const normHome =
+      homeSharpDollars > 0 ? homeConviction / homeSharpDollars : 0;
+    const normAway =
+      awaySharpDollars > 0 ? awayConviction / awaySharpDollars : 0;
+    const leanScore = Math.max(-1, Math.min(1, (normHome - normAway) / 2));
+
+    // Signal confidence: sample size × magnitude, capped at 1.
+    const sampleConf = Math.min(1, totalSharps / 15);
+    const signalConfidence = sampleConf * Math.abs(leanScore);
+
+    return {
+      signalKind: 'backdrop',
+      leanScore,
+      signalConfidence,
+      sharpCount: totalSharps,
+      sharpDollarsOutcome0: homeSharpDollars,
+      sharpDollarsOutcome1: awaySharpDollars,
+      outcome0Name: 'Home team (season-long conviction)',
+      outcome1Name: 'Away team (season-long conviction)',
+      topSharps: allTopSharps
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 5),
+      contributingMarkets,
+      // Backdrop signal has no single marketTeamId — home wins → leanScore +
+      marketTeamId: homeTeamId,
+    };
+  }
+
+  /**
+   * Lightweight team-name similarity. Lower-cased, FC/AFC/SC/etc. stripped,
+   * punctuation normalised. Returns 0..1; 1 = exact or substring match.
+   * Mirrors (and simplifies) OddsService.teamNameSimilarity — the two live
+   * in different modules and a shared util would force a new dependency.
+   */
+  private nameSimilarity(a: string, b: string): number {
+    const norm = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/\b(fc|cf|sc|afc|ac|as|ss|us|rc|cd|ud|rcd|sd|ca|se)\b/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    if (na.includes(nb) || nb.includes(na)) return 0.85;
+    // Word overlap
+    const wa = new Set(na.split(' '));
+    const wb = new Set(nb.split(' '));
+    const overlap = [...wa].filter((w) => wb.has(w)).length;
+    const denom = Math.min(wa.size, wb.size);
+    if (denom === 0) return 0;
+    return overlap / denom;
+  }
+
+  /**
+   * Smart-money confidence adjustment, calibrated against the Apr-2026
+   * backtest of 583 signaled predictions:
+   *
+   *   - Signal AGREES with ensemble pick: mean Brier 0.560
+   *   - Signal DISAGREES with ensemble pick: mean Brier 0.602
+   *   - Difference: -0.042 in favour of agreement
+   *
+   * That gap is large enough (the autoresearch loop spent months fighting
+   * for 0.001) that we trust the signal as a confidence modifier:
+   *   • agreement → +1 confidence (we're more likely right)
+   *   • disagreement → −1 confidence and demote the prediction's
+   *     "high-conviction" tier (we're more likely wrong)
+   *
+   * We do NOT modify probabilities — the signal's direction-prediction
+   * power is unverified. Probability shifts wait for a separate study
+   * that maps Polymarket outcome 0/1 to football outcomes per market.
+   *
+   * `marketTeamId` enables proper agreement detection: outcome 0 (YES)
+   * usually means "team X wins", so agreement = (sharps lean YES AND
+   * ensemble picks team X to win).
+   */
+  private applySmartMoneyConfidenceAdjustment(
+    prediction: PredictionOutput,
+    signal: SmartMoneySignal & { marketTeamId?: number | null },
+    matchData: CollectedMatchData,
+  ): PredictionOutput {
+    if (
+      signal.leanScore == null ||
+      signal.signalConfidence < 0.2 ||
+      signal.sharpCount < 3
+    ) {
+      return prediction;
+    }
+
+    // Determine which football outcome the ensemble is picking
+    const ensemblePick =
+      prediction.homeWinProb >= prediction.drawProb &&
+      prediction.homeWinProb >= prediction.awayWinProb
+        ? 'home'
+        : prediction.awayWinProb >= prediction.drawProb
+          ? 'away'
+          : 'draw';
+
+    // Determine which side of the Polymarket market the ensemble corresponds to
+    let ensembleAlignsWithYes: boolean | null = null;
+    if (signal.marketTeamId != null) {
+      if (signal.marketTeamId === matchData.fixture.homeTeamId) {
+        ensembleAlignsWithYes = ensemblePick === 'home';
+      } else if (signal.marketTeamId === matchData.fixture.awayTeamId) {
+        ensembleAlignsWithYes = ensemblePick === 'away';
+      }
+    }
+
+    let adjustedConfidence = prediction.confidence;
+    const sharpsLeanYes = signal.leanScore > 0;
+    const sharpsLeanStrong = Math.abs(signal.leanScore) >= 0.3;
+
+    if (ensembleAlignsWithYes === null || !sharpsLeanStrong) {
+      // No clean direction comparison — just log
+      this.logger.log(
+        `Smart-money: ${signal.sharpCount} sharps lean=${signal.leanScore.toFixed(2)} (no direction match available)`,
+      );
+      return prediction;
+    }
+
+    const agree = sharpsLeanYes === ensembleAlignsWithYes;
+    const kind = signal.signalKind ?? 'direct';
+    if (agree) {
+      adjustedConfidence = Math.min(9, adjustedConfidence + 1);
+      this.logger.log(
+        `Smart-money (${kind}): ${signal.sharpCount} sharps AGREE with ensemble ` +
+          `(lean=${signal.leanScore.toFixed(2)}) — confidence +1`,
+      );
+    } else if (kind === 'direct') {
+      // Direct per-match market: the backtest showed a 0.042 Brier gap
+      // favouring agreement, so disagreement is a genuine warning.
+      adjustedConfidence = Math.max(1, adjustedConfidence - 1);
+      this.logger.log(
+        `Smart-money (direct): ${signal.sharpCount} sharps DISAGREE with ensemble ` +
+          `(lean=${signal.leanScore.toFixed(2)}) — confidence −1 (Brier degrades on disagreement)`,
+      );
+    } else {
+      // Backdrop: season-long outrights don't directly predict a single
+      // match outcome, so disagreement is too weak to justify a penalty.
+      // Log it for visibility but leave confidence alone.
+      this.logger.log(
+        `Smart-money (backdrop): ${signal.sharpCount} sharps disagree with ensemble ` +
+          `(lean=${signal.leanScore.toFixed(2)}) — no penalty, season-long signal is only used for agreement`,
+      );
+    }
+
+    return { ...prediction, confidence: adjustedConfidence };
   }
 
   private buildMatchContext(data: CollectedMatchData): Record<string, any> {
@@ -2889,6 +3354,9 @@ export class AgentsService {
     if (critic) {
       confidence = confidence - critic.confidencePenalty;
     }
+    // Clamp to [1, 9] so the critic can't floor confidence below a sensible
+    // minimum, and the full range is preserved for downstream filtering.
+    confidence = Math.max(1, Math.min(9, Math.round(confidence)));
 
     const keyFactors = [...base.keyFactors];
     const riskFactors = [...base.riskFactors];

@@ -330,14 +330,25 @@ export class PolymarketGammaService {
 
   /**
    * Fetch all active events for a specific tag_slug, paginating through results.
+   *
+   * The generic `soccer` tag is the only tag that returns match-level
+   * moneyline events for smaller leagues (e.g. Romania Liga I, Peru, Egypt) —
+   * those leagues' league-specific tags only return season-long outrights,
+   * not per-match fixtures. Since the universal soccer feed carries 3000+
+   * active events globally, we use a larger page size + higher page cap for
+   * it to guarantee full coverage. League-specific tags rarely exceed 50
+   * events so they still finish in 1-2 pages.
    */
   private async fetchEventsForTag(
     tag: PolymarketLeagueTag,
   ): Promise<ParsedPolymarketEvent[]> {
     const events: ParsedPolymarketEvent[] = [];
     let offset = 0;
-    const limit = 100;
-    const maxPages = 10; // Safety cap: 1000 events per tag
+    // Soccer super-tag: use big pages + high cap. League-specific tags:
+    // keep page size small to minimise wasted bytes on single-digit results.
+    const isUniversalSoccerTag = tag.tagSlug === 'soccer';
+    const limit = isUniversalSoccerTag ? 500 : 100;
+    const maxPages = isUniversalSoccerTag ? 20 : 10;
     let page = 0;
 
     while (page < maxPages) {
@@ -374,6 +385,60 @@ export class PolymarketGammaService {
       await this.delay(100);
     }
 
+    return events;
+  }
+
+  /**
+   * Fetch a bounded set of active soccer events ordered by most-recent
+   * startDate first, for use in on-demand linking.
+   *
+   * Unlike `fetchSoccerEvents`, which paginates the full 3000+ event space
+   * and is intended for the scheduled bulk scan, this method takes a hard
+   * cap on total events and a short page size — it's the fast path used
+   * when a single prediction runs and we want to try to match its fixture
+   * to a Polymarket market right now rather than wait for the next scan.
+   *
+   * Ordering by `startDate` DESC puts the most recently-created events
+   * first — this matches fixtures in the near-future window (next 2-3
+   * weeks) where predictions are active.
+   */
+  async fetchRecentSoccerEvents(
+    opts: { maxEvents?: number } = {},
+  ): Promise<ParsedPolymarketEvent[]> {
+    const max = opts.maxEvents ?? 1000;
+    const events: ParsedPolymarketEvent[] = [];
+    const seen = new Set<string>();
+    let offset = 0;
+    const pageSize = 500;
+
+    while (events.length < max) {
+      const response = await this.client.get('/events', {
+        params: {
+          tag_slug: 'soccer',
+          active: 'true',
+          closed: 'false',
+          order: 'startDate',
+          ascending: 'false',
+          limit: pageSize,
+          offset,
+        },
+      });
+      const raw = Array.isArray(response.data) ? response.data : [];
+      if (raw.length === 0) break;
+      for (const e of raw) {
+        if (!e.markets?.length) continue;
+        const parsed = this.parseEvent(e, 'soccer');
+        if (!parsed.markets.length) continue;
+        if (seen.has(parsed.eventId)) continue;
+        seen.add(parsed.eventId);
+        events.push(parsed);
+        if (events.length >= max) break;
+      }
+      offset += pageSize;
+      if (raw.length < pageSize) break;
+      // Rate-limit between pages
+      await this.delay(100);
+    }
     return events;
   }
 

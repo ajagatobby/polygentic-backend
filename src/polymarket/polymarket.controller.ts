@@ -3,9 +3,11 @@ import {
   Get,
   Post,
   Patch,
+  Param,
   Query,
   Body,
   Logger,
+  BadRequestException,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -36,6 +38,43 @@ export class PolymarketController {
   })
   async getPerformance() {
     return this.polymarketService.getPerformanceSummary();
+  }
+
+  @Get('smart-money/predict/:fixtureId')
+  @ApiOperation({
+    summary:
+      'Dry-run: predict a fixture using ONLY the smart-money signal (no LLM, no Poisson, no persistence)',
+    description:
+      'Translates Polymarket sharp-wallet positioning into home/draw/away probabilities. ' +
+      'Triggers an on-demand Polymarket link if the fixture has no market yet. ' +
+      'Returns `prediction: null` with a reason when no coverage or no qualifying sharps exist. ' +
+      'Does NOT write to the predictions table — use POST to persist.',
+  })
+  async predictFromSmartMoney(@Param('fixtureId') fixtureId: string) {
+    const id = Number(fixtureId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new BadRequestException('fixtureId must be a positive integer');
+    }
+    return this.polymarketService.predictFromSmartMoney(id);
+  }
+
+  @Post('smart-money/predict/:fixtureId')
+  @ApiOperation({
+    summary:
+      'Generate + persist a prediction for a fixture using ONLY the smart-money signal',
+    description:
+      'Same computation as the GET endpoint, but upserts a row into the predictions ' +
+      'table with predictionType = "smart_money". Overwrites any previous smart_money ' +
+      'prediction for this fixture (one-per-fixture-per-type by unique constraint). ' +
+      'The created prediction surfaces in the regular fixture response as the newest run ' +
+      'if no other prediction type was generated more recently.',
+  })
+  async generateSmartMoneyPrediction(@Param('fixtureId') fixtureId: string) {
+    const id = Number(fixtureId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new BadRequestException('fixtureId must be a positive integer');
+    }
+    return this.polymarketService.predictFromSmartMoney(id, { persist: true });
   }
 
   @Get('config')

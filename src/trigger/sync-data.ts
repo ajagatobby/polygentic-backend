@@ -206,9 +206,118 @@ export const syncOddsTask = task({
 
     logger.info('Syncing odds for all soccer events');
     const result = await oddsService.syncAllSoccerOdds();
-
     logger.info('Odds sync complete', result);
-    return result;
+
+    // After ingesting events, retroactively link any orphan fixtures whose
+    // odds arrived earlier (or races where the fixture was created after the
+    // event was stored). This is what keeps fixtures.odds_api_event_id
+    // populated over time instead of drifting to mostly-null.
+    try {
+      const backfill = await oddsService.backfillUnlinkedFixtures();
+      logger.info('Odds link backfill complete', backfill);
+      return { ...result, backfill };
+    } catch (err) {
+      logger.warn('Odds link backfill failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { ...result, backfill: { error: true } };
+    }
+  },
+});
+
+// ─── Snapshot Polymarket Holders ────────────────────────────────────
+//
+// Daily snapshot of /holders for every tracked Polymarket market that
+// hasn't resolved yet. Required for walk-forward backtesting of the
+// smart-money signal — Polymarket's public API only exposes CURRENT
+// holders, so without this we can never reconstruct the holder
+// distribution at the time we made a prediction.
+
+export const snapshotPolymarketHoldersTask = task({
+  id: 'snapshot-polymarket-holders',
+  retry: {
+    maxAttempts: 2,
+    minTimeoutInMs: 10_000,
+    maxTimeoutInMs: 60_000,
+    factor: 2,
+  },
+  maxDuration: 3600, // up to 1h — caps the run if Polymarket throttles us
+  run: async () => {
+    const { db, polymarketDataService } = initServices();
+    const { sql } = await import('drizzle-orm');
+    const schema = await import('../database/schema');
+
+    // Pick markets to snapshot: anything with a conditionId that ends after
+    // now (i.e. still open). Polymarket pricing changes daily, so daily
+    // cadence is enough.
+    const targets = await db.execute(sql`
+      SELECT condition_id
+      FROM polymarket_markets
+      WHERE condition_id IS NOT NULL
+        AND (end_date IS NULL OR end_date > now())
+      ORDER BY last_synced_at DESC NULLS LAST
+      LIMIT 500
+    `);
+
+    const conditionIds = (targets as any[])
+      .map((r) => r.condition_id as string)
+      .filter(Boolean);
+
+    if (conditionIds.length === 0) {
+      logger.info('snapshot-holders: no open markets to snapshot');
+      return { attempted: 0, snapshotted: 0, failed: 0 };
+    }
+
+    logger.info(
+      `snapshot-holders: snapshotting ${conditionIds.length} open markets`,
+    );
+
+    let snapshotted = 0;
+    let failed = 0;
+    const snapshotAt = new Date();
+
+    for (const cid of conditionIds) {
+      try {
+        const payload = await polymarketDataService.getTopHolders(cid, {
+          limit: 20,
+        });
+        const totalHolders = payload.reduce(
+          (s, outcome) => s + (outcome.holders?.length ?? 0),
+          0,
+        );
+        const totalDollars = payload.reduce(
+          (s, outcome) =>
+            s +
+            (outcome.holders ?? []).reduce(
+              (subSum, h) => subSum + Number(h.amount ?? 0),
+              0,
+            ),
+          0,
+        );
+        if (totalHolders === 0) continue; // skip empty markets — wasted row
+
+        await db.insert(schema.polymarketHolderSnapshots).values({
+          conditionId: cid,
+          snapshotAt,
+          payload: payload as any,
+          totalHolders,
+          totalDollars: String(totalDollars),
+        });
+        snapshotted++;
+      } catch (err) {
+        failed++;
+        logger.warn(`snapshot-holders failed for ${cid.slice(0, 12)}...`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    logger.info('snapshot-holders complete', {
+      attempted: conditionIds.length,
+      snapshotted,
+      failed,
+    });
+    return { attempted: conditionIds.length, snapshotted, failed };
   },
 });
 

@@ -96,7 +96,7 @@ export class FootballController {
   @ApiResponse({
     status: 200,
     description:
-      "Today's fixtures with best prediction (pre_match > daily > on_demand) and all available predictions",
+      "Today's fixtures with the most recent prediction per fixture and all available predictions",
   })
   async getTodayFixtures(
     @Query('leagueId') leagueId?: string,

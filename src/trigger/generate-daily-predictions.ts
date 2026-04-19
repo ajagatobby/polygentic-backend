@@ -1,7 +1,7 @@
 import { task, logger } from '@trigger.dev/sdk/v3';
 import { generatePredictionTask } from './generate-prediction';
 import { initServices } from './init';
-import { eq, and, gte, lte, asc, sql } from 'drizzle-orm';
+import { eq, and, gte, lte, asc } from 'drizzle-orm';
 import * as schema from '../database/schema';
 
 /**
@@ -33,7 +33,7 @@ export const generateDailyPredictionsTask = task({
 
     // Get upcoming fixtures
     const upcomingFixtures = await db
-      .select()
+      .select({ id: schema.fixtures.id })
       .from(schema.fixtures)
       .where(
         and(
@@ -130,7 +130,7 @@ export const generatePreMatchPredictionsTask = task({
     const oneHourFromNow = new Date(now.getTime() + 60 * 60 * 1000);
 
     const fixtures = await db
-      .select()
+      .select({ id: schema.fixtures.id })
       .from(schema.fixtures)
       .where(
         and(
@@ -236,7 +236,7 @@ export const generateTodayPredictionsTask = task({
 
     // Get all of today's fixtures (NS = Not Started)
     const todayFixtures = await db
-      .select()
+      .select({ id: schema.fixtures.id })
       .from(schema.fixtures)
       .where(
         and(

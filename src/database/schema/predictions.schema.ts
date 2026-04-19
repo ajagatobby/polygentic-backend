@@ -52,6 +52,12 @@ export const predictions = pgTable(
     matchContext: jsonb('match_context'), // raw data used by agents
     researchContext: jsonb('research_context'), // raw research results
     detailedAnalysis: text('detailed_analysis'), // full reasoning text
+    /**
+     * Smart-money signal computed at prediction time from Polymarket
+     * /holders + /positions data. Null when no Polymarket market exists
+     * for this fixture or the signal has insufficient sharp coverage.
+     */
+    smartMoneySignal: jsonb('smart_money_signal'),
 
     // Predicted outcome (stored at prediction time — never re-derived)
     predictedResult: varchar('predicted_result', { length: 20 }), // 'home_win' | 'draw' | 'away_win'

@@ -29,7 +29,10 @@ import { PolymarketGammaService } from '../polymarket/services/polymarket-gamma.
 import { PolymarketClobService } from '../polymarket/services/polymarket-clob.service';
 import { PolymarketMatcherService } from '../polymarket/services/polymarket-matcher.service';
 import { PolymarketTradingAgent } from '../polymarket/services/polymarket-trading.agent';
+import { PolymarketDataService } from '../polymarket/services/polymarket-data.service';
+import { SmartMoneySignalService } from '../polymarket/services/smart-money-signal.service';
 import { PredictionMemoryService } from '../agents/prediction-memory.service';
+import { LeaguePriorsService } from '../agents/league-priors.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
@@ -45,14 +48,43 @@ function createDb() {
   }
 
   const ssl = process.env.DATABASE_SSL === 'true' ? 'require' : false;
-  const client = (postgres as any)(connectionString, {
+  const rawClient = (postgres as any)(connectionString, {
     ssl,
     max: 5,
     idle_timeout: 20,
     connect_timeout: 10,
   });
 
-  return drizzle(client, { schema });
+  // Drizzle calls client.unsafe(query, params) for every query. With prepare
+  // disabled (which postgres-js's unsafe always sets), Date parameters reach
+  // an internal Buffer.byteLength path that throws ERR_INVALID_ARG_TYPE
+  // because the value isn't pre-serialized. Coerce Dates → ISO strings here
+  // before postgres-js sees them. Also tee a .catch onto the query so the
+  // underlying PG error is logged before Drizzle wraps it as the generic
+  // "Failed query" error with no cause attached.
+  const unsafeFn = rawClient.unsafe.bind(rawClient);
+  rawClient.unsafe = (queryString: string, params?: unknown[], opts?: any) => {
+    const safeParams = Array.isArray(params)
+      ? params.map((p) => (p instanceof Date ? p.toISOString() : p))
+      : params;
+    const query = unsafeFn(queryString, safeParams, opts);
+    query.catch((err: any) => {
+      // eslint-disable-next-line no-console
+      console.error('[postgres-js] query failed', {
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        hint: err?.hint,
+        where: err?.where,
+        severity: err?.severity_local ?? err?.severity,
+        routine: err?.routine,
+        query: String(queryString ?? '').slice(0, 300),
+      });
+    });
+    return query;
+  };
+
+  return drizzle(rawClient, { schema });
 }
 
 function createConfigService(): ConfigService {
@@ -77,6 +109,8 @@ export interface Services {
   agentsService: AgentsService;
   syncService: SyncService;
   polymarketService: PolymarketService;
+  polymarketDataService: PolymarketDataService;
+  smartMoneySignalService: SmartMoneySignalService;
 }
 
 /**
@@ -106,6 +140,28 @@ export function initServices(): Services {
   const playerImpactService = new PlayerImpactService(db as any);
 
   const predictionMemory = new PredictionMemoryService(config);
+  const leaguePriorsService = new LeaguePriorsService(db as any);
+
+  // Build Polymarket services up front so AgentsService can take
+  // PolymarketService as a dependency (used for on-demand fixture linking
+  // during prediction generation).
+  const polymarketDataService = new PolymarketDataService();
+  const smartMoneySignalService = new SmartMoneySignalService(
+    polymarketDataService,
+  );
+  const polymarketGamma = new PolymarketGammaService(config);
+  const polymarketClob = new PolymarketClobService(config);
+  const polymarketMatcher = new PolymarketMatcherService(db as any);
+  const polymarketTradingAgent = new PolymarketTradingAgent(config);
+  const polymarketService = new PolymarketService(
+    db as any,
+    config,
+    polymarketGamma,
+    polymarketClob,
+    polymarketMatcher,
+    polymarketTradingAgent,
+    smartMoneySignalService,
+  );
 
   const agentsService = new AgentsService(
     db as any,
@@ -121,6 +177,9 @@ export function initServices(): Services {
     oddsService,
     alertsService,
     predictionMemory,
+    leaguePriorsService,
+    smartMoneySignalService,
+    polymarketService,
   );
 
   const syncService = new SyncService(
@@ -128,20 +187,6 @@ export function initServices(): Services {
     config,
     footballService,
     oddsService,
-  );
-
-  // Polymarket trading agent services
-  const polymarketGamma = new PolymarketGammaService(config);
-  const polymarketClob = new PolymarketClobService(config);
-  const polymarketMatcher = new PolymarketMatcherService(db as any);
-  const polymarketTradingAgent = new PolymarketTradingAgent(config);
-  const polymarketService = new PolymarketService(
-    db as any,
-    config,
-    polymarketGamma,
-    polymarketClob,
-    polymarketMatcher,
-    polymarketTradingAgent,
   );
 
   return {
@@ -161,5 +206,7 @@ export function initServices(): Services {
     agentsService,
     syncService,
     polymarketService,
+    polymarketDataService,
+    smartMoneySignalService,
   };
 }

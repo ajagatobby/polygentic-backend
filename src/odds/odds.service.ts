@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
-import { eq, and, desc, gte, lte, isNull, sql } from 'drizzle-orm';
+import { eq, and, desc, gte, lte, isNull, isNotNull, sql } from 'drizzle-orm';
 import {
   bookmakerOdds,
   consensusOdds,
@@ -14,16 +14,47 @@ import { ProbabilityUtil } from './probability.util';
  * All tracked soccer leagues on The Odds API.
  */
 export const SOCCER_SPORT_KEYS = [
+  // Top-5 European leagues
   'soccer_epl',
   'soccer_spain_la_liga',
   'soccer_germany_bundesliga',
   'soccer_italy_serie_a',
   'soccer_france_ligue_one',
+  // UEFA competitions
   'soccer_uefa_champs_league',
   'soccer_uefa_europa_league',
-  'soccer_usa_mls',
-  'soccer_brazil_campeonato',
+  'soccer_uefa_europa_conference_league',
+  // Second tiers & cups
+  'soccer_spain_segunda_division',
+  'soccer_germany_bundesliga2',
+  'soccer_italy_serie_b',
+  'soccer_france_ligue_two',
+  'soccer_efl_champ',
+  'soccer_fa_cup',
+  // Other major domestic leagues the system predicts on
   'soccer_netherlands_eredivisie',
+  'soccer_portugal_primeira_liga',
+  'soccer_turkey_super_league',
+  'soccer_spl', // Scottish Premiership
+  'soccer_belgium_first_div',
+  'soccer_switzerland_superleague',
+  'soccer_austria_bundesliga',
+  'soccer_denmark_superliga',
+  'soccer_greece_super_league',
+  'soccer_norway_eliteserien',
+  'soccer_sweden_allsvenskan',
+  // Americas
+  'soccer_usa_mls',
+  'soccer_mexico_ligamx',
+  'soccer_brazil_campeonato',
+  'soccer_brazil_serie_b',
+  'soccer_argentina_primera_division',
+  'soccer_chile_campeonato',
+  // Rest of world
+  'soccer_australia_aleague',
+  'soccer_japan_j_league',
+  'soccer_korea_kleague1',
+  'soccer_china_superleague',
 ] as const;
 
 interface OddsApiOutcome {
@@ -495,6 +526,193 @@ export class OddsService {
     );
 
     return bestMatch.fixtureId;
+  }
+
+  /**
+   * Inverse of matchEventToFixture: walks fixtures that have no linked
+   * oddsApiEventId and tries to match each one against stored odds events
+   * (from bookmaker_odds / consensus_odds) in a ±36h window.
+   *
+   * Needed because the forward sync only links when the fixture exists at
+   * odds-ingest time. Orphan fixtures whose odds arrived before them (or
+   * whose sync raced) stay unlinked forever without this backfill.
+   *
+   * Returns counts of attempted / linked / skipped.
+   */
+  async backfillUnlinkedFixtures(options?: {
+    /** Only consider fixtures at or after this date. Default: 180 days ago. */
+    since?: Date;
+    /** Only consider fixtures at or before this date. Default: +14 days from now. */
+    until?: Date;
+    /** Hard cap on how many fixtures to attempt in a single run. */
+    limit?: number;
+  }): Promise<{
+    attempted: number;
+    linked: number;
+    skippedNoCandidate: number;
+    skippedLowScore: number;
+  }> {
+    const now = Date.now();
+    const since =
+      options?.since ?? new Date(now - 180 * 24 * 60 * 60 * 1000);
+    const until = options?.until ?? new Date(now + 14 * 24 * 60 * 60 * 1000);
+    const limit = options?.limit ?? 5000;
+
+    // Unlinked fixtures in the window
+    const orphanFixtures = await this.db
+      .select({
+        id: fixtures.id,
+        date: fixtures.date,
+        homeTeamId: fixtures.homeTeamId,
+        awayTeamId: fixtures.awayTeamId,
+      })
+      .from(fixtures)
+      .where(
+        and(
+          isNull(fixtures.oddsApiEventId),
+          gte(fixtures.date, since),
+          lte(fixtures.date, until),
+        ),
+      )
+      .limit(limit);
+
+    if (orphanFixtures.length === 0) {
+      return { attempted: 0, linked: 0, skippedNoCandidate: 0, skippedLowScore: 0 };
+    }
+
+    // Look up all team names once
+    const teamIds = new Set<number>();
+    for (const f of orphanFixtures) {
+      teamIds.add(f.homeTeamId);
+      teamIds.add(f.awayTeamId);
+    }
+    const teamRows = await this.db
+      .select({ id: teams.id, name: teams.name })
+      .from(teams)
+      .where(
+        sql`${teams.id} IN (${sql.join(
+          [...teamIds].map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      );
+    const teamNameMap = new Map<number, string>();
+    for (const t of teamRows) teamNameMap.set(t.id, t.name);
+
+    // Pull distinct events (home_team, away_team, commence_time, oddsApiEventId)
+    // across the overall fixture window — from bookmaker_odds (which has
+    // team names). consensus_odds also has them but bookmaker_odds is the
+    // canonical source.
+    const fixtureWindowStart = new Date(
+      orphanFixtures.reduce(
+        (min, f) => Math.min(min, new Date(f.date).getTime()),
+        Infinity,
+      ) -
+        36 * 60 * 60 * 1000,
+    );
+    const fixtureWindowEnd = new Date(
+      orphanFixtures.reduce(
+        (max, f) => Math.max(max, new Date(f.date).getTime()),
+        -Infinity,
+      ) +
+        36 * 60 * 60 * 1000,
+    );
+
+    const eventRows = await this.db
+      .selectDistinct({
+        oddsApiEventId: bookmakerOdds.oddsApiEventId,
+        homeTeam: bookmakerOdds.homeTeam,
+        awayTeam: bookmakerOdds.awayTeam,
+        commenceTime: bookmakerOdds.commenceTime,
+      })
+      .from(bookmakerOdds)
+      .where(
+        and(
+          gte(bookmakerOdds.commenceTime, fixtureWindowStart),
+          lte(bookmakerOdds.commenceTime, fixtureWindowEnd),
+        ),
+      );
+
+    this.logger.log(
+      `Backfill: ${orphanFixtures.length} orphan fixtures, ${eventRows.length} candidate events`,
+    );
+
+    // Already-used event IDs so we don't double-link. Fetching linked
+    // fixtures' IDs once is cheap.
+    const takenEventIds = new Set<string>();
+    const taken = await this.db
+      .select({ oddsApiEventId: fixtures.oddsApiEventId })
+      .from(fixtures)
+      .where(isNotNull(fixtures.oddsApiEventId));
+    for (const t of taken) {
+      if (t.oddsApiEventId) takenEventIds.add(t.oddsApiEventId);
+    }
+
+    let linked = 0;
+    let skippedNoCandidate = 0;
+    let skippedLowScore = 0;
+    const windowMs = 36 * 60 * 60 * 1000;
+
+    for (const f of orphanFixtures) {
+      const fixtureDate = new Date(f.date);
+      const homeName = teamNameMap.get(f.homeTeamId) ?? '';
+      const awayName = teamNameMap.get(f.awayTeamId) ?? '';
+      if (!homeName || !awayName) {
+        skippedNoCandidate++;
+        continue;
+      }
+
+      let best: { eventId: string; score: number } | null = null;
+      for (const e of eventRows) {
+        if (takenEventIds.has(e.oddsApiEventId)) continue;
+        const eventDate = new Date(e.commenceTime);
+        const timeDiff = Math.abs(
+          eventDate.getTime() - fixtureDate.getTime(),
+        );
+        if (timeDiff > windowMs) continue;
+
+        const homeScore = this.teamNameSimilarity(e.homeTeam, homeName);
+        const awayScore = this.teamNameSimilarity(e.awayTeam, awayName);
+        const combined = (homeScore + awayScore) / 2;
+        const timeBonus = 1 - timeDiff / windowMs;
+        const finalScore = combined * 0.85 + timeBonus * 0.15;
+
+        if (finalScore > 0.5 && (!best || finalScore > best.score)) {
+          best = { eventId: e.oddsApiEventId, score: finalScore };
+        }
+      }
+
+      if (!best) {
+        skippedLowScore++;
+        continue;
+      }
+
+      await this.db
+        .update(fixtures)
+        .set({ oddsApiEventId: best.eventId, updatedAt: new Date() })
+        .where(eq(fixtures.id, f.id));
+      takenEventIds.add(best.eventId);
+      linked++;
+
+      // Also recompute consensus for this event — cheap and ensures the
+      // consensus row is present if bookmaker_odds had data but no
+      // consensus was computed earlier.
+      try {
+        await this.calculateConsensus(best.eventId);
+      } catch (err) {
+        this.logger.debug(
+          `Backfill: consensus recompute failed for event ${best.eventId}: ${
+            (err as Error).message
+          }`,
+        );
+      }
+    }
+
+    return {
+      attempted: orphanFixtures.length,
+      linked,
+      skippedNoCandidate,
+      skippedLowScore,
+    };
   }
 
   /**
