@@ -554,6 +554,14 @@ export class PolymarketService implements OnModuleInit {
     } | null;
     smartMoneySignal: any;
     marketSignal?: any;
+    polymarket?: {
+      marketQuestion: string;
+      marketTeam: string;
+      conditionId: string;
+      marketUrl: string | null;
+      eventUrl: string | null;
+      url: string | null;
+    };
     stored?: boolean;
     reason?: string;
   }> {
@@ -616,6 +624,8 @@ export class PolymarketService implements OnModuleInit {
         conditionId: schema.polymarketMarkets.conditionId,
         teamId: schema.polymarketMarkets.teamId,
         marketQuestion: schema.polymarketMarkets.marketQuestion,
+        slug: schema.polymarketMarkets.slug,
+        eventSlug: schema.polymarketMarkets.eventSlug,
         outcomes: schema.polymarketMarkets.outcomes,
         outcomePrices: schema.polymarketMarkets.outcomePrices,
         midpoints: schema.polymarketMarkets.midpoints,
@@ -645,6 +655,8 @@ export class PolymarketService implements OnModuleInit {
       teamName: string;
       matchSide: 'home' | 'away';
       similarity: number;
+      slug: string | null;
+      eventSlug: string | null;
       outcomes: string[] | null;
       outcomePrices: string[] | null;
       midpoints: string[] | null;
@@ -664,6 +676,8 @@ export class PolymarketService implements OnModuleInit {
         teamName: teamInQuestion,
         matchSide: homeSim >= awaySim ? 'home' : 'away',
         similarity: Math.max(homeSim, awaySim),
+        slug: (m.slug as string | null) ?? null,
+        eventSlug: (m.eventSlug as string | null) ?? null,
         outcomes: (m.outcomes as string[] | null) ?? null,
         outcomePrices: (m.outcomePrices as string[] | null) ?? null,
         midpoints: (m.midpoints as string[] | null) ?? null,
@@ -936,6 +950,13 @@ export class PolymarketService implements OnModuleInit {
       storedCreatedAt = row.createdAt;
     }
 
+    const marketUrl = chosen.slug
+      ? `https://polymarket.com/market/${chosen.slug}`
+      : null;
+    const eventUrl = chosen.eventSlug
+      ? `https://polymarket.com/event/${chosen.eventSlug}`
+      : null;
+
     return {
       fixture: fixtureView,
       prediction: {
@@ -946,6 +967,14 @@ export class PolymarketService implements OnModuleInit {
       },
       smartMoneySignal: viewSignal,
       marketSignal,
+      polymarket: {
+        marketQuestion: `Will ${chosen.teamName} win?`,
+        marketTeam: chosen.teamName,
+        conditionId: chosen.conditionId,
+        marketUrl,
+        eventUrl,
+        url: marketUrl ?? eventUrl,
+      },
       ...(options.persist ? { stored: storedId != null } : {}),
     };
   }
