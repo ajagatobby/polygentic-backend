@@ -505,6 +505,57 @@ export class PolymarketGammaService {
   }
 
   /**
+   * Tier-3 fallback: keyword search across all Polymarket events using
+   * the undocumented `/public-search` endpoint. Accepts team names as `q`
+   * and returns a scored, sorted list — first result is usually the
+   * exact fixture match.
+   *
+   * Use this when Tier 2 (league-scoped window) misses — typically
+   * because the fixture's league isn't in our tag map or the event was
+   * tagged only with the generic `soccer` tag.
+   *
+   * Note: `/public-search` returns a wrapped object `{ events, pagination }`
+   * rather than a raw array. We extract `events` and parse them through
+   * the standard pipeline.
+   */
+  async searchEvents(
+    query: string,
+    opts: {
+      tagSlugs?: string[];
+      includeClosedMarkets?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<ParsedPolymarketEvent[]> {
+    const params: Record<string, any> = {
+      q: query,
+      events_status: 'active',
+      limit_per_type: Math.min(20, opts.limit ?? 10),
+    };
+    if (opts.tagSlugs && opts.tagSlugs.length > 0) {
+      params.events_tag = opts.tagSlugs;
+    }
+    if (opts.includeClosedMarkets) {
+      params.keep_closed_markets = 1;
+    }
+
+    try {
+      const response = await this.client.get('/public-search', { params });
+      const raw: GammaEvent[] = Array.isArray(response.data?.events)
+        ? response.data.events
+        : [];
+      return raw
+        .filter((e) => e.markets && e.markets.length > 0)
+        .map((e) => this.parseEvent(e))
+        .filter((e) => e.markets.length > 0);
+    } catch (err) {
+      this.logger.warn(
+        `searchEvents("${query}") failed: ${(err as Error).message}`,
+      );
+      return [];
+    }
+  }
+
+  /**
    * Fetch a single event by ID.
    */
   async fetchEventById(eventId: string): Promise<ParsedPolymarketEvent | null> {

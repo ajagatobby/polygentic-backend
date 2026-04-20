@@ -463,53 +463,92 @@ export class PolymarketService implements OnModuleInit {
     );
 
     try {
-      // Look up the fixture's league + kickoff so we can try the fast
-      // Tier-2 lookup (league-scoped + kickoff window) before falling
-      // back to the 1000-event global scan.
+      // Look up the fixture's league + kickoff + team names so we can try
+      // the fast Tier-2 (league-scoped) and Tier-3 (public-search) lookups
+      // before falling back to the 1000-event global scan.
       const [fixtureRow] = await this.db
         .select({
           date: schema.fixtures.date,
           leagueId: schema.fixtures.leagueId,
+          homeTeamId: schema.fixtures.homeTeamId,
+          awayTeamId: schema.fixtures.awayTeamId,
         })
         .from(schema.fixtures)
         .where(eq(schema.fixtures.id, fixtureId))
         .limit(1);
 
+      let homeName: string | null = null;
+      let awayName: string | null = null;
+      if (fixtureRow) {
+        const teamRows = await this.db
+          .select({ id: schema.teams.id, name: schema.teams.name })
+          .from(schema.teams)
+          .where(
+            inArray(schema.teams.id, [
+              fixtureRow.homeTeamId,
+              fixtureRow.awayTeamId,
+            ]),
+          );
+        homeName =
+          teamRows.find((t: any) => t.id === fixtureRow.homeTeamId)?.name ??
+          null;
+        awayName =
+          teamRows.find((t: any) => t.id === fixtureRow.awayTeamId)?.name ??
+          null;
+      }
+
       let events: Awaited<
         ReturnType<typeof this.gammaService.fetchRecentSoccerEvents>
       > = [];
-      let tier: 'league-window' | 'global-scan' = 'global-scan';
+      let tier: 'league-window' | 'public-search' | 'global-scan' =
+        'global-scan';
 
       // Tier 2: league-scoped + kickoff window. Single HTTP call, typically
       // 1-10 events. Works when we have both a kickoff date and a known
       // Polymarket tag_slug for the fixture's league.
-      if (fixtureRow?.date && fixtureRow.leagueId != null) {
-        const tagSlug = PolymarketGammaService.tagSlugForLeagueId(
-          fixtureRow.leagueId,
+      const tagSlug =
+        fixtureRow?.leagueId != null
+          ? PolymarketGammaService.tagSlugForLeagueId(fixtureRow.leagueId)
+          : null;
+      if (fixtureRow?.date && tagSlug) {
+        const kickoff = new Date(fixtureRow.date);
+        const tier2 = await this.gammaService.fetchEventsByLeagueAndDate(
+          tagSlug,
+          kickoff,
+          6,
         );
-        if (tagSlug) {
-          const kickoff = new Date(fixtureRow.date);
-          const tier2 = await this.gammaService.fetchEventsByLeagueAndDate(
-            tagSlug,
-            kickoff,
-            6,
+        if (tier2.length > 0) {
+          events = tier2;
+          tier = 'league-window';
+          this.logger.log(
+            `Tier 2 (${tagSlug}, ±6h): ${tier2.length} candidate event(s)`,
           );
-          if (tier2.length > 0) {
-            events = tier2;
-            tier = 'league-window';
-            this.logger.log(
-              `Tier 2 (${tagSlug}, ±6h): ${tier2.length} candidate event(s)`,
-            );
-          }
+        }
+      }
+
+      // Tier 3: public-search by team names. Catches fixtures in leagues
+      // we haven't mapped (tagSlug === null) and those that Polymarket
+      // tagged only with `soccer` instead of a league-specific tag.
+      if (events.length === 0 && homeName && awayName) {
+        const query = `${homeName} ${awayName}`;
+        const tier3 = await this.gammaService.searchEvents(query, {
+          tagSlugs: tagSlug ? [tagSlug] : undefined,
+          limit: 10,
+        });
+        if (tier3.length > 0) {
+          events = tier3;
+          tier = 'public-search';
+          this.logger.log(
+            `Tier 3 (public-search "${query}"): ${tier3.length} candidate event(s)`,
+          );
         }
       }
 
       // Tier 4 fallback: generic soccer-tag scan. Slow (20 pages × 500) but
-      // catches fixtures in leagues we haven't mapped or fixtures whose
-      // league tag_slug doesn't carry per-match events.
+      // last-resort coverage for edge cases where tiers 2 and 3 both miss.
       if (events.length === 0) {
         this.logger.log(
-          `Tier 2 miss — falling back to global scan for fixture ${fixtureId}`,
+          `Tiers 2+3 missed — falling back to global scan for fixture ${fixtureId}`,
         );
         events = await this.gammaService.fetchRecentSoccerEvents({
           maxEvents: 1000,
