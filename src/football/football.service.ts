@@ -2869,7 +2869,7 @@ export class FootballService {
       otherTeamName != null ? `${otherTeamName} or Draw` : 'No';
 
     const topSharps = Array.isArray(raw.topSharps)
-      ? raw.topSharps.slice(0, 5).map((s: any) => {
+      ? raw.topSharps.map((s: any) => {
           const betYes = s.outcomeIndex === 0;
           return {
             wallet: s.proxyWallet ?? null,

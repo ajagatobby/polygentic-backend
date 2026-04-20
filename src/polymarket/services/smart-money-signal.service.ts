@@ -291,19 +291,18 @@ export class SmartMoneySignalService {
       sharpDollarsOutcome1: dollars1,
       outcome0Name,
       outcome1Name,
-      // Surface the hottest wallets (recent form), not the biggest bettors.
-      // Ties broken by current streak, then lifetime PnL.
-      topSharps: independent
-        .sort((a, b) => {
-          const aw = a.last10Wins ?? -1;
-          const bw = b.last10Wins ?? -1;
-          if (aw !== bw) return bw - aw;
-          if (a.currentWinStreak !== b.currentWinStreak) {
-            return b.currentWinStreak - a.currentWinStreak;
-          }
-          return b.lifetimePnl - a.lifetimePnl;
-        })
-        .slice(0, 5),
+      // All qualifying sharps, sorted hottest-first (recent wins), not
+      // bet size. No cap — consumers get the full list so they can
+      // display or filter as they like.
+      topSharps: independent.sort((a, b) => {
+        const aw = a.last10Wins ?? -1;
+        const bw = b.last10Wins ?? -1;
+        if (aw !== bw) return bw - aw;
+        if (a.currentWinStreak !== b.currentWinStreak) {
+          return b.currentWinStreak - a.currentWinStreak;
+        }
+        return b.lifetimePnl - a.lifetimePnl;
+      }),
       contributingMarkets: 1,
     };
   }

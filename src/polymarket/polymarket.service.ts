@@ -1724,7 +1724,7 @@ export class PolymarketService implements OnModuleInit {
         dollarsFor: Math.round(dollarsFor),
         dollarsAgainst: Math.round(dollarsAgainst),
       },
-      topSharps: (raw.topSharps ?? []).slice(0, 5).map((s) => {
+      topSharps: (raw.topSharps ?? []).map((s) => {
         const betYes = s.outcomeIndex === 0;
         return {
           wallet: s.proxyWallet ?? null,
