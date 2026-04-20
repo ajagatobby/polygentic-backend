@@ -908,7 +908,17 @@ export class PolymarketMatcherService {
     event: ParsedPolymarketEvent,
     market: ParsedMarket,
   ): Promise<FixtureMarketMatch | null> {
-    const textToSearch = `${event.title} ${market.question}`;
+    // Search across the event title AND every market's question. Polymarket
+    // moneyline events have one "Will TEAM win?" market per team, so
+    // harvesting all market questions lets us pick up both team names
+    // even when the event title is truncated or stylized.
+    const allMarketQuestions = (event.markets ?? [])
+      .map((m) => m.question)
+      .filter(Boolean)
+      .join(' | ');
+    const textToSearch = [event.title, market.question, allMarketQuestions]
+      .filter(Boolean)
+      .join(' | ');
     const extractedTeams = this.extractTeamNamesFromMatchText(textToSearch);
 
     // For multi-outcome match events (negRisk moneylines), the team names
@@ -1084,33 +1094,56 @@ export class PolymarketMatcherService {
   // ─── Team name extraction for match outcomes ────────────────────────
 
   private extractTeamNamesFromMatchText(text: string): string[] {
-    const teams: string[] = [];
+    const teams = new Set<string>();
+    // Unicode-aware team-name word class — any letter (incl. diacritics
+    // like ș, ã, é, ñ), plus spaces, dots, apostrophes, hyphens. Required
+    // because Polymarket uses the real spellings ("FC Botoșani"), not
+    // ASCII-only forms.
+    const W = `[\\p{L}][\\p{L}\\s.'-]*?`;
+    const END = `(?=\\s+(?:on|in|at|vs|versus)\\b|\\s*[-–—,?!.:]|\\s*$)`;
 
-    // Pattern 1: "X vs Y"
+    // Pattern 1: "X vs Y" / "X vs. Y" / "X versus Y"
     const vsMatch = text.match(
-      /([A-Z][A-Za-z\s.'-]+?)\s+(?:vs?\.?|versus)\s+([A-Z][A-Za-z\s.'-]+?)(?:\s+(?:on|in|at|–|-|,|\?|$))/i,
+      new RegExp(`(${W})\\s+(?:vs?\\.?|versus)\\s+(${W})${END}`, 'iu'),
     );
     if (vsMatch) {
-      teams.push(vsMatch[1].trim(), vsMatch[2].trim());
+      teams.add(vsMatch[1].trim());
+      teams.add(vsMatch[2].trim());
     }
 
-    // Pattern 2: "Will X beat Y"
+    // Pattern 2: Polymarket moneyline format — "Will TEAM win" / "Will
+    // TEAM win on DATE?". /g flag to capture both sides when the same
+    // text contains multiple questions joined together.
+    const willWinRx = new RegExp(`will\\s+(${W})\\s+win\\b`, 'giu');
+    let m: RegExpExecArray | null;
+    while ((m = willWinRx.exec(text)) != null) {
+      if (m[1]) teams.add(m[1].trim());
+      // Guard against zero-length stalls
+      if (m.index === willWinRx.lastIndex) willWinRx.lastIndex++;
+    }
+
+    // Pattern 3: "Will X beat Y" / "Will X defeat Y"
     const beatMatch = text.match(
-      /(?:will|can|does)\s+([A-Z][A-Za-z\s.'-]+?)\s+(?:beat|defeat|win against)\s+([A-Z][A-Za-z\s.'-]+?)(?:\s+(?:on|in|at|–|-|,|\?|$))/i,
+      new RegExp(
+        `(?:will|can|does)\\s+(${W})\\s+(?:beat|defeat|win against)\\s+(${W})${END}`,
+        'iu',
+      ),
     );
-    if (beatMatch && teams.length === 0) {
-      teams.push(beatMatch[1].trim(), beatMatch[2].trim());
+    if (beatMatch) {
+      teams.add(beatMatch[1].trim());
+      teams.add(beatMatch[2].trim());
     }
 
-    // Pattern 3: "X - Y"
+    // Pattern 4: "X - Y" / "X – Y" / "X — Y"
     const dashMatch = text.match(
-      /([A-Z][A-Za-z\s.'-]+?)\s+[-–]\s+([A-Z][A-Za-z\s.'-]+?)(?:\s+(?:on|in|at|,|\?|$))/i,
+      new RegExp(`(${W})\\s+[-–—]\\s+(${W})${END}`, 'iu'),
     );
-    if (dashMatch && teams.length === 0) {
-      teams.push(dashMatch[1].trim(), dashMatch[2].trim());
+    if (dashMatch) {
+      teams.add(dashMatch[1].trim());
+      teams.add(dashMatch[2].trim());
     }
 
-    return teams
+    return [...teams]
       .map((t) =>
         t
           .replace(/\b(the|will|fc|cf|sc|afc)\b/gi, '')
