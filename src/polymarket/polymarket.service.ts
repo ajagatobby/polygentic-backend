@@ -1140,11 +1140,22 @@ export class PolymarketService implements OnModuleInit {
     // Pool expansion: on persist (POST) we widen the candidate pool past
     // Polymarket's 20-holder cap via /trades aggregation + leaderboard
     // cross-check. GETs stay on the cheaper native /holders query.
+    //
+    // targetHoldersPerOutcome is set to a very large number so no wallet
+    // gets dropped by the per-outcome cap — the effective pool size is
+    // bounded only by how many unique wallets Polymarket surfaces across
+    // /holders + /trades + leaderboard. More candidates in → more
+    // qualifying sharps out → more reliable leanScore.
     const poolOptions = options.persist
       ? {
           expandPool: true,
-          targetHoldersPerOutcome: 100,
+          targetHoldersPerOutcome: 10_000,
           includeLeaderboardInPool: true,
+          // Deeper trade pagination + wider leaderboard cross-check so
+          // the union catches every active wallet on the market, not
+          // just the top tier.
+          tradeSampleSize: 5_000,
+          leaderboardSize: 200,
         }
       : {};
 

@@ -121,6 +121,14 @@ export interface SmartMoneyOptions {
    *  (~100 extra HTTP calls to /positions) but surfaces proven sharps
    *  below the top-20 holder cutoff. Default false. */
   includeLeaderboardInPool?: boolean;
+  /** How many recent /trades records to pull when reconstructing net
+   *  positions. Default 1000. Higher = deeper wallet discovery at the
+   *  cost of one larger HTTP response. */
+  tradeSampleSize?: number;
+  /** How many leaderboard entries to cross-check against this market.
+   *  Default 100, clamped to 200 upstream. Higher surfaces more proven
+   *  sharps at N additional /positions calls (cached 30min). */
+  leaderboardSize?: number;
 }
 
 /** Aggregated lifetime stats for a single wallet, used by the sharp
@@ -154,6 +162,8 @@ export class SmartMoneySignalService {
     expandPool: false,
     targetHoldersPerOutcome: 100,
     includeLeaderboardInPool: false,
+    tradeSampleSize: 1000,
+    leaderboardSize: 100,
   };
 
   constructor(private readonly data: PolymarketDataService) {}
@@ -191,6 +201,8 @@ export class SmartMoneySignalService {
       ? await this.data.getExpandedHolders(conditionId, {
           targetPerOutcome: cfg.targetHoldersPerOutcome,
           includeLeaderboard: cfg.includeLeaderboardInPool,
+          tradeSampleSize: cfg.tradeSampleSize,
+          leaderboardSize: cfg.leaderboardSize,
         })
       : await this.data.getTopHolders(conditionId);
     if (holdersByOutcome.length < 2) {
