@@ -161,6 +161,7 @@ export function initServices(): Services {
     polymarketMatcher,
     polymarketTradingAgent,
     smartMoneySignalService,
+    polymarketDataService,
   );
 
   const agentsService = new AgentsService(

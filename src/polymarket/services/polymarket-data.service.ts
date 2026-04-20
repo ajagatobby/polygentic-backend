@@ -310,6 +310,22 @@ export class PolymarketDataService {
     });
   }
 
+  /**
+   * Drop every cache entry mentioning `conditionId` so the next lookup
+   * hits Polymarket fresh. Used when a caller explicitly asks for live
+   * data (e.g. a POST that needs the newest holder positions).
+   */
+  invalidateForConditionId(conditionId: string): number {
+    let dropped = 0;
+    for (const key of this.cache.keys()) {
+      if (key.includes(conditionId)) {
+        this.cache.delete(key);
+        dropped++;
+      }
+    }
+    return dropped;
+  }
+
   // ─── Internals ─────────────────────────────────────────────────────
 
   /** Memoising wrapper: same key returns same result until TTL expires. */

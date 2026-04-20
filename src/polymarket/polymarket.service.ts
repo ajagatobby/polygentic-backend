@@ -43,6 +43,7 @@ import {
   SmartMoneySignalService,
   SmartMoneySignal,
 } from './services/smart-money-signal.service';
+import { PolymarketDataService } from './services/polymarket-data.service';
 
 /**
  * PolymarketService — Orchestrator
@@ -68,6 +69,7 @@ export class PolymarketService implements OnModuleInit {
     private readonly matcherService: PolymarketMatcherService,
     private readonly tradingAgent: PolymarketTradingAgent,
     private readonly smartMoneySignalService: SmartMoneySignalService,
+    private readonly polymarketDataService: PolymarketDataService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -565,6 +567,14 @@ export class PolymarketService implements OnModuleInit {
     stored?: boolean;
     reason?: string;
   }> {
+    // When persisting (the user-triggered POST path), drop the negative
+    // on-demand cache up front so linkFixtureOnDemand re-checks Gamma
+    // even if we recently recorded a miss. Holder cache gets invalidated
+    // later once we know which conditionId to target.
+    if (options.persist) {
+      this.onDemandMissCache.delete(fixtureId);
+    }
+
     // Step 1: ensure the fixture is linked to Polymarket.
     const existingLink = await this.db
       .select({ id: schema.polymarketMarkets.id })
@@ -621,11 +631,13 @@ export class PolymarketService implements OnModuleInit {
     // Step 3: find a moneyline market for this fixture.
     const linkedMarkets = await this.db
       .select({
+        id: schema.polymarketMarkets.id,
         conditionId: schema.polymarketMarkets.conditionId,
         teamId: schema.polymarketMarkets.teamId,
         marketQuestion: schema.polymarketMarkets.marketQuestion,
         slug: schema.polymarketMarkets.slug,
         eventSlug: schema.polymarketMarkets.eventSlug,
+        clobTokenIds: schema.polymarketMarkets.clobTokenIds,
         outcomes: schema.polymarketMarkets.outcomes,
         outcomePrices: schema.polymarketMarkets.outcomePrices,
         midpoints: schema.polymarketMarkets.midpoints,
@@ -651,12 +663,14 @@ export class PolymarketService implements OnModuleInit {
 
     const MONEYLINE_RX = /^Will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}\??$/i;
     const candidates: Array<{
+      marketId: number;
       conditionId: string;
       teamName: string;
       matchSide: 'home' | 'away';
       similarity: number;
       slug: string | null;
       eventSlug: string | null;
+      clobTokenIds: string[] | null;
       outcomes: string[] | null;
       outcomePrices: string[] | null;
       midpoints: string[] | null;
@@ -672,12 +686,14 @@ export class PolymarketService implements OnModuleInit {
       const awaySim = this.nameSimilarity(teamInQuestion, awayName ?? '');
       if (homeSim < 0.5 && awaySim < 0.5) continue;
       candidates.push({
+        marketId: m.id as number,
         conditionId: m.conditionId as string,
         teamName: teamInQuestion,
         matchSide: homeSim >= awaySim ? 'home' : 'away',
         similarity: Math.max(homeSim, awaySim),
         slug: (m.slug as string | null) ?? null,
         eventSlug: (m.eventSlug as string | null) ?? null,
+        clobTokenIds: (m.clobTokenIds as string[] | null) ?? null,
         outcomes: (m.outcomes as string[] | null) ?? null,
         outcomePrices: (m.outcomePrices as string[] | null) ?? null,
         midpoints: (m.midpoints as string[] | null) ?? null,
@@ -702,6 +718,55 @@ export class PolymarketService implements OnModuleInit {
     const chosen = candidates[0];
     const marketTeamId =
       chosen.matchSide === 'home' ? fixture.homeTeamId : fixture.awayTeamId;
+
+    // Step 3b: if the caller asked to persist, force live data. Drop every
+    // cache that would otherwise serve a stale response, then refresh the
+    // market's price snapshot from the CLOB before the signal computes.
+    // This matters most for the user-triggered POST path — the whole point
+    // of that request is "give me the newest read you can get."
+    if (options.persist) {
+      this.onDemandMissCache.delete(fixtureId);
+      this.polymarketDataService.invalidateForConditionId(chosen.conditionId);
+      try {
+        const yesTokenId = chosen.clobTokenIds?.[0];
+        const noTokenId = chosen.clobTokenIds?.[1];
+        const [yesPricing, noPricing] = await Promise.all([
+          yesTokenId
+            ? this.clobService.getMarketPricingSnapshot(yesTokenId)
+            : Promise.resolve(null),
+          noTokenId
+            ? this.clobService.getMarketPricingSnapshot(noTokenId)
+            : Promise.resolve(null),
+        ]);
+        if (yesPricing || noPricing) {
+          const freshMidpoints = [
+            yesPricing ? String(yesPricing.midpoint) : null,
+            noPricing ? String(noPricing.midpoint) : null,
+          ];
+          // Update the in-memory chosen record so any downstream use
+          // (market fallback, marketSignal block) sees live prices.
+          if (freshMidpoints[0] != null) {
+            chosen.midpoints = chosen.midpoints
+              ? [freshMidpoints[0], chosen.midpoints[1] ?? freshMidpoints[1] ?? '']
+              : [freshMidpoints[0], freshMidpoints[1] ?? ''];
+          }
+          // Also persist back to the row so subsequent GETs benefit.
+          await this.db
+            .update(schema.polymarketMarkets)
+            .set({
+              midpoints: freshMidpoints.filter((v) => v != null) as string[],
+              lastSyncedAt: new Date(),
+            })
+            .where(eq(schema.polymarketMarkets.id, chosen.marketId));
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Live price refresh failed for condition ${chosen.conditionId}: ${
+            (err as Error).message
+          }`,
+        );
+      }
+    }
 
     // Step 4: compute signal for the chosen market. Two-pass:
     //   Pass 1 — strict defaults ($50k PnL, 10% ROI, 50+ resolved, 3+ sharps).
