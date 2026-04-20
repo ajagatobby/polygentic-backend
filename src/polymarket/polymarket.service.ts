@@ -463,18 +463,65 @@ export class PolymarketService implements OnModuleInit {
     );
 
     try {
-      // 1. Fetch a manageable slice of active soccer events
-      const events = await this.gammaService.fetchRecentSoccerEvents({
-        maxEvents: 1000,
-      });
+      // Look up the fixture's league + kickoff so we can try the fast
+      // Tier-2 lookup (league-scoped + kickoff window) before falling
+      // back to the 1000-event global scan.
+      const [fixtureRow] = await this.db
+        .select({
+          date: schema.fixtures.date,
+          leagueId: schema.fixtures.leagueId,
+        })
+        .from(schema.fixtures)
+        .where(eq(schema.fixtures.id, fixtureId))
+        .limit(1);
 
-      // 2. Run the matcher — matchEvents internally calls matchToFixture
-      //    which queries the DB for candidate fixtures in a ±7 day window
-      //    around each event's start time. Passing the full event list
-      //    lets it consider any fixture, including the target one.
+      let events: Awaited<
+        ReturnType<typeof this.gammaService.fetchRecentSoccerEvents>
+      > = [];
+      let tier: 'league-window' | 'global-scan' = 'global-scan';
+
+      // Tier 2: league-scoped + kickoff window. Single HTTP call, typically
+      // 1-10 events. Works when we have both a kickoff date and a known
+      // Polymarket tag_slug for the fixture's league.
+      if (fixtureRow?.date && fixtureRow.leagueId != null) {
+        const tagSlug = PolymarketGammaService.tagSlugForLeagueId(
+          fixtureRow.leagueId,
+        );
+        if (tagSlug) {
+          const kickoff = new Date(fixtureRow.date);
+          const tier2 = await this.gammaService.fetchEventsByLeagueAndDate(
+            tagSlug,
+            kickoff,
+            6,
+          );
+          if (tier2.length > 0) {
+            events = tier2;
+            tier = 'league-window';
+            this.logger.log(
+              `Tier 2 (${tagSlug}, ±6h): ${tier2.length} candidate event(s)`,
+            );
+          }
+        }
+      }
+
+      // Tier 4 fallback: generic soccer-tag scan. Slow (20 pages × 500) but
+      // catches fixtures in leagues we haven't mapped or fixtures whose
+      // league tag_slug doesn't carry per-match events.
+      if (events.length === 0) {
+        this.logger.log(
+          `Tier 2 miss — falling back to global scan for fixture ${fixtureId}`,
+        );
+        events = await this.gammaService.fetchRecentSoccerEvents({
+          maxEvents: 1000,
+        });
+      }
+
+      // Run the matcher — matchEvents internally calls matchToFixture
+      // which queries the DB for candidate fixtures in a ±7 day window
+      // around each event's start time.
       const matches = await this.matcherService.matchEvents(events);
 
-      // 3. Filter to matches that link to THIS fixture specifically
+      // Filter to matches that link to THIS fixture specifically
       const ourMatches = matches.filter(
         (m: any) =>
           m.marketType === 'match_outcome' && m.fixtureId === fixtureId,
@@ -485,15 +532,15 @@ export class PolymarketService implements OnModuleInit {
         // immediately for this same fixture.
         this.onDemandMissCache.set(fixtureId, Date.now());
         this.logger.log(
-          `On-demand link: no Polymarket market for fixture ${fixtureId} (${events.length} events scanned)`,
+          `On-demand link: no Polymarket market for fixture ${fixtureId} (${events.length} events scanned, tier=${tier})`,
         );
         return { linked: 0, alreadyLinked: false, cached: false };
       }
 
-      // 4. Persist all matches we found for this fixture
+      // Persist all matches we found for this fixture
       await this.persistMarkets(ourMatches);
       this.logger.log(
-        `On-demand link: fixture ${fixtureId} → ${ourMatches.length} market(s) linked`,
+        `On-demand link: fixture ${fixtureId} → ${ourMatches.length} market(s) linked (tier=${tier})`,
       );
       return {
         linked: ourMatches.length,

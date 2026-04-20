@@ -443,6 +443,68 @@ export class PolymarketGammaService {
   }
 
   /**
+   * Tier-2 fixture lookup — scope `/events` to a single league tag +
+   * narrow kickoff-time window. Uses the `end_date_min` / `end_date_max`
+   * params (undocumented in Gamma docs but live as of 2026-04) which
+   * filter on the event's kickoff time (not publish time).
+   *
+   * Typical response size: 1–10 events for a league's single-day slate.
+   * Replaces the ~20-page soccer-super-tag scan for on-demand lookups.
+   *
+   * @param tagSlug       Polymarket league tag (e.g. "primeira-liga")
+   * @param kickoff       Fixture kickoff date/time
+   * @param windowHours   ± window around kickoff (default 6h — catches
+   *                      timezone drift and late-published markets)
+   */
+  async fetchEventsByLeagueAndDate(
+    tagSlug: string,
+    kickoff: Date,
+    windowHours: number = 6,
+  ): Promise<ParsedPolymarketEvent[]> {
+    const windowMs = windowHours * 60 * 60 * 1000;
+    const endMin = new Date(kickoff.getTime() - windowMs).toISOString();
+    const endMax = new Date(kickoff.getTime() + windowMs).toISOString();
+
+    try {
+      const response = await this.client.get('/events', {
+        params: {
+          tag_slug: tagSlug,
+          end_date_min: endMin,
+          end_date_max: endMax,
+          closed: 'false',
+          limit: 50,
+        },
+      });
+      const raw: GammaEvent[] = Array.isArray(response.data)
+        ? response.data
+        : [];
+      return raw
+        .filter((e) => e.markets && e.markets.length > 0)
+        .map((e) => this.parseEvent(e, tagSlug))
+        .filter((e) => e.markets.length > 0);
+    } catch (err) {
+      this.logger.warn(
+        `fetchEventsByLeagueAndDate(${tagSlug}, ${kickoff.toISOString()}) failed: ${
+          (err as Error).message
+        }`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Look up the Polymarket tag_slug for a given API-Football league ID.
+   * Returns null when no mapping exists — caller should fall back to the
+   * generic soccer-tag scan.
+   */
+  static tagSlugForLeagueId(leagueId: number): string | null {
+    const match = POLYMARKET_SOCCER_TAGS.find(
+      (t) => t.apiFootballLeagueId === leagueId,
+    );
+    return match?.tagSlug ?? null;
+  }
+
+  /**
    * Fetch a single event by ID.
    */
   async fetchEventById(eventId: string): Promise<ParsedPolymarketEvent | null> {
