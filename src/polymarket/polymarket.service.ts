@@ -1096,7 +1096,7 @@ export class PolymarketService implements OnModuleInit {
 
   async predictFromSmartMoney(
     fixtureId: number,
-    options: { persist?: boolean } = {},
+    options: { persist?: boolean; fresh?: boolean } = {},
   ): Promise<{
     fixture: {
       id: number;
@@ -1133,12 +1133,17 @@ export class PolymarketService implements OnModuleInit {
     stored?: boolean;
     reason?: string;
   }> {
-    // When persisting (the user-triggered POST path), drop the negative
-    // on-demand cache up front so linkFixtureOnDemand re-checks Gamma
-    // even if we recently recorded a miss. Holder cache gets invalidated
-    // later once we know which conditionId to target.
-    if (options.persist) {
+    // Fresh mode: nuke every cache that could serve stale data so the
+    // whole pipeline re-fetches from Polymarket — holders, trades,
+    // leaderboard, per-wallet positions, closed positions, and the
+    // on-demand negative cache.
+    //
+    // Default: POST = fresh, GET = cache. Callers can override via
+    // options.fresh to force either behaviour.
+    const useFresh = options.fresh ?? options.persist ?? false;
+    if (useFresh) {
       this.onDemandMissCache.delete(fixtureId);
+      this.polymarketDataService.invalidateAll();
     }
 
     // Step 1: ensure the fixture is linked to Polymarket.
@@ -1285,14 +1290,11 @@ export class PolymarketService implements OnModuleInit {
     const marketTeamId =
       chosen.matchSide === 'home' ? fixture.homeTeamId : fixture.awayTeamId;
 
-    // Step 3b: if the caller asked to persist, force live data. Drop every
-    // cache that would otherwise serve a stale response, then refresh the
-    // market's price snapshot from the CLOB before the signal computes.
-    // This matters most for the user-triggered POST path — the whole point
-    // of that request is "give me the newest read you can get."
-    if (options.persist) {
-      this.onDemandMissCache.delete(fixtureId);
-      this.polymarketDataService.invalidateForConditionId(chosen.conditionId);
+    // Step 3b: on fresh mode, refresh market pricing live from the CLOB
+    // before signal compute. The data-api cache was already nuked at the
+    // top of this method, so every /holders, /trades, /leaderboard, and
+    // /positions call below is guaranteed fresh.
+    if (useFresh) {
       try {
         const yesTokenId = chosen.clobTokenIds?.[0];
         const noTokenId = chosen.clobTokenIds?.[1];

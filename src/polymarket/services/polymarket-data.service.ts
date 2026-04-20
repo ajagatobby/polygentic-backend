@@ -486,6 +486,19 @@ export class PolymarketDataService {
   }
 
   /**
+   * Drop the entire in-memory cache. Use when a caller needs absolutely
+   * fresh data across every endpoint (holders, trades, leaderboard,
+   * per-wallet positions, closed positions). More expensive than
+   * `invalidateForConditionId` because it forces re-fetch of leaderboard
+   * + every wallet's positions — but guarantees no staleness.
+   */
+  invalidateAll(): number {
+    const n = this.cache.size;
+    this.cache.clear();
+    return n;
+  }
+
+  /**
    * Drop every cache entry mentioning `conditionId` so the next lookup
    * hits Polymarket fresh. Used when a caller explicitly asks for live
    * data (e.g. a POST that needs the newest holder positions).

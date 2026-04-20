@@ -291,14 +291,27 @@ export class PolymarketController {
       'Translates Polymarket sharp-wallet positioning into home/draw/away probabilities. ' +
       'Triggers an on-demand Polymarket link if the fixture has no market yet. ' +
       'Returns `prediction: null` with a reason when no coverage or no qualifying sharps exist. ' +
-      'Does NOT write to the predictions table — use POST to persist.',
+      'Does NOT write to the predictions table — use POST to persist. ' +
+      'Pass ?fresh=true to force-refetch from Polymarket instead of using cache.',
   })
-  async predictFromSmartMoney(@Param('fixtureId') fixtureId: string) {
+  @ApiQuery({
+    name: 'fresh',
+    required: false,
+    type: Boolean,
+    description:
+      'If true, bypass all in-memory caches and re-fetch from Polymarket (slower but guaranteed live). Default: false (uses cache).',
+  })
+  async predictFromSmartMoney(
+    @Param('fixtureId') fixtureId: string,
+    @Query('fresh') fresh?: string,
+  ) {
     const id = Number(fixtureId);
     if (!Number.isFinite(id) || id <= 0) {
       throw new BadRequestException('fixtureId must be a positive integer');
     }
-    return this.polymarketService.predictFromSmartMoney(id);
+    return this.polymarketService.predictFromSmartMoney(id, {
+      fresh: fresh === 'true' ? true : fresh === 'false' ? false : undefined,
+    });
   }
 
   @Post('smart-money/predict/:fixtureId')
@@ -309,15 +322,29 @@ export class PolymarketController {
       'Same computation as the GET endpoint, but upserts a row into the predictions ' +
       'table with predictionType = "smart_money". Overwrites any previous smart_money ' +
       'prediction for this fixture (one-per-fixture-per-type by unique constraint). ' +
-      'The created prediction surfaces in the regular fixture response as the newest run ' +
-      'if no other prediction type was generated more recently.',
+      'Default behaviour: always re-fetch from Polymarket (fresh=true). ' +
+      'Pass ?fresh=false to use cached data instead (faster).',
   })
-  async generateSmartMoneyPrediction(@Param('fixtureId') fixtureId: string) {
+  @ApiQuery({
+    name: 'fresh',
+    required: false,
+    type: Boolean,
+    description:
+      'If true (default on POST), bypass all in-memory caches and re-fetch from Polymarket. ' +
+      'If false, use cached data where available (faster).',
+  })
+  async generateSmartMoneyPrediction(
+    @Param('fixtureId') fixtureId: string,
+    @Query('fresh') fresh?: string,
+  ) {
     const id = Number(fixtureId);
     if (!Number.isFinite(id) || id <= 0) {
       throw new BadRequestException('fixtureId must be a positive integer');
     }
-    return this.polymarketService.predictFromSmartMoney(id, { persist: true });
+    return this.polymarketService.predictFromSmartMoney(id, {
+      persist: true,
+      fresh: fresh === 'true' ? true : fresh === 'false' ? false : undefined,
+    });
   }
 
   @Get('config')
