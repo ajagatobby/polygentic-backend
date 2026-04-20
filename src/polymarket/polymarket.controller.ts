@@ -48,27 +48,143 @@ export class PolymarketController {
       '1000 trades → net position per wallet) and a top-100 leaderboard ' +
       'cross-check. Returns all holders per outcome with no cap. ' +
       'Pass ?enrich=true to augment each wallet with lifetime PnL, ROI, ' +
-      'streak, and last-10 record — slower, adds one /positions + ' +
-      '/closed-positions pair per wallet (cached 30min).',
+      'streak, and last-10/20 record. Any filter that needs lifetime stats ' +
+      '(minPnl, minRoi, minLast10Wins, minLast20Wins, minStreak, ' +
+      'minResolved) auto-enables enrichment.',
+  })
+  @ApiQuery({ name: 'enrich', required: false, type: Boolean })
+  @ApiQuery({
+    name: 'outcome',
+    required: false,
+    type: Number,
+    description: '0 or 1 — scope to a single outcome (Yes/No)',
   })
   @ApiQuery({
-    name: 'enrich',
+    name: 'minAmount',
     required: false,
-    type: Boolean,
+    type: Number,
+    description: 'Minimum position size (USD / shares).',
+  })
+  @ApiQuery({ name: 'maxAmount', required: false, type: Number })
+  @ApiQuery({
+    name: 'minPnl',
+    required: false,
+    type: Number,
+    description: 'Minimum lifetime realized PnL (USD).',
+  })
+  @ApiQuery({ name: 'maxPnl', required: false, type: Number })
+  @ApiQuery({
+    name: 'minRoi',
+    required: false,
+    type: Number,
+    description: 'Minimum lifetime ROI as a fraction (0.10 = 10%).',
+  })
+  @ApiQuery({ name: 'maxRoi', required: false, type: Number })
+  @ApiQuery({
+    name: 'minLast10Wins',
+    required: false,
+    type: Number,
+    description: 'Minimum wins out of last 10 resolved positions (0-10).',
+  })
+  @ApiQuery({
+    name: 'minLast20Wins',
+    required: false,
+    type: Number,
+    description: 'Minimum wins out of last 20 resolved positions (0-20).',
+  })
+  @ApiQuery({
+    name: 'minStreak',
+    required: false,
+    type: Number,
+    description: 'Minimum current consecutive-wins streak.',
+  })
+  @ApiQuery({
+    name: 'minResolved',
+    required: false,
+    type: Number,
     description:
-      'Include lifetime PnL, ROI, streak, last10 per wallet. Default false.',
+      'Minimum resolved bets (skill-sample floor). Drops unknown / new wallets.',
+  })
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    description:
+      'amount (default) | pnl | roi | last10Wins | last20Wins | streak',
+  })
+  @ApiQuery({
+    name: 'sortOrder',
+    required: false,
+    description: 'asc | desc (default)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max holders per outcome after filtering.',
   })
   async getAllHolders(
     @Param('conditionId') conditionId: string,
     @Query('enrich') enrich?: string,
+    @Query('outcome') outcome?: string,
+    @Query('minAmount') minAmount?: string,
+    @Query('maxAmount') maxAmount?: string,
+    @Query('minPnl') minPnl?: string,
+    @Query('maxPnl') maxPnl?: string,
+    @Query('minRoi') minRoi?: string,
+    @Query('maxRoi') maxRoi?: string,
+    @Query('minLast10Wins') minLast10Wins?: string,
+    @Query('minLast20Wins') minLast20Wins?: string,
+    @Query('minStreak') minStreak?: string,
+    @Query('minResolved') minResolved?: string,
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: string,
+    @Query('limit') limit?: string,
   ) {
     if (!conditionId || !conditionId.startsWith('0x')) {
       throw new BadRequestException(
         'conditionId must be a 0x-prefixed Polymarket condition ID',
       );
     }
+    const num = (v: string | undefined) => {
+      if (v == null || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const outcomeNum = num(outcome);
+    const outcomeFiltered =
+      outcomeNum === 0 || outcomeNum === 1
+        ? (outcomeNum as 0 | 1)
+        : undefined;
+    const allowedSorts = [
+      'amount',
+      'pnl',
+      'roi',
+      'last10Wins',
+      'last20Wins',
+      'streak',
+    ] as const;
+    const sortByNorm = allowedSorts.includes(sortBy as any)
+      ? (sortBy as (typeof allowedSorts)[number])
+      : undefined;
+    const sortOrderNorm =
+      sortOrder === 'asc' || sortOrder === 'desc' ? sortOrder : undefined;
+
     return this.polymarketService.getAllMarketHolders(conditionId, {
       enrich: enrich === 'true',
+      outcome: outcomeFiltered,
+      minAmount: num(minAmount),
+      maxAmount: num(maxAmount),
+      minPnl: num(minPnl),
+      maxPnl: num(maxPnl),
+      minRoi: num(minRoi),
+      maxRoi: num(maxRoi),
+      minLast10Wins: num(minLast10Wins),
+      minLast20Wins: num(minLast20Wins),
+      minStreak: num(minStreak),
+      minResolved: num(minResolved),
+      sortBy: sortByNorm,
+      sortOrder: sortOrderNorm,
+      limit: num(limit),
     });
   }
 

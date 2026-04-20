@@ -616,20 +616,45 @@ export class PolymarketService implements OnModuleInit {
    */
   /**
    * Return every top holder for a Polymarket market, unioning all
-   * available discovery sources (no truncation).
+   * available discovery sources (no truncation by default).
    *
    *   - /holders top-20 per outcome
    *   - /trades aggregation (up to 1000 trades → net position per wallet)
    *   - Top-100 leaderboard wallets × /positions cross-check
    *
-   * Actual count per outcome depends on market activity; a busy market
-   * easily exceeds 100, a cold market may yield <40. Pass `enrich=true`
-   * to augment each wallet with lifetime PnL / ROI / streak — adds one
-   * cached pair of /positions + /closed-positions calls per wallet.
+   * Supports a comprehensive filter set so callers can scope the pool
+   * before it ships over the wire. Any filter that touches lifetime
+   * stats (pnl, roi, last10, last20, streak, resolved) auto-enables
+   * enrichment so the values exist to filter against.
    */
   async getAllMarketHolders(
     conditionId: string,
-    opts: { enrich?: boolean } = {},
+    opts: {
+      enrich?: boolean;
+      // Bet-level filters (no enrichment needed)
+      outcome?: 0 | 1;
+      minAmount?: number;
+      maxAmount?: number;
+      // Lifetime-stat filters (auto-enable enrichment)
+      minPnl?: number;
+      maxPnl?: number;
+      minRoi?: number;
+      maxRoi?: number;
+      minLast10Wins?: number;
+      minLast20Wins?: number;
+      minStreak?: number;
+      minResolved?: number;
+      // Output controls
+      sortBy?:
+        | 'amount'
+        | 'pnl'
+        | 'roi'
+        | 'last10Wins'
+        | 'last20Wins'
+        | 'streak';
+      sortOrder?: 'asc' | 'desc';
+      limit?: number;
+    } = {},
   ): Promise<{
     conditionId: string;
     totalHolders: number;
@@ -667,6 +692,21 @@ export class PolymarketService implements OnModuleInit {
       },
     );
 
+    // Auto-enable enrichment when a filter or sort needs lifetime stats.
+    const needsStatsForFilter =
+      opts.minPnl != null ||
+      opts.maxPnl != null ||
+      opts.minRoi != null ||
+      opts.maxRoi != null ||
+      opts.minLast10Wins != null ||
+      opts.minLast20Wins != null ||
+      opts.minStreak != null ||
+      opts.minResolved != null;
+    const needsStatsForSort =
+      opts.sortBy != null && opts.sortBy !== 'amount';
+    const enrichEffective =
+      opts.enrich === true || needsStatsForFilter || needsStatsForSort;
+
     // Optional enrichment: lifetime stats per wallet.
     let walletStats = new Map<
       string,
@@ -681,7 +721,7 @@ export class PolymarketService implements OnModuleInit {
         resolvedCount: number;
       }
     >();
-    if (opts.enrich) {
+    if (enrichEffective) {
       const wallets = new Set<string>();
       for (const o of expanded) {
         for (const h of o.holders) wallets.add(h.proxyWallet);
@@ -724,47 +764,111 @@ export class PolymarketService implements OnModuleInit {
       }
     }
 
-    const outcomes = expanded.map((o) => {
-      const outcomeIndex = o.holders[0]?.outcomeIndex ?? 0;
-      const outcomeName =
-        ((o.holders[0]?.name as any)?.outcome as string | undefined) ??
-        (outcomeIndex === 0 ? 'Yes' : 'No');
-      const totalAmount = o.holders.reduce(
-        (sum, h) => sum + Number(h.amount ?? 0),
-        0,
-      );
-      const holders = o.holders.map((h) => {
-        const enr = walletStats.get(h.proxyWallet);
+    // Pre-compute sort comparator + limit once — applied per outcome.
+    const sortBy = opts.sortBy ?? 'amount';
+    const dir = opts.sortOrder === 'asc' ? 1 : -1;
+    const cmp = (a: any, b: any) => {
+      const av = Number(a[sortBy] ?? 0);
+      const bv = Number(b[sortBy] ?? 0);
+      if (av === bv) return 0;
+      return av > bv ? dir : -dir;
+    };
+    const perOutcomeLimit =
+      opts.limit != null && opts.limit > 0 ? opts.limit : null;
+
+    const outcomes = expanded
+      // Outcome-level filter — drops the opposite side entirely when caller
+      // specified one side.
+      .filter((o) => {
+        if (opts.outcome == null) return true;
+        const idx = o.holders[0]?.outcomeIndex ?? -1;
+        return idx === opts.outcome;
+      })
+      .map((o) => {
+        const outcomeIndex = o.holders[0]?.outcomeIndex ?? 0;
+        const outcomeName =
+          ((o.holders[0]?.name as any)?.outcome as string | undefined) ??
+          (outcomeIndex === 0 ? 'Yes' : 'No');
+        const totalAmount = o.holders.reduce(
+          (sum, h) => sum + Number(h.amount ?? 0),
+          0,
+        );
+
+        // Map raw holders → response shape with optional enrichment merged.
+        const mapped = o.holders.map((h) => {
+          const enr = walletStats.get(h.proxyWallet);
+          return {
+            wallet: h.proxyWallet,
+            name: h.name ?? '',
+            pseudonym: h.pseudonym ?? '',
+            amount: Number(h.amount ?? 0),
+            outcomeIndex: h.outcomeIndex,
+            outcomeName,
+            ...(enr
+              ? {
+                  lifetimePnl: enr.lifetimePnl,
+                  lifetimeRoi: enr.lifetimeRoi,
+                  last10Wins: enr.last10Wins,
+                  last10WinRate: enr.last10WinRate,
+                  last20Wins: enr.last20Wins,
+                  last20WinRate: enr.last20WinRate,
+                  currentWinStreak: enr.currentWinStreak,
+                  resolvedCount: enr.resolvedCount,
+                }
+              : {}),
+          };
+        });
+
+        // Apply filters. Lifetime-stat filters drop wallets that have no
+        // enrichment (can't verify they pass the gate).
+        const filtered = mapped.filter((h) => {
+          if (opts.minAmount != null && h.amount < opts.minAmount) return false;
+          if (opts.maxAmount != null && h.amount > opts.maxAmount) return false;
+          if (opts.minPnl != null && (h.lifetimePnl ?? -Infinity) < opts.minPnl)
+            return false;
+          if (opts.maxPnl != null && (h.lifetimePnl ?? Infinity) > opts.maxPnl)
+            return false;
+          if (opts.minRoi != null && (h.lifetimeRoi ?? -Infinity) < opts.minRoi)
+            return false;
+          if (opts.maxRoi != null && (h.lifetimeRoi ?? Infinity) > opts.maxRoi)
+            return false;
+          if (
+            opts.minLast10Wins != null &&
+            ((h.last10Wins ?? -1) < opts.minLast10Wins)
+          )
+            return false;
+          if (
+            opts.minLast20Wins != null &&
+            ((h.last20Wins ?? -1) < opts.minLast20Wins)
+          )
+            return false;
+          if (
+            opts.minStreak != null &&
+            (h.currentWinStreak ?? -1) < opts.minStreak
+          )
+            return false;
+          if (
+            opts.minResolved != null &&
+            (h.resolvedCount ?? -1) < opts.minResolved
+          )
+            return false;
+          return true;
+        });
+
+        filtered.sort(cmp);
+        const limited = perOutcomeLimit
+          ? filtered.slice(0, perOutcomeLimit)
+          : filtered;
+
         return {
-          wallet: h.proxyWallet,
-          name: h.name ?? '',
-          pseudonym: h.pseudonym ?? '',
-          amount: Number(h.amount ?? 0),
-          outcomeIndex: h.outcomeIndex,
+          outcomeIndex,
           outcomeName,
-          ...(enr
-            ? {
-                lifetimePnl: enr.lifetimePnl,
-                lifetimeRoi: enr.lifetimeRoi,
-                last10Wins: enr.last10Wins,
-                last10WinRate: enr.last10WinRate,
-                last20Wins: enr.last20Wins,
-                last20WinRate: enr.last20WinRate,
-                currentWinStreak: enr.currentWinStreak,
-                resolvedCount: enr.resolvedCount,
-              }
-            : {}),
+          token: o.token,
+          holderCount: limited.length,
+          totalAmount: Math.round(totalAmount),
+          holders: limited,
         };
       });
-      return {
-        outcomeIndex,
-        outcomeName,
-        token: o.token,
-        holderCount: holders.length,
-        totalAmount: Math.round(totalAmount),
-        holders,
-      };
-    });
 
     const totalHolders = outcomes.reduce((s, o) => s + o.holderCount, 0);
 
