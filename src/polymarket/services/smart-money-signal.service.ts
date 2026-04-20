@@ -326,35 +326,39 @@ export class SmartMoneySignalService {
   /**
    * Per-sharp vote weight for leanScore aggregation.
    *
-   * Recent form is the single most predictive signal of active skill in
-   * prediction markets — more than lifetime PnL or ROI. A wallet that
-   * went 8-2 in its last 10 and 16-4 in its last 20 is almost certainly
-   * reading the current market correctly; a 1/10 whale is likely either
-   * slumping, on tilt, or over-extended in markets they don't
-   * specialise in. So we weight aggressively on recent form.
+   * Two components, added together:
    *
-   * Formula (range 0.15..2.5):
+   *   1. Form weight (0.15..2.5) — from last10 + last20 win rates.
+   *      last10 gets 2x the weight of last20 (recency dominates).
+   *      A 0/10 + 0/20 wallet lands at 0.15 (near-zero vote); a
+   *      10/10 + 20/20 wallet lands at 2.50.
    *
-   *   last10Score  = last10WinRate (null → 0.5 neutral)     // 0..1
-   *   last20Score  = last20WinRate (null → 0.5 neutral)     // 0..1
-   *   formScore    = (2·last10 + last20) / 3                // 0..1, last10 weighted 2x
-   *   streakBonus  = min(1, currentWinStreak / 10)          // 0..1
-   *   combined     = (5·formScore + streakBonus) / 6        // 0..1, form dominates
-   *   weight       = 0.15 + 2.35·combined                   // 0.15..2.5
+   *   2. Streak bonus (0..+2.5) — additive. EACH consecutive win from
+   *      the most recent resolution adds +0.25 weight, capped at +2.5
+   *      (streak ≥ 10). A wallet on a 5-game win streak picks up
+   *      +1.25 extra weight; a 10+ streak adds +2.5 on top of form.
    *
-   * Key ratios:
-   *   10/10 + 20/20 + streak 10   → weight ~2.50 (elite hot hand)
-   *   9/10  + 19/20 + streak 0    → weight ~2.15
-   *   8/10  + 16/20 + streak 0    → weight ~1.92
-   *   5/10  + 10/20 + streak 0    → weight ~1.32 (neutral)
-   *   2/10  + 3/20  + streak 0    → weight ~0.60 (cold)
-   *   1/10  + 8/20  + streak 0    → weight ~0.65
-   *   0/10  + 0/20  + streak 0    → weight ~0.15 (ice cold, near-zero vote)
+   * Total range: 0.15..5.0. A cold wallet on a losing run can't
+   * outvote a single hot streaking wallet.
    *
-   * So a hot wallet (9/10) counts roughly 3.3x a cold one (2/10) and
-   * ~14x an ice-cold one (0/10). The previous formula only had a ~2.5x
-   * spread, which let $500k of cold-whale dollars outvote $40k of
-   * hot-hand dollars.
+   *   10/10 + 20/20 + streak 10   →  2.50 + 2.50 = 5.00 (maximum)
+   *   9/10  + 19/20 + streak 5    →  2.15 + 1.25 = 3.40
+   *   9/10  + 19/20 + streak 0    →  2.15 + 0    = 2.15
+   *   8/10  + 16/20 + streak 0    →  1.92
+   *   5/10  + 10/20 + streak 0    →  1.32 (neutral form)
+   *   2/10  + 3/20  + streak 0    →  0.60 (cold)
+   *   1/10  + 8/20  + streak 0    →  0.65
+   *   0/10  + 0/20  + streak 0    →  0.15 (ice, near-zero)
+   *
+   * Design choices:
+   *   - Form and streak are additive, not blended. Two separate
+   *     credentials, not one averaged signal.
+   *   - Streak is capped so a fluke-hot wallet (say, 20-streak by
+   *     sheer luck on easy markets) doesn't dominate. Cap at +2.5
+   *     matches the max form weight.
+   *   - Each streak win is worth +0.25. At the qualification
+   *     threshold (streak ≥ 7) that's +1.75 — genuinely meaningful
+   *     but not runaway.
    */
   private sharpVoteWeight(s: {
     last10WinRate: number;
@@ -366,9 +370,9 @@ export class SmartMoneySignalService {
     const last10 = s.last10Wins != null ? s.last10WinRate : 0.5;
     const last20 = s.last20Wins != null ? s.last20WinRate : 0.5;
     const formScore = (2 * last10 + last20) / 3;
-    const streakBonus = Math.min(1, s.currentWinStreak / 10);
-    const combined = (5 * formScore + streakBonus) / 6;
-    return 0.15 + 2.35 * combined;
+    const formWeight = 0.15 + 2.35 * formScore;
+    const streakBonus = Math.min(2.5, (s.currentWinStreak ?? 0) * 0.25);
+    return formWeight + streakBonus;
   }
 
   /**
