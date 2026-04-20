@@ -819,6 +819,39 @@ export class PolymarketService implements OnModuleInit {
    *   - No qualifying sharps backed the market (leanScore null)
    */
   /**
+   * Fetch the persisted smart-money-only prediction for a fixture, or
+   * null if none exists. Separate table from the main `predictions`, so
+   * LLM predictions and smart-money predictions never mix.
+   */
+  async getSmartMoneyPredictionForFixture(
+    fixtureId: number,
+  ): Promise<any | null> {
+    const [row] = await this.db
+      .select()
+      .from(schema.smartMoneyPredictions)
+      .where(eq(schema.smartMoneyPredictions.fixtureId, fixtureId))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Bulk fetch — used by list endpoints that need to attach the
+   * smart-money prediction to each fixture without N+1 lookups.
+   */
+  async getSmartMoneyPredictionsForFixtures(
+    fixtureIds: number[],
+  ): Promise<Map<number, any>> {
+    if (fixtureIds.length === 0) return new Map();
+    const rows = await this.db
+      .select()
+      .from(schema.smartMoneyPredictions)
+      .where(inArray(schema.smartMoneyPredictions.fixtureId, fixtureIds));
+    const map = new Map<number, any>();
+    for (const r of rows) map.set(r.fixtureId, r);
+    return map;
+  }
+
+  /**
    * Return every top holder for a Polymarket market, unioning all
    * available discovery sources (no truncation by default).
    *
@@ -1550,9 +1583,11 @@ export class PolymarketService implements OnModuleInit {
           }
         : null;
 
-    // Optional persistence — upserts into the predictions table with
-    // predictionType = 'smart_money'. Existing smart_money prediction for
-    // this fixture is overwritten (one-per-fixture by unique constraint).
+    // Optional persistence — upserts into the smart_money_predictions
+    // table (one row per fixture). Kept separate from the main
+    // `predictions` table so LLM predictions and smart-money-only
+    // predictions don't mix in aggregate queries or fixture response
+    // payloads.
     let storedId: number | undefined;
     let storedCreatedAt: Date | undefined;
     if (options.persist) {
@@ -1562,53 +1597,35 @@ export class PolymarketService implements OnModuleInit {
           : predictedResult === 'away'
             ? 'away_win'
             : 'draw';
-      // For the market-fallback path we have no sharp-money signal, so
-      // store a small stub capturing the market price that drove the
-      // prediction — keeps downstream consumers uniform and preserves
-      // audit trail of "this prediction came from market, not sharps".
       const storedSignal =
-        signal.leanScore != null
-          ? { ...signal, marketTeamId }
-          : {
-              signalKind: 'market-fallback',
-              marketTeamId,
-              ...marketSignal,
-            };
+        signal.leanScore != null ? { ...signal, marketTeamId } : null;
+      const modelVersion =
+        source === 'market' ? 'smart-money-v1-market' : 'smart-money-v1';
+
+      const values = {
+        fixtureId,
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        homeWinProb: String(predictionPayload.homeWinProb),
+        drawProb: String(predictionPayload.drawProb),
+        awayWinProb: String(predictionPayload.awayWinProb),
+        confidence: predictionPayload.confidence,
+        predictedResult: predictedResultDb,
+        source,
+        thresholdMode: source === 'direct' ? thresholdMode : null,
+        modelVersion,
+        smartMoneySignal: storedSignal as any,
+        marketSignal: (marketSignal ?? null) as any,
+        predictionStatus: 'pending' as const,
+        updatedAt: new Date(),
+      };
 
       const [row] = await this.db
-        .insert(schema.predictions)
-        .values({
-          fixtureId,
-          homeTeamId: fixture.homeTeamId,
-          awayTeamId: fixture.awayTeamId,
-          homeWinProb: String(predictionPayload.homeWinProb),
-          drawProb: String(predictionPayload.drawProb),
-          awayWinProb: String(predictionPayload.awayWinProb),
-          confidence: predictionPayload.confidence,
-          predictionType: 'smart_money',
-          predictedResult: predictedResultDb,
-          smartMoneySignal: storedSignal as any,
-          modelVersion:
-            source === 'market' ? 'smart-money-v1-market' : 'smart-money-v1',
-          predictionStatus: 'pending',
-          updatedAt: new Date(),
-        })
+        .insert(schema.smartMoneyPredictions)
+        .values(values)
         .onConflictDoUpdate({
-          target: [
-            schema.predictions.fixtureId,
-            schema.predictions.predictionType,
-          ],
-          set: {
-            homeWinProb: String(predictionPayload.homeWinProb),
-            drawProb: String(predictionPayload.drawProb),
-            awayWinProb: String(predictionPayload.awayWinProb),
-            confidence: predictionPayload.confidence,
-            predictedResult: predictedResultDb,
-            smartMoneySignal: storedSignal as any,
-            modelVersion:
-              source === 'market' ? 'smart-money-v1-market' : 'smart-money-v1',
-            updatedAt: new Date(),
-          },
+          target: schema.smartMoneyPredictions.fixtureId,
+          set: values,
         })
         .returning();
       storedId = row.id;

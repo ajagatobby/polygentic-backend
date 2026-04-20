@@ -1639,6 +1639,7 @@ export class FootballService {
     // market links for all fixtures
     const [
       predictions,
+      smartMoneyRows,
       teamRows,
       allLineups,
       allInjuries,
@@ -1654,6 +1655,15 @@ export class FootballService {
           )})`,
         )
         .orderBy(desc(schema.predictions.createdAt)),
+      this.db
+        .select()
+        .from(schema.smartMoneyPredictions)
+        .where(
+          sql`${schema.smartMoneyPredictions.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
       teamIds.size > 0
         ? this.db
             .select({
@@ -1749,6 +1759,10 @@ export class FootballService {
       existing.push(p);
       predictionsByFixture.set(p.fixtureId, existing);
     }
+
+    // Build smart-money prediction lookup (1-per-fixture by unique index).
+    const smartMoneyByFixture = new Map<number, any>();
+    for (const r of smartMoneyRows) smartMoneyByFixture.set(r.fixtureId, r);
 
     // Preload recent game history for all teams in the fixture set
     const teamHistoryMap = new Map<number, any[]>();
@@ -1887,6 +1901,15 @@ export class FootballService {
           confidence: p.confidence,
           createdAt: p.createdAt,
         })),
+        smartMoneyPrediction: this.formatSmartMoneyPrediction(
+          smartMoneyByFixture.get(fixture.id) ?? null,
+          {
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+            homeName: homeTeam?.name ?? null,
+            awayName: awayTeam?.name ?? null,
+          },
+        ),
         polymarket: polymarketByFixture.get(fixture.id) ?? null,
       };
     });
@@ -1953,6 +1976,7 @@ export class FootballService {
 
     const [
       predictions,
+      smartMoneyRow,
       teamRows,
       lineups,
       injuries,
@@ -1964,6 +1988,12 @@ export class FootballService {
         .from(schema.predictions)
         .where(eq(schema.predictions.fixtureId, fixtureId))
         .orderBy(desc(schema.predictions.createdAt)),
+      this.db
+        .select()
+        .from(schema.smartMoneyPredictions)
+        .where(eq(schema.smartMoneyPredictions.fixtureId, fixtureId))
+        .limit(1)
+        .then((rows: any[]) => rows[0] ?? null),
       teamIds.length > 0
         ? this.db
             .select({
@@ -2146,6 +2176,12 @@ export class FootballService {
         confidence: p.confidence,
         createdAt: p.createdAt,
       })),
+      smartMoneyPrediction: this.formatSmartMoneyPrediction(smartMoneyRow, {
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        homeName: homeTeam?.name ?? null,
+        awayName: awayTeam?.name ?? null,
+      }),
     };
   }
 
@@ -2778,6 +2814,58 @@ export class FootballService {
         },
       };
     });
+  }
+
+  /**
+   * Transform a stored smart_money_predictions row into the fixture
+   * response shape. Carries the prediction values, lifecycle status,
+   * and a cleaned smart-money signal view. Returns null when no
+   * smart-money prediction exists for the fixture.
+   */
+  private formatSmartMoneyPrediction(
+    row: any,
+    ctx: {
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+    },
+  ): any {
+    if (!row) return null;
+    const homeWinProb = Number(row.homeWinProb ?? 0);
+    const drawProb = Number(row.drawProb ?? 0);
+    const awayWinProb = Number(row.awayWinProb ?? 0);
+    return {
+      id: row.id,
+      homeWinProb,
+      drawProb,
+      awayWinProb,
+      predictedResult: row.predictedResult,
+      confidence: row.confidence,
+      source: row.source,
+      thresholdMode: row.thresholdMode,
+      modelVersion: row.modelVersion,
+      predictionStatus: row.predictionStatus,
+      actualResult: row.actualResult,
+      wasCorrect: row.wasCorrect,
+      probabilityAccuracy:
+        row.probabilityAccuracy != null
+          ? Number(row.probabilityAccuracy)
+          : null,
+      resolvedAt: row.resolvedAt,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      smartMoneySignal: this.formatSmartMoneySignal(row.smartMoneySignal, {
+        homeTeamId: ctx.homeTeamId,
+        awayTeamId: ctx.awayTeamId,
+        homeName: ctx.homeName,
+        awayName: ctx.awayName,
+        homeWinProb,
+        drawProb,
+        awayWinProb,
+      }),
+      marketSignal: row.marketSignal ?? null,
+    };
   }
 
   /**

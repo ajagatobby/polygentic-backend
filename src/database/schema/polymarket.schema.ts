@@ -341,6 +341,60 @@ export const smartMoneyConfig = pgTable(
   (table) => [uniqueIndex('uq_smart_money_config_profile').on(table.profile)],
 );
 
+// ─── smart_money_predictions ───────────────────────────────────────────
+// Standalone predictions derived only from the Polymarket smart-money
+// signal (no LLM, no Poisson). Kept in a separate table from the main
+// `predictions` so the two sources don't mix in aggregate queries /
+// fixture response payloads. One row per fixture.
+
+export const smartMoneyPredictions = pgTable(
+  'smart_money_predictions',
+  {
+    id: serial('id').primaryKey(),
+    fixtureId: integer('fixture_id')
+      .notNull()
+      .references(() => fixtures.id),
+    homeTeamId: integer('home_team_id').references(() => teams.id),
+    awayTeamId: integer('away_team_id').references(() => teams.id),
+
+    homeWinProb: numeric('home_win_prob', { precision: 5, scale: 4 }).notNull(),
+    drawProb: numeric('draw_prob', { precision: 5, scale: 4 }).notNull(),
+    awayWinProb: numeric('away_win_prob', { precision: 5, scale: 4 }).notNull(),
+
+    predictedResult: varchar('predicted_result', { length: 20 }),
+    confidence: integer('confidence'),
+
+    source: varchar('source', { length: 20 }),
+    thresholdMode: varchar('threshold_mode', { length: 20 }),
+    modelVersion: varchar('model_version', { length: 50 }),
+
+    smartMoneySignal: jsonb('smart_money_signal'),
+    marketSignal: jsonb('market_signal'),
+
+    predictionStatus: varchar('prediction_status', { length: 20 })
+      .default('pending')
+      .notNull(),
+    actualHomeGoals: integer('actual_home_goals'),
+    actualAwayGoals: integer('actual_away_goals'),
+    actualResult: varchar('actual_result', { length: 20 }),
+    wasCorrect: boolean('was_correct'),
+    probabilityAccuracy: numeric('probability_accuracy', {
+      precision: 8,
+      scale: 6,
+    }),
+    resolvedAt: timestamp('resolved_at'),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('uq_smart_money_predictions_fixture').on(table.fixtureId),
+    index('idx_smart_money_predictions_created').on(table.createdAt),
+    index('idx_smart_money_predictions_status').on(table.predictionStatus),
+    index('idx_smart_money_predictions_confidence').on(table.confidence),
+  ],
+);
+
 // ─── polymarket_holder_snapshots ───────────────────────────────────────
 // Daily snapshot of /holders for tracked Polymarket markets. Required for
 // walk-forward backtesting of the smart-money signal — without these,
