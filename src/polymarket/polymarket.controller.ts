@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
   Param,
   Query,
   Body,
@@ -18,6 +19,7 @@ import {
 } from '@nestjs/swagger';
 import { Roles } from '../auth/roles.decorator';
 import { PolymarketService } from './polymarket.service';
+import { CopyTraderService } from './services/copy-trader.service';
 import {
   polymarketScanTask,
   polymarketTradeTask,
@@ -29,7 +31,10 @@ import {
 export class PolymarketController {
   private readonly logger = new Logger(PolymarketController.name);
 
-  constructor(private readonly polymarketService: PolymarketService) {}
+  constructor(
+    private readonly polymarketService: PolymarketService,
+    private readonly copyTraderService: CopyTraderService,
+  ) {}
 
   @Get('performance')
   @ApiOperation({
@@ -329,6 +334,173 @@ export class PolymarketController {
       limit: num(limit),
       offset: num(offset),
     });
+  }
+
+  // ─── Copy traders ──────────────────────────────────────────────────
+
+  @Get('copy-traders')
+  @ApiOperation({
+    summary: 'List followed Polymarket wallets with per-trader copy config',
+  })
+  async listCopyTraders(@Query('activeOnly') activeOnly?: string) {
+    return this.copyTraderService.list({ activeOnly: activeOnly !== 'false' });
+  }
+
+  @Roles('admin')
+  @Post('copy-traders')
+  @ApiOperation({
+    summary: '[Admin] Follow a Polymarket wallet (detection only by default)',
+    description:
+      'Adds the wallet to the copy-trader follow list. copy_enabled defaults ' +
+      'to false — only detection + logging, no CLOB orders. Flip copy_enabled=true ' +
+      'once you trust the detection. Sizing defaults to 0.5% of followed size, ' +
+      'capped at $50 per trade.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['proxyWallet'],
+      properties: {
+        proxyWallet: { type: 'string', example: '0x...' },
+        nickname: { type: 'string' },
+        copyEnabled: { type: 'boolean', default: false },
+        sizingMode: {
+          type: 'string',
+          enum: ['fixed', 'fraction', 'kelly'],
+          default: 'fraction',
+        },
+        sizingValue: {
+          type: 'number',
+          description:
+            'fixed: USD per trade | fraction: X of followed size (0.005 = 0.5%) | kelly: edge-based',
+          default: 0.005,
+        },
+        maxPositionUsd: { type: 'number', default: 50 },
+        minLast10Wins: {
+          type: 'integer',
+          description: 'Skip copy if wallet has <N wins in last 10',
+        },
+        minLifetimePnl: { type: 'number' },
+        minLifetimeRoi: { type: 'number' },
+        notes: { type: 'string' },
+      },
+    },
+  })
+  async followCopyTrader(
+    @Body()
+    body: {
+      proxyWallet: string;
+      nickname?: string;
+      copyEnabled?: boolean;
+      sizingMode?: 'fixed' | 'fraction' | 'kelly';
+      sizingValue?: number;
+      maxPositionUsd?: number;
+      minLast10Wins?: number;
+      minLifetimePnl?: number;
+      minLifetimeRoi?: number;
+      notes?: string;
+    },
+  ) {
+    if (!body?.proxyWallet || !body.proxyWallet.startsWith('0x')) {
+      throw new BadRequestException(
+        'proxyWallet must be a 0x-prefixed address',
+      );
+    }
+    return this.copyTraderService.follow(body);
+  }
+
+  @Roles('admin')
+  @Patch('copy-traders/:wallet')
+  @ApiOperation({
+    summary: '[Admin] Update per-trader copy config',
+    description:
+      'Partial update — any field can be patched including toggling ' +
+      'copy_enabled on/off to pause execution without removing the wallet.',
+  })
+  async updateCopyTrader(
+    @Param('wallet') wallet: string,
+    @Body()
+    body: Partial<{
+      nickname: string | null;
+      copyEnabled: boolean;
+      sizingMode: 'fixed' | 'fraction' | 'kelly';
+      sizingValue: number;
+      maxPositionUsd: number;
+      minLast10Wins: number | null;
+      minLifetimePnl: number | null;
+      minLifetimeRoi: number | null;
+      notes: string | null;
+      active: boolean;
+    }>,
+  ) {
+    const row = await this.copyTraderService.update(wallet, body);
+    if (!row) {
+      throw new BadRequestException(`Wallet ${wallet} is not followed`);
+    }
+    return row;
+  }
+
+  @Roles('admin')
+  @Delete('copy-traders/:wallet')
+  @ApiOperation({
+    summary: '[Admin] Unfollow a wallet (sets active=false, keeps history)',
+  })
+  async unfollowCopyTrader(@Param('wallet') wallet: string) {
+    const row = await this.copyTraderService.unfollow(wallet);
+    if (!row) {
+      throw new BadRequestException(`Wallet ${wallet} is not followed`);
+    }
+    return { message: `Unfollowed ${wallet}`, wallet: row };
+  }
+
+  @Get('copy-traders/trades')
+  @ApiOperation({
+    summary: 'Get detected copy-trades with execution status',
+    description:
+      'Every position we detected on any followed wallet, whether we ' +
+      'executed it, paper-logged it, skipped, or failed.',
+  })
+  @ApiQuery({
+    name: 'since',
+    required: false,
+    type: String,
+    description: 'ISO 8601',
+  })
+  @ApiQuery({ name: 'wallet', required: false, type: String })
+  @ApiQuery({
+    name: 'executionStatus',
+    required: false,
+    description: 'executed | paper | skipped | failed',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Default 100, max 500',
+  })
+  async getCopyTraderTrades(
+    @Query('since') since?: string,
+    @Query('wallet') wallet?: string,
+    @Query('executionStatus') executionStatus?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.copyTraderService.getDetectedTrades({
+      since: since ? new Date(since) : undefined,
+      wallet: wallet || undefined,
+      executionStatus: executionStatus || undefined,
+      limit: limit ? Number(limit) : undefined,
+    });
+  }
+
+  @Roles('admin')
+  @Post('copy-traders/sync')
+  @ApiOperation({
+    summary:
+      '[Admin] Manually trigger a copy-trader sync (polls every followed wallet now)',
+  })
+  async syncCopyTraders() {
+    this.logger.log('Triggering copy-trader sync via API');
+    return this.copyTraderService.sync();
   }
 
   @Get('smart-money/config')

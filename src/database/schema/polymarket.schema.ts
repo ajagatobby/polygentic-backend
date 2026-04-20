@@ -395,6 +395,135 @@ export const smartMoneyPredictions = pgTable(
   ],
 );
 
+// ─── copied_traders ────────────────────────────────────────────────────
+// Copy-trader system: follow Polymarket wallets and (optionally)
+// auto-mirror their trades onto our CLOB account. copy_enabled is
+// default-false so adding a wallet is a safe action; admin toggles
+// on once they trust the detection.
+
+export const copiedTraders = pgTable(
+  'copied_traders',
+  {
+    id: serial('id').primaryKey(),
+    proxyWallet: varchar('proxy_wallet', { length: 255 }).notNull(),
+    nickname: varchar('nickname', { length: 255 }),
+    active: boolean('active').default(true).notNull(),
+
+    copyEnabled: boolean('copy_enabled').default(false).notNull(),
+    sizingMode: varchar('sizing_mode', { length: 20 })
+      .default('fraction')
+      .notNull(),
+    sizingValue: numeric('sizing_value', { precision: 10, scale: 6 })
+      .default('0.005')
+      .notNull(),
+    maxPositionUsd: numeric('max_position_usd', { precision: 14, scale: 2 })
+      .default('50')
+      .notNull(),
+
+    minLast10Wins: integer('min_last_10_wins'),
+    minLifetimePnl: numeric('min_lifetime_pnl', { precision: 14, scale: 2 }),
+    minLifetimeRoi: numeric('min_lifetime_roi', { precision: 5, scale: 4 }),
+
+    notes: text('notes'),
+    addedAt: timestamp('added_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('uq_copied_traders_wallet').on(table.proxyWallet),
+    index('idx_copied_traders_active').on(table.active),
+  ],
+);
+
+// ─── copied_trader_positions ───────────────────────────────────────────
+// Snapshot of current positions per followed wallet, updated every
+// sync. Diffing against the previous snapshot is how we detect new
+// trades (trade_type='new') vs position increases ('increased').
+
+export const copiedTraderPositions = pgTable(
+  'copied_trader_positions',
+  {
+    id: serial('id').primaryKey(),
+    proxyWallet: varchar('proxy_wallet', { length: 255 }).notNull(),
+    conditionId: varchar('condition_id', { length: 255 }).notNull(),
+    outcomeIndex: integer('outcome_index').notNull(),
+    asset: varchar('asset', { length: 255 }),
+    marketQuestion: text('market_question'),
+    slug: varchar('slug', { length: 500 }),
+    eventSlug: varchar('event_slug', { length: 500 }),
+
+    size: numeric('size', { precision: 18, scale: 4 }),
+    avgPrice: numeric('avg_price', { precision: 10, scale: 6 }),
+    totalBought: numeric('total_bought', { precision: 14, scale: 2 }),
+    currentValue: numeric('current_value', { precision: 14, scale: 2 }),
+    lastSize: numeric('last_size', { precision: 18, scale: 4 }),
+
+    firstSeenAt: timestamp('first_seen_at').defaultNow().notNull(),
+    lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
+    status: varchar('status', { length: 20 }).default('open').notNull(),
+  },
+  (table) => [
+    uniqueIndex('uq_copied_trader_positions_wallet_market_outcome').on(
+      table.proxyWallet,
+      table.conditionId,
+      table.outcomeIndex,
+    ),
+    index('idx_copied_trader_positions_wallet').on(table.proxyWallet),
+  ],
+);
+
+// ─── copied_trader_trades ──────────────────────────────────────────────
+// Every detected trade, logged regardless of whether we executed it.
+// execution_status tells you what happened:
+//   'executed' — real CLOB order placed
+//   'paper'    — liveTradingEnabled=false, logged only
+//   'skipped'  — failed a gate (wallet cooled off, bankroll, etc.)
+//   'failed'   — exception during execution
+//   'pending'  — not yet evaluated
+
+export const copiedTraderTrades = pgTable(
+  'copied_trader_trades',
+  {
+    id: serial('id').primaryKey(),
+    proxyWallet: varchar('proxy_wallet', { length: 255 }).notNull(),
+    nickname: varchar('nickname', { length: 255 }),
+    conditionId: varchar('condition_id', { length: 255 }).notNull(),
+    outcomeIndex: integer('outcome_index').notNull(),
+    outcomeName: varchar('outcome_name', { length: 100 }),
+    marketQuestion: text('market_question'),
+    slug: varchar('slug', { length: 500 }),
+    eventSlug: varchar('event_slug', { length: 500 }),
+
+    followedSize: numeric('followed_size', { precision: 18, scale: 4 }),
+    followedAvgPrice: numeric('followed_avg_price', {
+      precision: 10,
+      scale: 6,
+    }),
+    sizeDelta: numeric('size_delta', { precision: 18, scale: 4 }),
+    tradeType: varchar('trade_type', { length: 20 }),
+
+    executionStatus: varchar('execution_status', { length: 20 }),
+    executionReason: text('execution_reason'),
+    ourPositionSizeUsd: numeric('our_position_size_usd', {
+      precision: 14,
+      scale: 2,
+    }),
+    ourTradeId: integer('our_trade_id'),
+    ourClobOrderId: varchar('our_clob_order_id', { length: 255 }),
+
+    detectedAt: timestamp('detected_at').defaultNow().notNull(),
+    executedAt: timestamp('executed_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_copied_trader_trades_wallet').on(
+      table.proxyWallet,
+      table.detectedAt,
+    ),
+    index('idx_copied_trader_trades_status').on(table.executionStatus),
+    index('idx_copied_trader_trades_detected').on(table.detectedAt),
+  ],
+);
+
 // ─── polymarket_holder_snapshots ───────────────────────────────────────
 // Daily snapshot of /holders for tracked Polymarket markets. Required for
 // walk-forward backtesting of the smart-money signal — without these,

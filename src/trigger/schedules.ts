@@ -13,6 +13,7 @@ import {
   snapshotPolymarketHoldersTask,
 } from './sync-data';
 import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
+import { copyTraderSyncTask } from './copy-trader-sync';
 import {
   syncBasketballFixturesTask,
   syncBasketballCompletedFixturesTask,
@@ -264,5 +265,20 @@ export const polymarketTradeSchedule = schedules.task({
     logger.info('Scheduled: Polymarket trading cycle');
     const handle = await polymarketTradeTask.trigger(undefined as void);
     logger.info('Triggered Polymarket trade task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 10 minutes: poll every active followed Polymarket wallet,
+ * detect new positions, and (if copy_enabled on that wallet) auto-place
+ * matching CLOB orders.
+ */
+export const copyTraderSyncSchedule = schedules.task({
+  id: 'scheduled-copy-trader-sync',
+  cron: '*/10 * * * *',
+  run: async () => {
+    logger.info('Scheduled: copy-trader sync');
+    const handle = await copyTraderSyncTask.trigger(undefined as void);
+    logger.info('Triggered copy-trader sync task', { runId: handle.id });
   },
 });

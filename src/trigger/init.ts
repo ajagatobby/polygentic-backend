@@ -31,6 +31,7 @@ import { PolymarketMatcherService } from '../polymarket/services/polymarket-matc
 import { PolymarketTradingAgent } from '../polymarket/services/polymarket-trading.agent';
 import { PolymarketDataService } from '../polymarket/services/polymarket-data.service';
 import { SmartMoneySignalService } from '../polymarket/services/smart-money-signal.service';
+import { CopyTraderService } from '../polymarket/services/copy-trader.service';
 import { PredictionMemoryService } from '../agents/prediction-memory.service';
 import { LeaguePriorsService } from '../agents/league-priors.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
@@ -111,6 +112,7 @@ export interface Services {
   polymarketService: PolymarketService;
   polymarketDataService: PolymarketDataService;
   smartMoneySignalService: SmartMoneySignalService;
+  copyTraderService: CopyTraderService;
 }
 
 /**
@@ -163,6 +165,12 @@ export function initServices(): Services {
     smartMoneySignalService,
     polymarketDataService,
   );
+  const copyTraderService = new CopyTraderService(
+    db as any,
+    polymarketDataService,
+    polymarketClob,
+    smartMoneySignalService,
+  );
 
   const agentsService = new AgentsService(
     db as any,
@@ -209,5 +217,6 @@ export function initServices(): Services {
     polymarketService,
     polymarketDataService,
     smartMoneySignalService,
+    copyTraderService,
   };
 }
