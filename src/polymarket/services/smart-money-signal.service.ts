@@ -68,6 +68,10 @@ export interface SmartMoneySignal {
     last10WinRate: number;
     /** Wins out of last 10 (0..10). Null if they haven't resolved 10 yet. */
     last10Wins: number | null;
+    /** Win rate over the last 20 resolved positions (0..1). */
+    last20WinRate: number;
+    /** Wins out of last 20 (0..20). Null if they haven't resolved 20 yet. */
+    last20Wins: number | null;
     /** Why this wallet qualified — `base` (lifetime PnL ≥ floor) or
      *  `hot-streak` (lower PnL floor + strong recent form). */
     qualifiedVia?: 'base' | 'hot-streak';
@@ -335,6 +339,8 @@ export class SmartMoneySignalService {
       currentWinStreak: number;
       last10WinRate: number;
       last10Wins: number | null;
+      last20WinRate: number;
+      last20Wins: number | null;
       qualifies: boolean;
       qualifiedVia?: 'base' | 'hot-streak';
     }>
@@ -374,6 +380,8 @@ export class SmartMoneySignalService {
       currentWinStreak: number;
       last10WinRate: number;
       last10Wins: number | null;
+      last20WinRate: number;
+      last20Wins: number | null;
       qualifies: boolean;
       qualifiedVia?: 'base' | 'hot-streak';
     }> = [];
@@ -438,6 +446,8 @@ export class SmartMoneySignalService {
       currentWinStreak: stats.currentWinStreak,
       last10WinRate: stats.last10WinRate,
       last10Wins: stats.last10Wins,
+      last20WinRate: stats.last20WinRate,
+      last20Wins: stats.last20Wins,
       qualifies,
       qualifiedVia,
     };

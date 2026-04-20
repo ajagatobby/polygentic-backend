@@ -1393,6 +1393,8 @@ export class PolymarketService implements OnModuleInit {
           lifetimePnl: Number(s.lifetimePnl ?? 0),
           lifetimeRoi: Number(s.lifetimeRoi ?? 0),
           last10Wins: s.last10Wins ?? null,
+          last20Wins: s.last20Wins ?? null,
+          currentWinStreak: Number(s.currentWinStreak ?? 0),
           bet: {
             outcome: betYes
               ? raw.outcome0Name ?? 'Yes'
