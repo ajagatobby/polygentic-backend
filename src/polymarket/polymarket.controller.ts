@@ -40,6 +40,101 @@ export class PolymarketController {
     return this.polymarketService.getPerformanceSummary();
   }
 
+  @Get('smart-money/config')
+  @ApiOperation({
+    summary: 'Get the current sharp-qualification thresholds',
+    description:
+      'Returns the DB-stored overrides for the smart-money gates. ' +
+      'Any field returned as null means the service default is in effect.',
+  })
+  async getSmartMoneyConfig() {
+    return this.polymarketService.getSmartMoneyConfig();
+  }
+
+  @Roles('admin')
+  @Patch('smart-money/config')
+  @ApiOperation({
+    summary: '[Admin] Update sharp-qualification thresholds',
+    description:
+      'Partial update — only provided fields change. Pass null to clear ' +
+      'a field and revert that specific gate to the service default. ' +
+      'Changes take effect within 30s (config is cached). Affects every ' +
+      'endpoint and task that runs the smart-money signal.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        minLifetimePnl: {
+          type: 'number',
+          description: 'Base lifetime PnL floor (USD). Default 50000.',
+          example: 75000,
+        },
+        minLifetimePnlWithStreak: {
+          type: 'number',
+          description:
+            'Lower PnL floor when the wallet has a hot streak. Default 20000.',
+          example: 25000,
+        },
+        minLifetimeRoi: {
+          type: 'number',
+          description: 'Min lifetime ROI fraction (0.10 = 10%). Default 0.10.',
+          example: 0.15,
+        },
+        minResolvedBets: {
+          type: 'integer',
+          description: 'Min resolved bets. Default 50.',
+          example: 30,
+        },
+        minSharpCount: {
+          type: 'integer',
+          description:
+            'Signal-level floor: min qualifying sharps before leanScore is non-null. Default 3.',
+          example: 5,
+        },
+        minPositionMultiple: {
+          type: 'number',
+          description:
+            'Position must be >= this multiple of trader typical bet. Default 0.5.',
+          example: 0.7,
+        },
+        correlationThreshold: {
+          type: 'number',
+          description:
+            'Dedup correlation threshold (fraction). Default 0.15.',
+          example: 0.2,
+        },
+        minLast10WinRate: {
+          type: 'number',
+          description: 'Hot-streak path: min last-10 win rate. Default 0.80.',
+          example: 0.85,
+        },
+        minCurrentStreak: {
+          type: 'integer',
+          description:
+            'Hot-streak path: min consecutive-wins streak. Default 7.',
+          example: 8,
+        },
+      },
+    },
+  })
+  async updateSmartMoneyConfig(
+    @Body()
+    body: Partial<{
+      minLifetimePnl: number | null;
+      minLifetimePnlWithStreak: number | null;
+      minLifetimeRoi: number | null;
+      minResolvedBets: number | null;
+      minSharpCount: number | null;
+      minPositionMultiple: number | null;
+      correlationThreshold: number | null;
+      minLast10WinRate: number | null;
+      minCurrentStreak: number | null;
+    }>,
+  ) {
+    return this.polymarketService.updateSmartMoneyConfig(body);
+  }
+
   @Get('holders/:conditionId')
   @ApiOperation({
     summary: 'Get every top holder for a Polymarket market (by conditionId)',

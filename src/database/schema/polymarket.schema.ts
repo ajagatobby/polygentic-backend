@@ -301,6 +301,46 @@ export const polymarketConfig = pgTable(
   (table) => [uniqueIndex('uq_polymarket_config_mode').on(table.mode)],
 );
 
+// ─── smart_money_config ────────────────────────────────────────────────
+// Runtime-tunable thresholds for the sharp-qualification pipeline in
+// smart-money-signal.service.ts. DB values override the hard-coded
+// defaults on every call. Single-row table (profile = 'default') with
+// the profile column reserved for future alternates (e.g. 'whales-only').
+
+export const smartMoneyConfig = pgTable(
+  'smart_money_config',
+  {
+    id: serial('id').primaryKey(),
+    profile: varchar('profile', { length: 50 }).notNull().default('default'),
+
+    minLifetimePnl: numeric('min_lifetime_pnl', { precision: 14, scale: 2 }),
+    minLifetimePnlWithStreak: numeric('min_lifetime_pnl_with_streak', {
+      precision: 14,
+      scale: 2,
+    }),
+    minLifetimeRoi: numeric('min_lifetime_roi', { precision: 5, scale: 4 }),
+    minResolvedBets: integer('min_resolved_bets'),
+    minSharpCount: integer('min_sharp_count'),
+    minPositionMultiple: numeric('min_position_multiple', {
+      precision: 5,
+      scale: 4,
+    }),
+    correlationThreshold: numeric('correlation_threshold', {
+      precision: 5,
+      scale: 4,
+    }),
+    minLast10WinRate: numeric('min_last_10_win_rate', {
+      precision: 5,
+      scale: 4,
+    }),
+    minCurrentStreak: integer('min_current_streak'),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [uniqueIndex('uq_smart_money_config_profile').on(table.profile)],
+);
+
 // ─── polymarket_holder_snapshots ───────────────────────────────────────
 // Daily snapshot of /holders for tracked Polymarket markets. Required for
 // walk-forward backtesting of the smart-money signal — without these,

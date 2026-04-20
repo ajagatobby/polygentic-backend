@@ -344,6 +344,210 @@ export class PolymarketService implements OnModuleInit {
     return this.getTradingConfig();
   }
 
+  // ─── Smart-money thresholds (runtime-tunable) ─────────────────────────
+  //
+  // Mirrors the trading-config pattern above. DB row (one per profile)
+  // overrides the hard-coded DEFAULTS in SmartMoneySignalService. Cached
+  // 30s so a prediction cycle doesn't hammer the table.
+
+  private smartMoneyConfigCache:
+    | {
+        profile: string;
+        minLifetimePnl: number | null;
+        minLifetimePnlWithStreak: number | null;
+        minLifetimeRoi: number | null;
+        minResolvedBets: number | null;
+        minSharpCount: number | null;
+        minPositionMultiple: number | null;
+        correlationThreshold: number | null;
+        minLast10WinRate: number | null;
+        minCurrentStreak: number | null;
+        updatedAt: Date | null;
+      }
+    | null = null;
+  private smartMoneyConfigCacheAt = 0;
+
+  /**
+   * Read the current sharp-qualification thresholds. Returns a row with
+   * null fields when no DB override exists — caller treats null as
+   * "use the service default".
+   */
+  async getSmartMoneyConfig(): Promise<{
+    profile: string;
+    minLifetimePnl: number | null;
+    minLifetimePnlWithStreak: number | null;
+    minLifetimeRoi: number | null;
+    minResolvedBets: number | null;
+    minSharpCount: number | null;
+    minPositionMultiple: number | null;
+    correlationThreshold: number | null;
+    minLast10WinRate: number | null;
+    minCurrentStreak: number | null;
+    updatedAt: Date | null;
+  }> {
+    if (
+      this.smartMoneyConfigCache &&
+      Date.now() - this.smartMoneyConfigCacheAt < 30_000
+    ) {
+      return this.smartMoneyConfigCache;
+    }
+
+    const empty = {
+      profile: 'default',
+      minLifetimePnl: null,
+      minLifetimePnlWithStreak: null,
+      minLifetimeRoi: null,
+      minResolvedBets: null,
+      minSharpCount: null,
+      minPositionMultiple: null,
+      correlationThreshold: null,
+      minLast10WinRate: null,
+      minCurrentStreak: null,
+      updatedAt: null,
+    };
+
+    try {
+      const rows = await this.db
+        .select()
+        .from(schema.smartMoneyConfig)
+        .where(eq(schema.smartMoneyConfig.profile, 'default'))
+        .limit(1);
+      const row = rows[0];
+      if (!row) {
+        this.smartMoneyConfigCache = empty;
+        this.smartMoneyConfigCacheAt = Date.now();
+        return empty;
+      }
+      const parsed = {
+        profile: row.profile as string,
+        minLifetimePnl:
+          row.minLifetimePnl != null ? Number(row.minLifetimePnl) : null,
+        minLifetimePnlWithStreak:
+          row.minLifetimePnlWithStreak != null
+            ? Number(row.minLifetimePnlWithStreak)
+            : null,
+        minLifetimeRoi:
+          row.minLifetimeRoi != null ? Number(row.minLifetimeRoi) : null,
+        minResolvedBets:
+          row.minResolvedBets != null ? Number(row.minResolvedBets) : null,
+        minSharpCount:
+          row.minSharpCount != null ? Number(row.minSharpCount) : null,
+        minPositionMultiple:
+          row.minPositionMultiple != null
+            ? Number(row.minPositionMultiple)
+            : null,
+        correlationThreshold:
+          row.correlationThreshold != null
+            ? Number(row.correlationThreshold)
+            : null,
+        minLast10WinRate:
+          row.minLast10WinRate != null ? Number(row.minLast10WinRate) : null,
+        minCurrentStreak:
+          row.minCurrentStreak != null ? Number(row.minCurrentStreak) : null,
+        updatedAt: (row.updatedAt as Date | null) ?? null,
+      };
+      this.smartMoneyConfigCache = parsed;
+      this.smartMoneyConfigCacheAt = Date.now();
+      return parsed;
+    } catch (err) {
+      this.logger.debug(
+        `smart_money_config table not available, using service defaults: ${
+          (err as Error).message
+        }`,
+      );
+      this.smartMoneyConfigCache = empty;
+      this.smartMoneyConfigCacheAt = Date.now();
+      return empty;
+    }
+  }
+
+  /**
+   * Partial update of the sharp thresholds. Upserts the single
+   * profile='default' row. Pass null for a field to clear the override
+   * (revert to service default).
+   */
+  async updateSmartMoneyConfig(
+    updates: Partial<{
+      minLifetimePnl: number | null;
+      minLifetimePnlWithStreak: number | null;
+      minLifetimeRoi: number | null;
+      minResolvedBets: number | null;
+      minSharpCount: number | null;
+      minPositionMultiple: number | null;
+      correlationThreshold: number | null;
+      minLast10WinRate: number | null;
+      minCurrentStreak: number | null;
+    }>,
+  ) {
+    // Convert numeric → string for Drizzle's numeric columns; null clears.
+    const n = (v: number | null | undefined): string | null | undefined => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      return String(v);
+    };
+    const i = (v: number | null | undefined): number | null | undefined => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      return Math.round(v);
+    };
+
+    const payload: any = { updatedAt: new Date() };
+    if (updates.minLifetimePnl !== undefined)
+      payload.minLifetimePnl = n(updates.minLifetimePnl);
+    if (updates.minLifetimePnlWithStreak !== undefined)
+      payload.minLifetimePnlWithStreak = n(updates.minLifetimePnlWithStreak);
+    if (updates.minLifetimeRoi !== undefined)
+      payload.minLifetimeRoi = n(updates.minLifetimeRoi);
+    if (updates.minResolvedBets !== undefined)
+      payload.minResolvedBets = i(updates.minResolvedBets);
+    if (updates.minSharpCount !== undefined)
+      payload.minSharpCount = i(updates.minSharpCount);
+    if (updates.minPositionMultiple !== undefined)
+      payload.minPositionMultiple = n(updates.minPositionMultiple);
+    if (updates.correlationThreshold !== undefined)
+      payload.correlationThreshold = n(updates.correlationThreshold);
+    if (updates.minLast10WinRate !== undefined)
+      payload.minLast10WinRate = n(updates.minLast10WinRate);
+    if (updates.minCurrentStreak !== undefined)
+      payload.minCurrentStreak = i(updates.minCurrentStreak);
+
+    await this.db
+      .insert(schema.smartMoneyConfig)
+      .values({ profile: 'default', ...payload })
+      .onConflictDoUpdate({
+        target: schema.smartMoneyConfig.profile,
+        set: payload,
+      });
+
+    this.smartMoneyConfigCache = null;
+    return this.getSmartMoneyConfig();
+  }
+
+  /**
+   * Returns the thresholds as a Partial<SmartMoneyOptions> ready to be
+   * merged into a computeSignal call. Only non-null DB values are
+   * included — the signal service's own defaults fill the rest.
+   */
+  async getSmartMoneyOptionsOverride(): Promise<Record<string, number>> {
+    const cfg = await this.getSmartMoneyConfig();
+    const out: Record<string, number> = {};
+    if (cfg.minLifetimePnl != null) out.minLifetimePnl = cfg.minLifetimePnl;
+    if (cfg.minLifetimePnlWithStreak != null)
+      out.minLifetimePnlWithStreak = cfg.minLifetimePnlWithStreak;
+    if (cfg.minLifetimeRoi != null) out.minLifetimeRoi = cfg.minLifetimeRoi;
+    if (cfg.minResolvedBets != null) out.minResolvedBets = cfg.minResolvedBets;
+    if (cfg.minSharpCount != null) out.minSharpCount = cfg.minSharpCount;
+    if (cfg.minPositionMultiple != null)
+      out.minPositionMultiple = cfg.minPositionMultiple;
+    if (cfg.correlationThreshold != null)
+      out.correlationThreshold = cfg.correlationThreshold;
+    if (cfg.minLast10WinRate != null)
+      out.minLast10WinRate = cfg.minLast10WinRate;
+    if (cfg.minCurrentStreak != null)
+      out.minCurrentStreak = cfg.minCurrentStreak;
+    return out;
+  }
+
   /**
    * Sync a new budget value to the active bankroll.
    * Updates initialBudget, recalculates currentBalance, and resets
@@ -1159,15 +1363,22 @@ export class PolymarketService implements OnModuleInit {
         }
       : {};
 
+    // Merge DB-stored threshold overrides. Admin-facing endpoint lets
+    // operators tune gates without shipping code — non-null DB fields
+    // win, nulls fall through to the signal service's hard-coded
+    // defaults.
+    const dbOverride = await this.getSmartMoneyOptionsOverride();
+
     let signal = await this.smartMoneySignalService.computeSignal(
       chosen.conditionId,
-      poolOptions,
+      { ...dbOverride, ...poolOptions },
     );
     let thresholdMode: 'strict' | 'relaxed' = 'strict';
     if (signal.leanScore == null) {
       const relaxed = await this.smartMoneySignalService.computeSignal(
         chosen.conditionId,
         {
+          ...dbOverride,
           ...poolOptions,
           minLifetimePnl: 10_000,
           minLifetimePnlWithStreak: 5_000,
