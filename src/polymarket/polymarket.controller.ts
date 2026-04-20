@@ -40,6 +40,222 @@ export class PolymarketController {
     return this.polymarketService.getPerformanceSummary();
   }
 
+  @Get('smart-money/top-picks')
+  @ApiOperation({
+    summary:
+      'Top soccer picks ranked by smart-money conviction, with Polymarket bet links',
+    description:
+      'Returns the highest-confidence standalone smart-money predictions ' +
+      'across your fixtures. Every pick carries its Polymarket URL plus a ' +
+      'recommendedBet sub-object with the outcome, implied price, and edge. ' +
+      'Heavy filter set covers prediction quality, fixture metadata, ' +
+      'probability ranges, resolution status, and edge vs market price.',
+  })
+  // Prediction quality
+  @ApiQuery({ name: 'minConfidence', required: false, type: Number })
+  @ApiQuery({ name: 'maxConfidence', required: false, type: Number })
+  @ApiQuery({
+    name: 'source',
+    required: false,
+    description: 'direct | market',
+  })
+  @ApiQuery({
+    name: 'thresholdMode',
+    required: false,
+    description: 'strict | relaxed',
+  })
+  @ApiQuery({
+    name: 'predictedResult',
+    required: false,
+    description: 'home_win | away_win | draw',
+  })
+  @ApiQuery({ name: 'minSharpCount', required: false, type: Number })
+  @ApiQuery({
+    name: 'minLeanMagnitude',
+    required: false,
+    type: Number,
+    description: '0..1 — absolute lean floor',
+  })
+  @ApiQuery({
+    name: 'strength',
+    required: false,
+    description: 'strong (|lean|≥0.5) | moderate (≥0.3) | weak',
+  })
+  @ApiQuery({
+    name: 'minDollarsFor',
+    required: false,
+    type: Number,
+    description: 'Minimum USD backing the leaning side',
+  })
+  @ApiQuery({
+    name: 'leaningTeam',
+    required: false,
+    description: 'home | away — which side sharps back',
+  })
+  // Fixture
+  @ApiQuery({ name: 'leagueId', required: false, type: Number })
+  @ApiQuery({ name: 'leagueName', required: false, type: String })
+  @ApiQuery({ name: 'leagueCountry', required: false, type: String })
+  @ApiQuery({ name: 'teamId', required: false, type: Number })
+  @ApiQuery({ name: 'teamName', required: false, type: String })
+  @ApiQuery({
+    name: 'dateFrom',
+    required: false,
+    type: String,
+    description: 'ISO 8601',
+  })
+  @ApiQuery({ name: 'dateTo', required: false, type: String })
+  @ApiQuery({
+    name: 'upcomingOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only fixtures where kickoff > now',
+  })
+  // Probabilities
+  @ApiQuery({ name: 'minHomeWinProb', required: false, type: Number })
+  @ApiQuery({ name: 'maxHomeWinProb', required: false, type: Number })
+  @ApiQuery({ name: 'minDrawProb', required: false, type: Number })
+  @ApiQuery({ name: 'maxDrawProb', required: false, type: Number })
+  @ApiQuery({ name: 'minAwayWinProb', required: false, type: Number })
+  @ApiQuery({ name: 'maxAwayWinProb', required: false, type: Number })
+  // Edge
+  @ApiQuery({
+    name: 'minEdge',
+    required: false,
+    type: Number,
+    description: 'Minimum edge (our probability − market implied price)',
+  })
+  // Resolution
+  @ApiQuery({ name: 'resolved', required: false, type: Boolean })
+  @ApiQuery({ name: 'wasCorrect', required: false, type: Boolean })
+  // Sort + pagination
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    description:
+      'confidence (default) | leanMagnitude | sharpCount | kickoff | createdAt | dollarsFor',
+  })
+  @ApiQuery({ name: 'sortOrder', required: false, description: 'asc | desc' })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max picks returned (default 20, max 100)',
+  })
+  @ApiQuery({ name: 'offset', required: false, type: Number })
+  async getTopSmartMoneyPicks(
+    // Prediction quality
+    @Query('minConfidence') minConfidence?: string,
+    @Query('maxConfidence') maxConfidence?: string,
+    @Query('source') source?: string,
+    @Query('thresholdMode') thresholdMode?: string,
+    @Query('predictedResult') predictedResult?: string,
+    @Query('minSharpCount') minSharpCount?: string,
+    @Query('minLeanMagnitude') minLeanMagnitude?: string,
+    @Query('strength') strength?: string,
+    @Query('minDollarsFor') minDollarsFor?: string,
+    @Query('leaningTeam') leaningTeam?: string,
+    // Fixture
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('leagueCountry') leagueCountry?: string,
+    @Query('teamId') teamId?: string,
+    @Query('teamName') teamName?: string,
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
+    @Query('upcomingOnly') upcomingOnly?: string,
+    // Probs
+    @Query('minHomeWinProb') minHomeWinProb?: string,
+    @Query('maxHomeWinProb') maxHomeWinProb?: string,
+    @Query('minDrawProb') minDrawProb?: string,
+    @Query('maxDrawProb') maxDrawProb?: string,
+    @Query('minAwayWinProb') minAwayWinProb?: string,
+    @Query('maxAwayWinProb') maxAwayWinProb?: string,
+    // Edge
+    @Query('minEdge') minEdge?: string,
+    // Resolution
+    @Query('resolved') resolved?: string,
+    @Query('wasCorrect') wasCorrect?: string,
+    // Sort + page
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    const num = (v: string | undefined) => {
+      if (v == null || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const bool = (v: string | undefined) => {
+      if (v === 'true') return true;
+      if (v === 'false') return false;
+      return undefined;
+    };
+    const allowedSorts = [
+      'confidence',
+      'leanMagnitude',
+      'sharpCount',
+      'kickoff',
+      'createdAt',
+      'dollarsFor',
+      'edge',
+    ] as const;
+    const sortByNorm = allowedSorts.includes(sortBy as any)
+      ? (sortBy as (typeof allowedSorts)[number])
+      : undefined;
+
+    return this.polymarketService.getTopSmartMoneyPicks({
+      minConfidence: num(minConfidence),
+      maxConfidence: num(maxConfidence),
+      source: source === 'direct' || source === 'market' ? source : undefined,
+      thresholdMode:
+        thresholdMode === 'strict' || thresholdMode === 'relaxed'
+          ? thresholdMode
+          : undefined,
+      predictedResult:
+        predictedResult === 'home_win' ||
+        predictedResult === 'away_win' ||
+        predictedResult === 'draw'
+          ? predictedResult
+          : undefined,
+      minSharpCount: num(minSharpCount),
+      minLeanMagnitude: num(minLeanMagnitude),
+      strength:
+        strength === 'strong' ||
+        strength === 'moderate' ||
+        strength === 'weak'
+          ? strength
+          : undefined,
+      minDollarsFor: num(minDollarsFor),
+      leaningTeam:
+        leaningTeam === 'home' || leaningTeam === 'away'
+          ? leaningTeam
+          : undefined,
+      leagueId: num(leagueId),
+      leagueName: leagueName || undefined,
+      leagueCountry: leagueCountry || undefined,
+      teamId: num(teamId),
+      teamName: teamName || undefined,
+      dateFrom: dateFrom || undefined,
+      dateTo: dateTo || undefined,
+      upcomingOnly: bool(upcomingOnly),
+      minHomeWinProb: num(minHomeWinProb),
+      maxHomeWinProb: num(maxHomeWinProb),
+      minDrawProb: num(minDrawProb),
+      maxDrawProb: num(maxDrawProb),
+      minAwayWinProb: num(minAwayWinProb),
+      maxAwayWinProb: num(maxAwayWinProb),
+      minEdge: num(minEdge),
+      resolved: bool(resolved),
+      wasCorrect: bool(wasCorrect),
+      sortBy: sortByNorm,
+      sortOrder: sortOrder === 'asc' ? 'asc' : undefined,
+      limit: num(limit),
+      offset: num(offset),
+    });
+  }
+
   @Get('smart-money/config')
   @ApiOperation({
     summary: 'Get the current sharp-qualification thresholds',

@@ -819,6 +819,577 @@ export class PolymarketService implements OnModuleInit {
    *   - No qualifying sharps backed the market (leanScore null)
    */
   /**
+   * Top smart-money picks — the highest-confidence standalone
+   * smart-money predictions across our fixtures, with deep filtering
+   * and inline Polymarket links.
+   *
+   * Filter categories:
+   *   Prediction quality: confidence, source, thresholdMode,
+   *     predictedResult, min sharp count / lean magnitude / dollars,
+   *     strength bucket
+   *   Fixture: league, team, date range, kickoff status
+   *   Probabilities: per-outcome min/max
+   *   Resolution: resolved-only, correct-only
+   *
+   * Includes a `polymarket` block per pick with the market question,
+   * direct betting URL, and a recommendedBet sub-object describing the
+   * outcome this prediction implies (with edge vs market price).
+   */
+  async getTopSmartMoneyPicks(filters: {
+    // Prediction quality
+    minConfidence?: number;
+    maxConfidence?: number;
+    source?: 'direct' | 'market';
+    thresholdMode?: 'strict' | 'relaxed';
+    predictedResult?: 'home_win' | 'away_win' | 'draw';
+    minSharpCount?: number;
+    minLeanMagnitude?: number; // 0..1 — applies to |leanScore|
+    strength?: 'strong' | 'moderate' | 'weak';
+    minDollarsFor?: number;
+    leaningTeam?: 'home' | 'away';
+
+    // Fixture
+    leagueId?: number;
+    leagueName?: string;
+    leagueCountry?: string;
+    teamId?: number;
+    teamName?: string;
+    dateFrom?: string; // ISO
+    dateTo?: string;
+    upcomingOnly?: boolean; // only fixtures where date > now
+
+    // Probabilities
+    minHomeWinProb?: number;
+    maxHomeWinProb?: number;
+    minDrawProb?: number;
+    maxDrawProb?: number;
+    minAwayWinProb?: number;
+    maxAwayWinProb?: number;
+
+    // Edge vs market
+    minEdge?: number; // ourProbability − marketImpliedProb for the bet side
+
+    // Resolution
+    resolved?: boolean;
+    wasCorrect?: boolean;
+
+    // Sort + pagination
+    sortBy?:
+      | 'confidence'
+      | 'leanMagnitude'
+      | 'sharpCount'
+      | 'kickoff'
+      | 'createdAt'
+      | 'dollarsFor'
+      | 'edge';
+    sortOrder?: 'asc' | 'desc';
+    limit?: number;
+    offset?: number;
+  }): Promise<{
+    filters: any;
+    total: number;
+    picks: any[];
+  }> {
+    const limit = Math.min(100, Math.max(1, filters.limit ?? 20));
+    const offset = Math.max(0, filters.offset ?? 0);
+
+    // Build the WHERE conditions. Mix of column and JSONB path filters.
+    const conditions: any[] = [];
+
+    // ── Column-level filters ───────────────────────────────────────
+    if (filters.minConfidence != null) {
+      conditions.push(
+        gte(schema.smartMoneyPredictions.confidence, filters.minConfidence),
+      );
+    }
+    if (filters.maxConfidence != null) {
+      conditions.push(
+        lte(schema.smartMoneyPredictions.confidence, filters.maxConfidence),
+      );
+    }
+    if (filters.source) {
+      conditions.push(eq(schema.smartMoneyPredictions.source, filters.source));
+    }
+    if (filters.thresholdMode) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.thresholdMode, filters.thresholdMode),
+      );
+    }
+    if (filters.predictedResult) {
+      conditions.push(
+        eq(
+          schema.smartMoneyPredictions.predictedResult,
+          filters.predictedResult,
+        ),
+      );
+    }
+    if (filters.minHomeWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.homeWinProb} >= ${filters.minHomeWinProb}`,
+      );
+    }
+    if (filters.maxHomeWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.homeWinProb} <= ${filters.maxHomeWinProb}`,
+      );
+    }
+    if (filters.minDrawProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.drawProb} >= ${filters.minDrawProb}`,
+      );
+    }
+    if (filters.maxDrawProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.drawProb} <= ${filters.maxDrawProb}`,
+      );
+    }
+    if (filters.minAwayWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.awayWinProb} >= ${filters.minAwayWinProb}`,
+      );
+    }
+    if (filters.maxAwayWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.awayWinProb} <= ${filters.maxAwayWinProb}`,
+      );
+    }
+    if (filters.resolved === true) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.predictionStatus, 'resolved'),
+      );
+    } else if (filters.resolved === false) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.predictionStatus, 'pending'),
+      );
+    }
+    if (filters.wasCorrect != null) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.wasCorrect, filters.wasCorrect),
+      );
+    }
+
+    // ── JSONB filters on smart_money_signal ────────────────────────
+    if (filters.minSharpCount != null) {
+      conditions.push(
+        sql`(${schema.smartMoneyPredictions.smartMoneySignal}->>'sharpCount')::int >= ${filters.minSharpCount}`,
+      );
+    }
+    if (filters.minLeanMagnitude != null) {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) >= ${filters.minLeanMagnitude}`,
+      );
+    }
+    if (filters.strength === 'strong') {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) >= 0.5`,
+      );
+    } else if (filters.strength === 'moderate') {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) >= 0.3 AND ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) < 0.5`,
+      );
+    } else if (filters.strength === 'weak') {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) < 0.3`,
+      );
+    }
+    if (filters.minDollarsFor != null) {
+      // dollarsFor = max(sharpDollarsOutcome0, sharpDollarsOutcome1)
+      // whichever side the sharps lean
+      conditions.push(
+        sql`GREATEST(
+            (${schema.smartMoneyPredictions.smartMoneySignal}->>'sharpDollarsOutcome0')::numeric,
+            (${schema.smartMoneyPredictions.smartMoneySignal}->>'sharpDollarsOutcome1')::numeric
+          ) >= ${filters.minDollarsFor}`,
+      );
+    }
+
+    // ── Fixture joins applied later — track which filters require them
+    if (filters.leagueId != null) {
+      conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+    if (filters.leagueName) {
+      conditions.push(
+        sql`${schema.fixtures.leagueName} ILIKE ${'%' + filters.leagueName + '%'}`,
+      );
+    }
+    if (filters.leagueCountry) {
+      conditions.push(
+        sql`${schema.fixtures.leagueCountry} ILIKE ${'%' + filters.leagueCountry + '%'}`,
+      );
+    }
+    if (filters.teamId != null) {
+      conditions.push(
+        sql`(${schema.fixtures.homeTeamId} = ${filters.teamId} OR ${schema.fixtures.awayTeamId} = ${filters.teamId})`,
+      );
+    }
+    if (filters.dateFrom) {
+      conditions.push(gte(schema.fixtures.date, new Date(filters.dateFrom)));
+    }
+    if (filters.dateTo) {
+      conditions.push(lte(schema.fixtures.date, new Date(filters.dateTo)));
+    }
+    if (filters.upcomingOnly) {
+      conditions.push(sql`${schema.fixtures.date} > NOW()`);
+    }
+    // leaningTeam — sharps lean home = (signal points to the home team
+    // as the winner). Computed: (marketTeamId == homeTeamId AND
+    // leanScore > 0) OR (marketTeamId == awayTeamId AND leanScore < 0)
+    if (filters.leaningTeam === 'home') {
+      conditions.push(
+        sql`(
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.homeTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric > 0)
+          OR
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.awayTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric < 0)
+        )`,
+      );
+    } else if (filters.leaningTeam === 'away') {
+      conditions.push(
+        sql`(
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.awayTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric > 0)
+          OR
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.homeTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric < 0)
+        )`,
+      );
+    }
+
+    // ── Sort ────────────────────────────────────────────────────────
+    const dir = filters.sortOrder === 'asc' ? 'asc' : 'desc';
+    let orderBy: any;
+    switch (filters.sortBy) {
+      case 'leanMagnitude':
+        orderBy = sql.raw(
+          `ABS((smart_money_signal->>'leanScore')::numeric) ${dir}`,
+        );
+        break;
+      case 'sharpCount':
+        orderBy = sql.raw(
+          `((smart_money_signal->>'sharpCount')::int) ${dir}`,
+        );
+        break;
+      case 'kickoff':
+        orderBy = sql.raw(`fixtures.date ${dir}`);
+        break;
+      case 'createdAt':
+        orderBy = sql.raw(
+          `smart_money_predictions.created_at ${dir}`,
+        );
+        break;
+      case 'dollarsFor':
+        orderBy = sql.raw(
+          `GREATEST(
+            (smart_money_signal->>'sharpDollarsOutcome0')::numeric,
+            (smart_money_signal->>'sharpDollarsOutcome1')::numeric
+          ) ${dir}`,
+        );
+        break;
+      case 'confidence':
+      default:
+        orderBy = sql.raw(`smart_money_predictions.confidence ${dir}`);
+        break;
+    }
+
+    // ── Base query ─────────────────────────────────────────────────
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // Use a single join so all fixture filters apply.
+    const baseQuery = this.db
+      .select({
+        pred: schema.smartMoneyPredictions,
+        fixtureId: schema.fixtures.id,
+        fixtureDate: schema.fixtures.date,
+        fixtureStatus: schema.fixtures.status,
+        fixtureStatusLong: schema.fixtures.statusLong,
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+        leagueId: schema.fixtures.leagueId,
+        leagueName: schema.fixtures.leagueName,
+        leagueCountry: schema.fixtures.leagueCountry,
+        goalsHome: schema.fixtures.goalsHome,
+        goalsAway: schema.fixtures.goalsAway,
+      })
+      .from(schema.smartMoneyPredictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.smartMoneyPredictions.fixtureId, schema.fixtures.id),
+      );
+
+    const [rows, countRows] = await Promise.all([
+      whereClause
+        ? baseQuery
+            .where(whereClause)
+            .orderBy(orderBy)
+            .limit(limit)
+            .offset(offset)
+        : baseQuery.orderBy(orderBy).limit(limit).offset(offset),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.smartMoneyPredictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.smartMoneyPredictions.fixtureId, schema.fixtures.id),
+        )
+        .where(whereClause ?? sql`true`),
+    ]);
+
+    if (rows.length === 0) {
+      return {
+        filters,
+        total: Number(countRows[0]?.count ?? 0),
+        picks: [],
+      };
+    }
+
+    // ── Team name filter (post-query) ──────────────────────────────
+    // (cheaper than joining twice; team names are rarely a hot filter)
+
+    // ── Enrich with teams + polymarket links ───────────────────────
+    const teamIds = new Set<number>();
+    const fixtureIds: number[] = [];
+    for (const r of rows) {
+      if (r.homeTeamId) teamIds.add(r.homeTeamId);
+      if (r.awayTeamId) teamIds.add(r.awayTeamId);
+      fixtureIds.push(r.fixtureId);
+    }
+
+    const [teamRows, marketRows] = await Promise.all([
+      teamIds.size > 0
+        ? this.db
+            .select({
+              id: schema.teams.id,
+              name: schema.teams.name,
+              shortName: schema.teams.shortName,
+              logo: schema.teams.logo,
+            })
+            .from(schema.teams)
+            .where(inArray(schema.teams.id, [...teamIds]))
+        : Promise.resolve([]),
+      this.db
+        .select({
+          fixtureId: schema.polymarketMarkets.fixtureId,
+          teamId: schema.polymarketMarkets.teamId,
+          conditionId: schema.polymarketMarkets.conditionId,
+          marketQuestion: schema.polymarketMarkets.marketQuestion,
+          marketType: schema.polymarketMarkets.marketType,
+          slug: schema.polymarketMarkets.slug,
+          eventSlug: schema.polymarketMarkets.eventSlug,
+          outcomes: schema.polymarketMarkets.outcomes,
+          outcomePrices: schema.polymarketMarkets.outcomePrices,
+          midpoints: schema.polymarketMarkets.midpoints,
+        })
+        .from(schema.polymarketMarkets)
+        .where(
+          and(
+            inArray(schema.polymarketMarkets.fixtureId, fixtureIds),
+            eq(schema.polymarketMarkets.marketType, 'match_outcome'),
+          ),
+        ),
+    ]);
+
+    const teamMap = new Map<number, any>();
+    for (const t of teamRows) teamMap.set(t.id, t);
+
+    // Markets grouped by fixture
+    const marketsByFixture = new Map<number, any[]>();
+    for (const m of marketRows) {
+      const list = marketsByFixture.get(m.fixtureId as number) ?? [];
+      list.push(m);
+      marketsByFixture.set(m.fixtureId as number, list);
+    }
+
+    // ── Assemble picks ─────────────────────────────────────────────
+    const picks = rows
+      .map((r: any) => {
+        const pred = r.pred;
+        const homeTeam = teamMap.get(r.homeTeamId);
+        const awayTeam = teamMap.get(r.awayTeamId);
+        const homeName = homeTeam?.name ?? null;
+        const awayName = awayTeam?.name ?? null;
+
+        // Post-query teamName filter
+        if (filters.teamName) {
+          const needle = filters.teamName.toLowerCase();
+          const matched =
+            (homeName ?? '').toLowerCase().includes(needle) ||
+            (awayName ?? '').toLowerCase().includes(needle);
+          if (!matched) return null;
+        }
+
+        // Find the moneyline market that matches the signal's
+        // marketTeamId — that's the one the sharp signal was
+        // computed against and the one the user should bet on.
+        const signal = pred.smartMoneySignal ?? null;
+        const marketTeamId = signal?.marketTeamId ?? null;
+        const fixtureMarkets = marketsByFixture.get(r.fixtureId) ?? [];
+        const chosenMarket =
+          fixtureMarkets.find(
+            (m) =>
+              m.teamId === marketTeamId &&
+              m.conditionId &&
+              /^will\s+.+?\s+win/i.test(String(m.marketQuestion ?? '')),
+          ) ??
+          fixtureMarkets.find(
+            (m) =>
+              m.conditionId &&
+              /^will\s+.+?\s+win/i.test(String(m.marketQuestion ?? '')),
+          ) ??
+          null;
+
+        const marketUrl = chosenMarket?.slug
+          ? `https://polymarket.com/market/${chosenMarket.slug}`
+          : null;
+        const eventUrl = chosenMarket?.eventSlug
+          ? `https://polymarket.com/event/${chosenMarket.eventSlug}`
+          : null;
+
+        // Recommended bet: map predicted result → Polymarket outcome
+        // on the chosen market. For "Will TEAM win?" market:
+        //   marketIsHome + predictedResult=home_win → YES (backs home)
+        //   marketIsHome + predictedResult=away_win → NO (backs away/draw)
+        //   marketIsHome + predictedResult=draw     → NO (draw covered by NO)
+        //   marketIsAway + predictedResult=away_win → YES
+        //   else NO
+        let recommendedBet: any = null;
+        if (chosenMarket && marketTeamId != null) {
+          const marketIsHome = marketTeamId === r.homeTeamId;
+          const marketTeamName = marketIsHome ? homeName : awayName;
+          const otherTeamName = marketIsHome ? awayName : homeName;
+          const wantYes =
+            (marketIsHome && pred.predictedResult === 'home_win') ||
+            (!marketIsHome && pred.predictedResult === 'away_win');
+          const outcome = wantYes ? 'Yes' : 'No';
+          const backs = wantYes
+            ? marketTeamName
+            : otherTeamName != null
+              ? `${otherTeamName} or Draw`
+              : 'No';
+          const mid = chosenMarket.midpoints?.[wantYes ? 0 : 1];
+          const outPrice = chosenMarket.outcomePrices?.[wantYes ? 0 : 1];
+          const impliedPrice =
+            mid != null
+              ? Number(mid)
+              : outPrice != null
+                ? Number(outPrice)
+                : null;
+
+          // Our implied probability for this bet.
+          // YES = the market team wins; NO = market team doesn't win
+          // (draw + other side win).
+          const homeWinProb = Number(pred.homeWinProb ?? 0);
+          const drawProb = Number(pred.drawProb ?? 0);
+          const awayWinProb = Number(pred.awayWinProb ?? 0);
+          let ourProb = 0;
+          if (wantYes) {
+            ourProb = marketIsHome ? homeWinProb : awayWinProb;
+          } else {
+            ourProb = marketIsHome
+              ? drawProb + awayWinProb
+              : drawProb + homeWinProb;
+          }
+          const edge =
+            impliedPrice != null ? Number((ourProb - impliedPrice).toFixed(4)) : null;
+
+          recommendedBet = {
+            outcome,
+            backs,
+            impliedPrice:
+              impliedPrice != null ? Number(impliedPrice.toFixed(4)) : null,
+            ourProbability: Number(ourProb.toFixed(4)),
+            edge,
+          };
+        }
+
+        return {
+          fixture: {
+            id: r.fixtureId,
+            date: r.fixtureDate,
+            status: r.fixtureStatus,
+            statusLong: r.fixtureStatusLong,
+            goalsHome: r.goalsHome,
+            goalsAway: r.goalsAway,
+            league: {
+              id: r.leagueId,
+              name: r.leagueName,
+              country: r.leagueCountry,
+            },
+            homeTeam: homeTeam
+              ? {
+                  id: r.homeTeamId,
+                  name: homeTeam.name,
+                  shortName: homeTeam.shortName,
+                  logo: homeTeam.logo,
+                }
+              : { id: r.homeTeamId, name: null, logo: null },
+            awayTeam: awayTeam
+              ? {
+                  id: r.awayTeamId,
+                  name: awayTeam.name,
+                  shortName: awayTeam.shortName,
+                  logo: awayTeam.logo,
+                }
+              : { id: r.awayTeamId, name: null, logo: null },
+          },
+          prediction: {
+            id: pred.id,
+            homeWinProb: Number(pred.homeWinProb),
+            drawProb: Number(pred.drawProb),
+            awayWinProb: Number(pred.awayWinProb),
+            predictedResult: pred.predictedResult,
+            confidence: pred.confidence,
+            source: pred.source,
+            thresholdMode: pred.thresholdMode,
+            predictionStatus: pred.predictionStatus,
+            actualResult: pred.actualResult,
+            wasCorrect: pred.wasCorrect,
+            probabilityAccuracy:
+              pred.probabilityAccuracy != null
+                ? Number(pred.probabilityAccuracy)
+                : null,
+            createdAt: pred.createdAt,
+            updatedAt: pred.updatedAt,
+          },
+          signal: this.formatSmartMoneyView(signal, {
+            homeTeamId: r.homeTeamId,
+            awayTeamId: r.awayTeamId,
+            homeName,
+            awayName,
+            marketTeamId,
+          }),
+          polymarket: chosenMarket
+            ? {
+                conditionId: chosenMarket.conditionId,
+                marketQuestion: chosenMarket.marketQuestion,
+                marketUrl,
+                eventUrl,
+                url: marketUrl ?? eventUrl,
+                recommendedBet,
+              }
+            : null,
+        };
+      })
+      .filter((p): p is NonNullable<typeof p> => p != null);
+
+    // Apply minEdge post-enrichment (depends on recommendedBet.edge)
+    const edgeFiltered =
+      filters.minEdge != null
+        ? picks.filter(
+            (p) =>
+              p.polymarket?.recommendedBet?.edge != null &&
+              p.polymarket.recommendedBet.edge >= (filters.minEdge as number),
+          )
+        : picks;
+
+    return {
+      filters,
+      total: Number(countRows[0]?.count ?? 0),
+      picks: edgeFiltered,
+    };
+  }
+
+  /**
    * Fetch the persisted smart-money-only prediction for a fixture, or
    * null if none exists. Separate table from the main `predictions`, so
    * LLM predictions and smart-money predictions never mix.
