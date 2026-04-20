@@ -291,13 +291,19 @@ export class SmartMoneySignalService {
       sharpDollarsOutcome1: dollars1,
       outcome0Name,
       outcome1Name,
-      // All qualifying sharps, sorted hottest-first (recent wins), not
-      // bet size. No cap — consumers get the full list so they can
-      // display or filter as they like.
+      // All qualifying sharps, sorted hottest-first by recent form.
+      // Priority:
+      //   1. last10Wins DESC   — most recent form dominates
+      //   2. last20Wins DESC   — broader recent form as tiebreaker
+      //   3. currentWinStreak DESC
+      //   4. lifetimePnl DESC  — final tiebreak
       topSharps: independent.sort((a, b) => {
-        const aw = a.last10Wins ?? -1;
-        const bw = b.last10Wins ?? -1;
-        if (aw !== bw) return bw - aw;
+        const a10 = a.last10Wins ?? -1;
+        const b10 = b.last10Wins ?? -1;
+        if (a10 !== b10) return b10 - a10;
+        const a20 = a.last20Wins ?? -1;
+        const b20 = b.last20Wins ?? -1;
+        if (a20 !== b20) return b20 - a20;
         if (a.currentWinStreak !== b.currentWinStreak) {
           return b.currentWinStreak - a.currentWinStreak;
         }
@@ -317,16 +323,52 @@ export class SmartMoneySignalService {
    *   last10WinRate 0.5 (or unknown) → ~1.0
    *   last10WinRate 0.0 + no streak  → ~0.5
    */
+  /**
+   * Per-sharp vote weight for leanScore aggregation.
+   *
+   * Recent form is the single most predictive signal of active skill in
+   * prediction markets — more than lifetime PnL or ROI. A wallet that
+   * went 8-2 in its last 10 and 16-4 in its last 20 is almost certainly
+   * reading the current market correctly; a 1/10 whale is likely either
+   * slumping, on tilt, or over-extended in markets they don't
+   * specialise in. So we weight aggressively on recent form.
+   *
+   * Formula (range 0.15..2.5):
+   *
+   *   last10Score  = last10WinRate (null → 0.5 neutral)     // 0..1
+   *   last20Score  = last20WinRate (null → 0.5 neutral)     // 0..1
+   *   formScore    = (2·last10 + last20) / 3                // 0..1, last10 weighted 2x
+   *   streakBonus  = min(1, currentWinStreak / 10)          // 0..1
+   *   combined     = (5·formScore + streakBonus) / 6        // 0..1, form dominates
+   *   weight       = 0.15 + 2.35·combined                   // 0.15..2.5
+   *
+   * Key ratios:
+   *   10/10 + 20/20 + streak 10   → weight ~2.50 (elite hot hand)
+   *   9/10  + 19/20 + streak 0    → weight ~2.15
+   *   8/10  + 16/20 + streak 0    → weight ~1.92
+   *   5/10  + 10/20 + streak 0    → weight ~1.32 (neutral)
+   *   2/10  + 3/20  + streak 0    → weight ~0.60 (cold)
+   *   1/10  + 8/20  + streak 0    → weight ~0.65
+   *   0/10  + 0/20  + streak 0    → weight ~0.15 (ice cold, near-zero vote)
+   *
+   * So a hot wallet (9/10) counts roughly 3.3x a cold one (2/10) and
+   * ~14x an ice-cold one (0/10). The previous formula only had a ~2.5x
+   * spread, which let $500k of cold-whale dollars outvote $40k of
+   * hot-hand dollars.
+   */
   private sharpVoteWeight(s: {
     last10WinRate: number;
     last10Wins: number | null;
+    last20WinRate: number;
+    last20Wins: number | null;
     currentWinStreak: number;
   }): number {
-    const formComponent =
-      s.last10Wins != null ? s.last10WinRate : 0.5; // 0..1, 0.5 if unknown
-    const streakComponent = Math.min(1, s.currentWinStreak / 10); // 0..1
-    const avg = (formComponent + streakComponent) / 2; // 0..1
-    return 0.5 + avg; // 0.5..1.5
+    const last10 = s.last10Wins != null ? s.last10WinRate : 0.5;
+    const last20 = s.last20Wins != null ? s.last20WinRate : 0.5;
+    const formScore = (2 * last10 + last20) / 3;
+    const streakBonus = Math.min(1, s.currentWinStreak / 10);
+    const combined = (5 * formScore + streakBonus) / 6;
+    return 0.15 + 2.35 * combined;
   }
 
   /**
