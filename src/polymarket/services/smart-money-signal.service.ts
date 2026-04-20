@@ -105,6 +105,18 @@ export interface SmartMoneyOptions {
    *  consecutive-wins streak. Default 7 — genuinely rare in binary
    *  markets absent skill. */
   minCurrentStreak?: number;
+  /** Expand the candidate pool beyond Polymarket's 20-holder cap using
+   *  /trades aggregation (and optionally leaderboard cross-check).
+   *  Default false → use the native top-20 per outcome. */
+  expandPool?: boolean;
+  /** Target number of candidate holders per outcome when expandPool is
+   *  true. Default 100. The signal still filters aggressively after
+   *  expansion — this sets the haystack, not the hay. */
+  targetHoldersPerOutcome?: number;
+  /** Include a leaderboard cross-check when expanding — more expensive
+   *  (~100 extra HTTP calls to /positions) but surfaces proven sharps
+   *  below the top-20 holder cutoff. Default false. */
+  includeLeaderboardInPool?: boolean;
 }
 
 /** Aggregated lifetime stats for a single wallet, used by the sharp
@@ -133,6 +145,9 @@ export class SmartMoneySignalService {
     correlationThreshold: 0.15,
     minLast10WinRate: 0.8,
     minCurrentStreak: 7,
+    expandPool: false,
+    targetHoldersPerOutcome: 100,
+    includeLeaderboardInPool: false,
   };
 
   constructor(private readonly data: PolymarketDataService) {}
@@ -149,8 +164,14 @@ export class SmartMoneySignalService {
   ): Promise<SmartMoneySignal> {
     const cfg = { ...this.DEFAULTS, ...opts };
 
-    // 1. Fetch top holders for both outcomes (Polymarket caps at 20/outcome).
-    const holdersByOutcome = await this.data.getTopHolders(conditionId);
+    // 1. Fetch holders for both outcomes. Native /holders caps at 20/outcome;
+    //    expandPool widens the pool via /trades (+ optional leaderboard).
+    const holdersByOutcome = cfg.expandPool
+      ? await this.data.getExpandedHolders(conditionId, {
+          targetPerOutcome: cfg.targetHoldersPerOutcome,
+          includeLeaderboard: cfg.includeLeaderboardInPool,
+        })
+      : await this.data.getTopHolders(conditionId);
     if (holdersByOutcome.length < 2) {
       // Either market doesn't exist or only one outcome has holders — no
       // meaningful signal either way.

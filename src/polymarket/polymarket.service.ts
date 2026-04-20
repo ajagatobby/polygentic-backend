@@ -774,14 +774,28 @@ export class PolymarketService implements OnModuleInit {
     //            surface *some* sharps (e.g. a single 7/10 hot hand on a
     //            mid-ROI wallet) when the strict pool comes back empty.
     // If both passes fail, the caller falls back to the market midpoint.
+    //
+    // Pool expansion: on persist (POST) we widen the candidate pool past
+    // Polymarket's 20-holder cap via /trades aggregation + leaderboard
+    // cross-check. GETs stay on the cheaper native /holders query.
+    const poolOptions = options.persist
+      ? {
+          expandPool: true,
+          targetHoldersPerOutcome: 100,
+          includeLeaderboardInPool: true,
+        }
+      : {};
+
     let signal = await this.smartMoneySignalService.computeSignal(
       chosen.conditionId,
+      poolOptions,
     );
     let thresholdMode: 'strict' | 'relaxed' = 'strict';
     if (signal.leanScore == null) {
       const relaxed = await this.smartMoneySignalService.computeSignal(
         chosen.conditionId,
         {
+          ...poolOptions,
           minLifetimePnl: 10_000,
           minLifetimePnlWithStreak: 5_000,
           minLifetimeRoi: 0.05,

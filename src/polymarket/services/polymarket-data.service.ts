@@ -311,6 +311,181 @@ export class PolymarketDataService {
   }
 
   /**
+   * Expanded holder pool for a market — breaks past Polymarket's 20-per-
+   * outcome cap on `/holders` by unioning with traders derived from
+   * `/trades` (reconstructed net positions) and optionally the global
+   * leaderboard cross-checked against this specific market.
+   *
+   * Returns the same `HoldersByOutcome[]` shape as `getTopHolders` so
+   * downstream code is a drop-in swap.
+   */
+  async getExpandedHolders(
+    conditionId: string,
+    opts: {
+      targetPerOutcome?: number;
+      includeLeaderboard?: boolean;
+      tradeSampleSize?: number;
+      leaderboardSize?: number;
+    } = {},
+  ): Promise<HoldersByOutcome[]> {
+    const target = opts.targetPerOutcome ?? 100;
+    const tradeSample = opts.tradeSampleSize ?? 1000;
+    const leaderboardSize = Math.min(200, opts.leaderboardSize ?? 100);
+
+    // Start with the native top-20 per outcome.
+    const base = await this.getTopHolders(conditionId);
+    if (base.length < 2) return base;
+
+    // Build a map keyed by wallet+outcomeIndex so we can dedup and merge.
+    const merged = new Map<string, PolymarketHolder>();
+    for (const outcome of base) {
+      for (const h of outcome.holders) {
+        merged.set(`${h.proxyWallet}:${h.outcomeIndex}`, h);
+      }
+    }
+
+    // Token → outcomeIndex map for trade reconstruction.
+    const tokenToOutcome = new Map<string, number>();
+    for (const outcome of base) {
+      const idx = outcome.holders[0]?.outcomeIndex;
+      if (idx != null) tokenToOutcome.set(outcome.token, idx);
+    }
+
+    // Augment with /trades. Aggregate net shares (BUY − SELL) per
+    // wallet+outcome. Only add wallets with positive net positions that
+    // aren't already in the top-20.
+    try {
+      const trades = await this.getTrades(conditionId, { limit: tradeSample });
+      const netByKey = new Map<
+        string,
+        {
+          wallet: string;
+          outcomeIndex: number;
+          netShares: number;
+          name: string;
+          pseudonym: string;
+          asset: string;
+        }
+      >();
+      for (const t of trades) {
+        const key = `${t.proxyWallet}:${t.outcomeIndex}`;
+        const prev = netByKey.get(key) ?? {
+          wallet: t.proxyWallet,
+          outcomeIndex: t.outcomeIndex,
+          netShares: 0,
+          name: t.name ?? '',
+          pseudonym: t.pseudonym ?? '',
+          asset: t.asset,
+        };
+        prev.netShares += t.side === 'BUY' ? t.size : -t.size;
+        netByKey.set(key, prev);
+      }
+      for (const [key, t] of netByKey) {
+        if (t.netShares <= 0) continue;
+        if (merged.has(key)) continue;
+        merged.set(key, {
+          proxyWallet: t.wallet,
+          bio: '',
+          asset: t.asset,
+          pseudonym: t.pseudonym,
+          amount: t.netShares,
+          displayUsernamePublic: true,
+          outcomeIndex: t.outcomeIndex,
+          name: t.name,
+          profileImage: '',
+          profileImageOptimized: '',
+          verified: false,
+        });
+      }
+    } catch (err) {
+      this.logger.warn(
+        `getExpandedHolders: trades augmentation failed for ${conditionId}: ${
+          (err as Error).message
+        }`,
+      );
+    }
+
+    // Optional leaderboard cross-check: pull top N global leaderboard
+    // wallets and check each for a current position on this market. More
+    // expensive (N × /positions) but surfaces proven sharps that sit just
+    // below the top-20 holder cutoff.
+    if (opts.includeLeaderboard) {
+      try {
+        // Leaderboard is capped at 50 per page; offset up to leaderboardSize.
+        const pages = Math.ceil(leaderboardSize / 50);
+        const leaderboardPages = await Promise.all(
+          Array.from({ length: pages }, (_, i) =>
+            this.getLeaderboard({
+              category: 'OVERALL',
+              timePeriod: 'ALL',
+              orderBy: 'PNL',
+              limit: 50,
+              offset: i * 50,
+            }),
+          ),
+        );
+        const leaderboard = leaderboardPages.flat().slice(0, leaderboardSize);
+
+        // Check positions for each wallet in parallel (cached, 30min TTL).
+        const positionChecks = await Promise.all(
+          leaderboard.map((lb) =>
+            this.getUserPositions(lb.proxyWallet, { limit: 200 }).catch(
+              () => [] as UserPosition[],
+            ),
+          ),
+        );
+
+        for (let i = 0; i < leaderboard.length; i++) {
+          const lb = leaderboard[i];
+          const userPositions = positionChecks[i];
+          const relevant = userPositions.filter(
+            (p) => p.conditionId === conditionId && p.size > 0,
+          );
+          for (const p of relevant) {
+            const key = `${p.proxyWallet}:${p.outcomeIndex}`;
+            if (merged.has(key)) continue;
+            merged.set(key, {
+              proxyWallet: p.proxyWallet,
+              bio: '',
+              asset: p.asset,
+              pseudonym: lb.userName ?? '',
+              amount: p.size,
+              displayUsernamePublic: true,
+              outcomeIndex: p.outcomeIndex,
+              name: lb.userName ?? '',
+              profileImage: lb.profileImage ?? '',
+              profileImageOptimized: lb.profileImage ?? '',
+              verified: lb.verifiedBadge ?? false,
+            });
+          }
+        }
+      } catch (err) {
+        this.logger.warn(
+          `getExpandedHolders: leaderboard augmentation failed for ${conditionId}: ${
+            (err as Error).message
+          }`,
+        );
+      }
+    }
+
+    // Rebuild the `HoldersByOutcome` shape. Rank by amount desc, take
+    // top `target` per outcome.
+    const byOutcome = new Map<number, PolymarketHolder[]>();
+    for (const h of merged.values()) {
+      const list = byOutcome.get(h.outcomeIndex) ?? [];
+      list.push(h);
+      byOutcome.set(h.outcomeIndex, list);
+    }
+
+    return base.map((outcome) => {
+      const idx = outcome.holders[0]?.outcomeIndex ?? 0;
+      const all = byOutcome.get(idx) ?? [];
+      all.sort((a, b) => b.amount - a.amount);
+      return { token: outcome.token, holders: all.slice(0, target) };
+    });
+  }
+
+  /**
    * Drop every cache entry mentioning `conditionId` so the next lookup
    * hits Polymarket fresh. Used when a caller explicitly asks for live
    * data (e.g. a POST that needs the newest holder positions).
