@@ -765,11 +765,22 @@ export class PolymarketService implements OnModuleInit {
     }
 
     // Pre-compute sort comparator + limit once — applied per outcome.
+    // Map the short sort key to the actual field name on the holder
+    // object (e.g. sortBy=streak → currentWinStreak).
+    const sortFieldMap: Record<string, string> = {
+      amount: 'amount',
+      pnl: 'lifetimePnl',
+      roi: 'lifetimeRoi',
+      last10Wins: 'last10Wins',
+      last20Wins: 'last20Wins',
+      streak: 'currentWinStreak',
+    };
     const sortBy = opts.sortBy ?? 'amount';
+    const sortField = sortFieldMap[sortBy] ?? 'amount';
     const dir = opts.sortOrder === 'asc' ? 1 : -1;
     const cmp = (a: any, b: any) => {
-      const av = Number(a[sortBy] ?? 0);
-      const bv = Number(b[sortBy] ?? 0);
+      const av = Number(a[sortField] ?? 0);
+      const bv = Number(b[sortField] ?? 0);
       if (av === bv) return 0;
       return av > bv ? dir : -dir;
     };
