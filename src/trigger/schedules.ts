@@ -269,13 +269,15 @@ export const polymarketTradeSchedule = schedules.task({
 });
 
 /**
- * Every 10 minutes: poll every active followed Polymarket wallet,
- * detect new positions, and (if copy_enabled on that wallet) auto-place
- * matching CLOB orders.
+ * Every 5 minutes: trigger the copy-trader sync. The task itself
+ * self-throttles via copy_trader_config.sync_interval_minutes — this
+ * cron is the ceiling, not the floor. Admins can tune the actual
+ * cadence (1-60 min) via PATCH /api/polymarket/copy-traders/config
+ * without redeploying.
  */
 export const copyTraderSyncSchedule = schedules.task({
   id: 'scheduled-copy-trader-sync',
-  cron: '*/10 * * * *',
+  cron: '*/5 * * * *',
   run: async () => {
     logger.info('Scheduled: copy-trader sync');
     const handle = await copyTraderSyncTask.trigger(undefined as void);

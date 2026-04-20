@@ -33,6 +33,105 @@ export class CopyTraderService {
     private readonly smartMoneyService: SmartMoneySignalService,
   ) {}
 
+  // ─── Config ────────────────────────────────────────────────────────
+
+  async getConfig() {
+    const rows = await this.db
+      .select()
+      .from(schema.copyTraderConfig)
+      .where(eq(schema.copyTraderConfig.profile, 'default'))
+      .limit(1);
+    if (rows.length > 0) return rows[0];
+    // Seed-if-missing so the consumer always gets a usable row.
+    const [inserted] = await this.db
+      .insert(schema.copyTraderConfig)
+      .values({ profile: 'default' })
+      .onConflictDoNothing({ target: schema.copyTraderConfig.profile })
+      .returning();
+    if (inserted) return inserted;
+    // Row existed between check and insert — re-read.
+    const [row] = await this.db
+      .select()
+      .from(schema.copyTraderConfig)
+      .where(eq(schema.copyTraderConfig.profile, 'default'))
+      .limit(1);
+    return row;
+  }
+
+  async updateConfig(
+    patch: Partial<{
+      enabled: boolean;
+      syncIntervalMinutes: number;
+      defaultSizingMode: 'fixed' | 'fraction' | 'kelly';
+      defaultSizingValue: number;
+      defaultMaxPositionUsd: number;
+      maxDailyTrades: number;
+      maxDailySpendUsd: number;
+      priceSlippageTolerance: number;
+      maxConsecutiveLosses: number;
+    }>,
+  ) {
+    await this.getConfig(); // ensure row exists
+    const set: any = { updatedAt: new Date() };
+    if (patch.enabled !== undefined) set.enabled = patch.enabled;
+    if (patch.syncIntervalMinutes !== undefined)
+      set.syncIntervalMinutes = Math.max(1, Math.round(patch.syncIntervalMinutes));
+    if (patch.defaultSizingMode !== undefined)
+      set.defaultSizingMode = patch.defaultSizingMode;
+    if (patch.defaultSizingValue !== undefined)
+      set.defaultSizingValue = String(patch.defaultSizingValue);
+    if (patch.defaultMaxPositionUsd !== undefined)
+      set.defaultMaxPositionUsd = String(patch.defaultMaxPositionUsd);
+    if (patch.maxDailyTrades !== undefined)
+      set.maxDailyTrades = Math.max(0, Math.round(patch.maxDailyTrades));
+    if (patch.maxDailySpendUsd !== undefined)
+      set.maxDailySpendUsd = String(patch.maxDailySpendUsd);
+    if (patch.priceSlippageTolerance !== undefined)
+      set.priceSlippageTolerance = String(patch.priceSlippageTolerance);
+    if (patch.maxConsecutiveLosses !== undefined)
+      set.maxConsecutiveLosses = Math.max(
+        0,
+        Math.round(patch.maxConsecutiveLosses),
+      );
+
+    const [row] = await this.db
+      .update(schema.copyTraderConfig)
+      .set(set)
+      .where(eq(schema.copyTraderConfig.profile, 'default'))
+      .returning();
+    return row;
+  }
+
+  /** Count today's executed + paper copy trades and total USD spent. */
+  private async getTodayStats(): Promise<{
+    count: number;
+    spendUsd: number;
+  }> {
+    const start = new Date();
+    start.setUTCHours(0, 0, 0, 0);
+    const rows = await this.db
+      .select({
+        id: schema.copiedTraderTrades.id,
+        ourPositionSizeUsd: schema.copiedTraderTrades.ourPositionSizeUsd,
+      })
+      .from(schema.copiedTraderTrades)
+      .where(
+        and(
+          gte(schema.copiedTraderTrades.detectedAt, start),
+          inArray(schema.copiedTraderTrades.executionStatus, [
+            'executed',
+            'paper',
+          ]),
+        ),
+      );
+    const count = rows.length;
+    const spendUsd = rows.reduce(
+      (s: number, r: any) => s + Number(r.ourPositionSizeUsd ?? 0),
+      0,
+    );
+    return { count, spendUsd };
+  }
+
   // ─── Follow-list CRUD ──────────────────────────────────────────────
 
   async follow(input: {
@@ -180,7 +279,7 @@ export class CopyTraderService {
    * it twice without new trades is a no-op except for snapshot
    * last_seen_at bumps.
    */
-  async sync(): Promise<{
+  async sync(opts: { force?: boolean } = {}): Promise<{
     scanned: number;
     newTradesDetected: number;
     executed: number;
@@ -188,8 +287,49 @@ export class CopyTraderService {
     skipped: number;
     failed: number;
     durationMs: number;
+    skippedReason?: string;
   }> {
     const startedAt = Date.now();
+    const config = await this.getConfig();
+
+    // Master kill-switch
+    if (!config.enabled && !opts.force) {
+      return {
+        scanned: 0,
+        newTradesDetected: 0,
+        executed: 0,
+        paper: 0,
+        skipped: 0,
+        failed: 0,
+        durationMs: Date.now() - startedAt,
+        skippedReason: 'copy_trader_config.enabled=false',
+      };
+    }
+
+    // Rate-limit to sync_interval_minutes even if the cron fires faster.
+    if (!opts.force && config.lastSyncAt) {
+      const elapsedMs = Date.now() - new Date(config.lastSyncAt).getTime();
+      const minMs = Number(config.syncIntervalMinutes) * 60_000;
+      if (elapsedMs < minMs) {
+        return {
+          scanned: 0,
+          newTradesDetected: 0,
+          executed: 0,
+          paper: 0,
+          skipped: 0,
+          failed: 0,
+          durationMs: Date.now() - startedAt,
+          skippedReason: `within sync_interval_minutes window (${Math.round(elapsedMs / 60_000)}min since last sync, interval=${config.syncIntervalMinutes}min)`,
+        };
+      }
+    }
+
+    // Mark the sync start — other parallel calls within window will bail.
+    await this.db
+      .update(schema.copyTraderConfig)
+      .set({ lastSyncAt: new Date() })
+      .where(eq(schema.copyTraderConfig.profile, 'default'));
+
     const traders = await this.list({ activeOnly: true });
     if (traders.length === 0) {
       return {
@@ -214,7 +354,7 @@ export class CopyTraderService {
     // the data-api with a burst of positions calls.
     for (const trader of traders) {
       try {
-        const result = await this.syncTrader(trader);
+        const result = await this.syncTrader(trader, config);
         newTradesDetected += result.newTrades.length;
         for (const t of result.newTrades) {
           if (t.executionStatus === 'executed') executed++;
@@ -247,9 +387,11 @@ export class CopyTraderService {
    */
   async syncTrader(
     trader: any,
+    config?: any,
   ): Promise<{
     newTrades: Array<{ executionStatus: string }>;
   }> {
+    const cfg = config ?? (await this.getConfig());
     const wallet = (trader.proxyWallet as string).toLowerCase();
 
     const positions = await this.data.getUserPositions(wallet, { limit: 200 });
@@ -336,10 +478,12 @@ export class CopyTraderService {
       if (tradeType == null) continue; // no change worth logging
 
       // Detected trade — log it and maybe execute.
-      const detection = await this.recordAndMaybeExecute(trader, p, {
-        tradeType,
-        sizeDelta,
-      });
+      const detection = await this.recordAndMaybeExecute(
+        trader,
+        p,
+        { tradeType, sizeDelta },
+        cfg,
+      );
       newTrades.push({ executionStatus: detection.executionStatus });
     }
 
@@ -362,6 +506,7 @@ export class CopyTraderService {
     trader: any,
     position: UserPosition,
     delta: { tradeType: 'new' | 'increased'; sizeDelta: number },
+    config: any,
   ): Promise<{ executionStatus: string }> {
     const wallet = trader.proxyWallet as string;
     const copyEnabled = trader.copyEnabled === true;
@@ -387,13 +532,46 @@ export class CopyTraderService {
       })
       .returning();
 
-    // If copy is off for this trader, we just want a detection log.
+    // If copy is off globally OR for this trader, just log the detection.
+    if (!config.enabled) {
+      await this.db
+        .update(schema.copiedTraderTrades)
+        .set({
+          executionStatus: 'skipped',
+          executionReason: 'copy_trader_config.enabled=false (global)',
+        })
+        .where(eq(schema.copiedTraderTrades.id, row.id));
+      return { executionStatus: 'skipped' };
+    }
     if (!copyEnabled) {
       await this.db
         .update(schema.copiedTraderTrades)
         .set({
           executionStatus: 'skipped',
           executionReason: 'copy_enabled=false — detection only',
+        })
+        .where(eq(schema.copiedTraderTrades.id, row.id));
+      return { executionStatus: 'skipped' };
+    }
+
+    // Daily caps — across all followed wallets combined.
+    const today = await this.getTodayStats();
+    if (today.count >= Number(config.maxDailyTrades)) {
+      await this.db
+        .update(schema.copiedTraderTrades)
+        .set({
+          executionStatus: 'skipped',
+          executionReason: `Daily trade cap reached (${today.count}/${config.maxDailyTrades})`,
+        })
+        .where(eq(schema.copiedTraderTrades.id, row.id));
+      return { executionStatus: 'skipped' };
+    }
+    if (today.spendUsd >= Number(config.maxDailySpendUsd)) {
+      await this.db
+        .update(schema.copiedTraderTrades)
+        .set({
+          executionStatus: 'skipped',
+          executionReason: `Daily spend cap reached ($${today.spendUsd.toFixed(2)} / $${Number(config.maxDailySpendUsd).toFixed(2)})`,
         })
         .where(eq(schema.copiedTraderTrades.id, row.id));
       return { executionStatus: 'skipped' };
@@ -454,10 +632,16 @@ export class CopyTraderService {
       }
     }
 
-    // Compute our position size based on the trader's sizing config.
-    const sizingMode = (trader.sizingMode as string) ?? 'fraction';
-    const sizingValue = Number(trader.sizingValue ?? 0.005);
-    const maxPositionUsd = Number(trader.maxPositionUsd ?? 50);
+    // Compute our position size. Per-trader setting wins; config defaults
+    // fill in gaps so a wallet added with `{proxyWallet}` alone still works.
+    const sizingMode =
+      (trader.sizingMode as string) ?? config.defaultSizingMode ?? 'fraction';
+    const sizingValue = Number(
+      trader.sizingValue ?? config.defaultSizingValue ?? 0.005,
+    );
+    const maxPositionUsd = Number(
+      trader.maxPositionUsd ?? config.defaultMaxPositionUsd ?? 50,
+    );
     const followedDollars =
       delta.sizeDelta * Number(position.avgPrice ?? position.curPrice ?? 0.5);
 
@@ -481,6 +665,26 @@ export class CopyTraderService {
       0.01,
       Math.min(0.99, Number(position.avgPrice ?? 0.5)),
     );
+
+    // Slippage guard: if the current market is far from the followed
+    // wallet's avg, skip. position.curPrice is set by the data-api.
+    const currentPrice = Number(position.curPrice ?? targetPrice);
+    const slippageTolerance = Number(config.priceSlippageTolerance ?? 0.05);
+    if (slippageTolerance > 0 && targetPrice > 0) {
+      const drift = Math.abs(currentPrice - targetPrice) / targetPrice;
+      if (drift > slippageTolerance) {
+        await this.db
+          .update(schema.copiedTraderTrades)
+          .set({
+            executionStatus: 'skipped',
+            executionReason: `Price drift ${(drift * 100).toFixed(2)}% > tolerance ${(slippageTolerance * 100).toFixed(2)}% (trader paid $${targetPrice.toFixed(4)}, market now $${currentPrice.toFixed(4)})`,
+            ourPositionSizeUsd: String(ourPositionUsd),
+          })
+          .where(eq(schema.copiedTraderTrades.id, row.id));
+        return { executionStatus: 'skipped' };
+      }
+    }
+
     const tokenSize = ourPositionUsd / targetPrice;
 
     try {
@@ -527,7 +731,44 @@ export class CopyTraderService {
           executionReason: (err as Error).message,
         })
         .where(eq(schema.copiedTraderTrades.id, row.id));
+      await this.maybeCircuitBreak(config);
       return { executionStatus: 'failed' };
     }
+  }
+
+  /**
+   * Circuit breaker. If the last N executions all have
+   * execution_status='failed', flip enabled=false on the config. Admin
+   * has to explicitly re-enable. Default N = 5 (configurable).
+   */
+  private async maybeCircuitBreak(config: any): Promise<void> {
+    const maxLosses = Number(config.maxConsecutiveLosses ?? 0);
+    if (maxLosses <= 0) return;
+
+    const recent = await this.db
+      .select({ executionStatus: schema.copiedTraderTrades.executionStatus })
+      .from(schema.copiedTraderTrades)
+      .where(
+        inArray(schema.copiedTraderTrades.executionStatus, [
+          'executed',
+          'failed',
+        ]),
+      )
+      .orderBy(desc(schema.copiedTraderTrades.detectedAt))
+      .limit(maxLosses);
+
+    if (recent.length < maxLosses) return;
+    const allFailed = recent.every(
+      (r: any) => r.executionStatus === 'failed',
+    );
+    if (!allFailed) return;
+
+    await this.db
+      .update(schema.copyTraderConfig)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(schema.copyTraderConfig.profile, 'default'));
+    this.logger.error(
+      `Copy-trader circuit breaker tripped — ${maxLosses} consecutive failed executions. Config.enabled set to false.`,
+    );
   }
 }

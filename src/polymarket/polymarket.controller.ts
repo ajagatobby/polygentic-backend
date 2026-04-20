@@ -338,6 +338,101 @@ export class PolymarketController {
 
   // ─── Copy traders ──────────────────────────────────────────────────
 
+  @Get('copy-traders/config')
+  @ApiOperation({
+    summary: 'Get global copy-trader settings',
+    description:
+      'Returns the runtime-tunable config row (enabled, sync interval, ' +
+      'default sizing, daily caps, slippage tolerance, circuit breaker).',
+  })
+  async getCopyTraderConfig() {
+    return this.copyTraderService.getConfig();
+  }
+
+  @Roles('admin')
+  @Patch('copy-traders/config')
+  @ApiOperation({
+    summary: '[Admin] Update global copy-trader settings',
+    description:
+      'Partial update — any field can be changed at runtime. enabled=false ' +
+      'is the kill switch; the sync task no-ops regardless of per-trader ' +
+      'flags. sync_interval_minutes controls cadence (cron fires every 5 min ' +
+      'but task bails if within window). Daily caps and slippage tolerance ' +
+      'apply across all followed wallets.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        enabled: {
+          type: 'boolean',
+          description: 'Master kill switch. Default true.',
+        },
+        syncIntervalMinutes: {
+          type: 'integer',
+          description:
+            'Minimum minutes between syncs. Default 10. Cron fires every 5 min; task checks this.',
+          example: 10,
+        },
+        defaultSizingMode: {
+          type: 'string',
+          enum: ['fixed', 'fraction', 'kelly'],
+          description: 'Fallback when per-trader mode is not set.',
+        },
+        defaultSizingValue: {
+          type: 'number',
+          description:
+            'Fallback sizing value. fraction 0.005 = 0.5% of followed size.',
+          example: 0.005,
+        },
+        defaultMaxPositionUsd: {
+          type: 'number',
+          description: 'Fallback per-trade cap. Default 50.',
+          example: 50,
+        },
+        maxDailyTrades: {
+          type: 'integer',
+          description:
+            'Cross-wallet trade count cap per UTC day. Default 50.',
+          example: 50,
+        },
+        maxDailySpendUsd: {
+          type: 'number',
+          description: 'Cross-wallet USD cap per UTC day. Default 500.',
+          example: 500,
+        },
+        priceSlippageTolerance: {
+          type: 'number',
+          description:
+            'Skip if market price drifted more than this fraction from followed avg. 0.05 = 5%.',
+          example: 0.05,
+        },
+        maxConsecutiveLosses: {
+          type: 'integer',
+          description:
+            'Auto-pause (flip enabled=false) after this many failed executions in a row. Default 5.',
+          example: 5,
+        },
+      },
+    },
+  })
+  async updateCopyTraderConfig(
+    @Body()
+    body: Partial<{
+      enabled: boolean;
+      syncIntervalMinutes: number;
+      defaultSizingMode: 'fixed' | 'fraction' | 'kelly';
+      defaultSizingValue: number;
+      defaultMaxPositionUsd: number;
+      maxDailyTrades: number;
+      maxDailySpendUsd: number;
+      priceSlippageTolerance: number;
+      maxConsecutiveLosses: number;
+    }>,
+  ) {
+    return this.copyTraderService.updateConfig(body);
+  }
+
   @Get('copy-traders')
   @ApiOperation({
     summary: 'List followed Polymarket wallets with per-trader copy config',

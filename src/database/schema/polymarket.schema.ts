@@ -395,6 +395,65 @@ export const smartMoneyPredictions = pgTable(
   ],
 );
 
+// ─── copy_trader_config ────────────────────────────────────────────────
+// Runtime-tunable knobs for the copy-trader system. Single-row
+// (profile='default'). Per-wallet overrides live on copied_traders.
+
+export const copyTraderConfig = pgTable(
+  'copy_trader_config',
+  {
+    id: serial('id').primaryKey(),
+    profile: varchar('profile', { length: 50 }).notNull().default('default'),
+
+    enabled: boolean('enabled').default(true).notNull(),
+    syncIntervalMinutes: integer('sync_interval_minutes')
+      .default(10)
+      .notNull(),
+
+    defaultSizingMode: varchar('default_sizing_mode', { length: 20 })
+      .default('fraction')
+      .notNull(),
+    defaultSizingValue: numeric('default_sizing_value', {
+      precision: 10,
+      scale: 6,
+    })
+      .default('0.005')
+      .notNull(),
+    defaultMaxPositionUsd: numeric('default_max_position_usd', {
+      precision: 14,
+      scale: 2,
+    })
+      .default('50')
+      .notNull(),
+
+    maxDailyTrades: integer('max_daily_trades').default(50).notNull(),
+    maxDailySpendUsd: numeric('max_daily_spend_usd', {
+      precision: 14,
+      scale: 2,
+    })
+      .default('500')
+      .notNull(),
+
+    priceSlippageTolerance: numeric('price_slippage_tolerance', {
+      precision: 5,
+      scale: 4,
+    })
+      .default('0.05')
+      .notNull(),
+
+    maxConsecutiveLosses: integer('max_consecutive_losses')
+      .default(5)
+      .notNull(),
+
+    lastSyncAt: timestamp('last_sync_at'),
+    lastSyncRunId: varchar('last_sync_run_id', { length: 255 }),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [uniqueIndex('uq_copy_trader_config_profile').on(table.profile)],
+);
+
 // ─── copied_traders ────────────────────────────────────────────────────
 // Copy-trader system: follow Polymarket wallets and (optionally)
 // auto-mirror their trades onto our CLOB account. copy_enabled is
