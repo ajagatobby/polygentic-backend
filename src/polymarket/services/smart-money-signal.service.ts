@@ -129,6 +129,9 @@ export interface LifetimeStats {
   currentWinStreak: number;
   last10WinRate: number;
   last10Wins: number | null;
+  /** Wins out of last 20 resolved positions. Null if < 20 resolved. */
+  last20Wins: number | null;
+  last20WinRate: number;
 }
 
 @Injectable()
@@ -465,6 +468,8 @@ export class SmartMoneySignalService {
         currentWinStreak: 0,
         last10WinRate: 0,
         last10Wins: null,
+        last20WinRate: 0,
+        last20Wins: null,
       };
     }
     let totalPnl = 0;
@@ -515,6 +520,16 @@ export class SmartMoneySignalService {
       last10WinRate = last10Wins / 10;
     }
 
+    // Last-20 win rate: broader form read, same gate — only meaningful
+    // when a wallet has resolved at least 20 positions.
+    let last20WinRate = 0;
+    let last20Wins: number | null = null;
+    if (resolvedWithDate.length >= 20) {
+      const last20 = resolvedWithDate.slice(0, 20);
+      last20Wins = last20.filter((r) => r.win).length;
+      last20WinRate = last20Wins / 20;
+    }
+
     return {
       totalPnl,
       totalBought,
@@ -523,6 +538,8 @@ export class SmartMoneySignalService {
       currentWinStreak,
       last10WinRate,
       last10Wins,
+      last20WinRate,
+      last20Wins,
     };
   }
 

@@ -645,10 +645,13 @@ export class PolymarketService implements OnModuleInit {
         pseudonym: string;
         amount: number;
         outcomeIndex: number;
+        outcomeName: string;
         lifetimePnl?: number;
         lifetimeRoi?: number;
         last10Wins?: number | null;
         last10WinRate?: number;
+        last20Wins?: number | null;
+        last20WinRate?: number;
         currentWinStreak?: number;
         resolvedCount?: number;
       }>;
@@ -672,6 +675,8 @@ export class PolymarketService implements OnModuleInit {
         lifetimeRoi: number;
         last10Wins: number | null;
         last10WinRate: number;
+        last20Wins: number | null;
+        last20WinRate: number;
         currentWinStreak: number;
         resolvedCount: number;
       }
@@ -694,6 +699,8 @@ export class PolymarketService implements OnModuleInit {
               roi,
               last10Wins: stats.last10Wins,
               last10WinRate: stats.last10WinRate,
+              last20Wins: stats.last20Wins,
+              last20WinRate: stats.last20WinRate,
               streak: stats.currentWinStreak,
               resolved: stats.resolvedCount,
             };
@@ -709,6 +716,8 @@ export class PolymarketService implements OnModuleInit {
           lifetimeRoi: e.roi,
           last10Wins: e.last10Wins,
           last10WinRate: e.last10WinRate,
+          last20Wins: e.last20Wins,
+          last20WinRate: e.last20WinRate,
           currentWinStreak: e.streak,
           resolvedCount: e.resolved,
         });
@@ -732,12 +741,15 @@ export class PolymarketService implements OnModuleInit {
           pseudonym: h.pseudonym ?? '',
           amount: Number(h.amount ?? 0),
           outcomeIndex: h.outcomeIndex,
+          outcomeName,
           ...(enr
             ? {
                 lifetimePnl: enr.lifetimePnl,
                 lifetimeRoi: enr.lifetimeRoi,
                 last10Wins: enr.last10Wins,
                 last10WinRate: enr.last10WinRate,
+                last20Wins: enr.last20Wins,
+                last20WinRate: enr.last20WinRate,
                 currentWinStreak: enr.currentWinStreak,
                 resolvedCount: enr.resolvedCount,
               }
