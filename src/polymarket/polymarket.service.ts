@@ -1572,6 +1572,15 @@ export class PolymarketService implements OnModuleInit {
             awayName,
             marketTeamId,
           }),
+          copyTrader: this.buildCopyTrader(signal, {
+            homeTeamId: r.homeTeamId,
+            awayTeamId: r.awayTeamId,
+            homeName,
+            awayName,
+            marketTeamId,
+            marketUrl,
+            eventUrl,
+          }),
           polymarket: chosenMarket
             ? {
                 conditionId: chosenMarket.conditionId,
@@ -1939,6 +1948,7 @@ export class PolymarketService implements OnModuleInit {
       createdAt?: Date;
     } | null;
     smartMoneySignal: any;
+    copyTrader?: any;
     marketSignal?: any;
     polymarket?: {
       marketQuestion: string;
@@ -2424,6 +2434,19 @@ export class PolymarketService implements OnModuleInit {
       ? `https://polymarket.com/event/${chosen.eventSlug}`
       : null;
 
+    const copyTrader = this.buildCopyTrader(
+      signal.leanScore != null ? signal : null,
+      {
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        homeName,
+        awayName,
+        marketTeamId,
+        marketUrl,
+        eventUrl,
+      },
+    );
+
     return {
       fixture: fixtureView,
       prediction: {
@@ -2433,6 +2456,7 @@ export class PolymarketService implements OnModuleInit {
           : {}),
       },
       smartMoneySignal: viewSignal,
+      copyTrader,
       marketSignal,
       polymarket: {
         marketQuestion: `Will ${chosen.teamName} win?`,
@@ -2469,6 +2493,112 @@ export class PolymarketService implements OnModuleInit {
     const denom = Math.min(wa.size, wb.size);
     if (denom === 0) return 0;
     return overlap / denom;
+  }
+
+  /**
+   * Build a copy-trader recommendation for a fixture's smart-money
+   * signal. Picks the single hottest qualifying sharp (by the same
+   * ordering used in topSharps: last10 → last20 → streak → PnL) and
+   * packages their exact bet as something the user can copy in one
+   * click.
+   *
+   * Returns one of three action states:
+   *
+   *   "copy"       — Top sharp aligns with the aggregate sharp lean AND
+   *                  has strong recent form. Highest-confidence follow.
+   *   "conflicted" — Top sharp disagrees with the aggregate (hot hand
+   *                  vs whale money). The user must pick a side — the
+   *                  response tells them both readings.
+   *   "weak"       — No sharp has meaningfully hot form. No good
+   *                  candidate to copy.
+   */
+  private buildCopyTrader(
+    raw: SmartMoneySignal | null,
+    ctx: {
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+      marketTeamId: number | null;
+      marketUrl: string | null;
+      eventUrl: string | null;
+    },
+  ): any {
+    if (!raw || raw.leanScore == null) return null;
+    const topSharp = raw.topSharps?.[0];
+    if (!topSharp) return null;
+
+    // Reproduce the vote-weight math so we can surface the single
+    // number the ordering is built on.
+    const last10 = topSharp.last10Wins != null ? topSharp.last10WinRate : 0.5;
+    const last20 = topSharp.last20Wins != null ? topSharp.last20WinRate : 0.5;
+    const formScore = (2 * last10 + last20) / 3;
+    const formWeight = 0.15 + 2.35 * formScore;
+    const streakBonus = Math.min(2.5, (topSharp.currentWinStreak ?? 0) * 0.25);
+    const voteWeight = Number((formWeight + streakBonus).toFixed(3));
+
+    // Decide action state based on form strength + alignment.
+    const sharpsLeanYes = raw.leanScore > 0;
+    const copyBetsYes = topSharp.outcomeIndex === 0;
+    const alignsWithAggregate = sharpsLeanYes === copyBetsYes;
+    let action: 'copy' | 'conflicted' | 'weak';
+    let reason: string;
+    if (voteWeight < 1.3) {
+      action = 'weak';
+      reason = `Top sharp has mediocre recent form (${topSharp.last10Wins ?? '—'}/10, ${topSharp.last20Wins ?? '—'}/20). No clear copy candidate — skip or wait for a sharper signal.`;
+    } else if (alignsWithAggregate) {
+      action = 'copy';
+      reason =
+        `Hottest hand (${topSharp.last10Wins}/10 recent, ${topSharp.last20Wins}/20 extended) ` +
+        `agrees with the aggregate sharp lean. Copy their bet directly — highest-confidence follow.`;
+    } else {
+      action = 'conflicted';
+      reason =
+        `Hottest hand (${topSharp.last10Wins}/10 recent, ${topSharp.last20Wins}/20 extended) ` +
+        `disagrees with the aggregate — the big money's on one side, the form's on the other. ` +
+        `Copy if you trust recent performance over dollar-weighted consensus.`;
+    }
+
+    // Map the sharp's bet back to plain-English team language.
+    const marketIsHome = ctx.marketTeamId === ctx.homeTeamId;
+    const marketTeamName = marketIsHome ? ctx.homeName : ctx.awayName;
+    const otherTeamName = marketIsHome ? ctx.awayName : ctx.homeName;
+    const betOutcome = copyBetsYes
+      ? raw.outcome0Name ?? 'Yes'
+      : raw.outcome1Name ?? 'No';
+    const betBacks = copyBetsYes
+      ? marketTeamName
+      : otherTeamName != null
+        ? `${otherTeamName} or Draw`
+        : 'No';
+
+    return {
+      wallet: topSharp.proxyWallet ?? null,
+      name: topSharp.name ?? null,
+      credentials: {
+        lifetimePnl: Number(topSharp.lifetimePnl ?? 0),
+        lifetimeRoi: Number(topSharp.lifetimeRoi ?? 0),
+        last10Wins: topSharp.last10Wins ?? null,
+        last20Wins: topSharp.last20Wins ?? null,
+        currentWinStreak: topSharp.currentWinStreak ?? 0,
+        voteWeight,
+      },
+      bet: {
+        outcome: betOutcome,
+        backs: betBacks,
+        amount: Math.round(Number(topSharp.amount ?? 0)),
+        alignsWithAggregate,
+      },
+      recommendation: {
+        action,
+        reason,
+      },
+      polymarket: {
+        url: ctx.marketUrl ?? ctx.eventUrl,
+        marketUrl: ctx.marketUrl,
+        eventUrl: ctx.eventUrl,
+      },
+    };
   }
 
   /**
