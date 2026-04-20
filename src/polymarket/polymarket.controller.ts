@@ -40,6 +40,81 @@ export class PolymarketController {
     return this.polymarketService.getPerformanceSummary();
   }
 
+  @Post('smart-money/top-picks/generate')
+  @ApiOperation({
+    summary: 'Batch-generate smart-money predictions across upcoming fixtures',
+    description:
+      'Walks fixtures in a date window and runs the predict-and-persist ' +
+      'flow for each, with bounded concurrency. Skips fixtures that ' +
+      'already have a smart_money_prediction unless forceRefresh is set. ' +
+      'Returns a per-fixture status summary. Use this to populate the ' +
+      '/top-picks endpoint for a whole slate at once instead of calling ' +
+      'POST /predict/:fixtureId one at a time.',
+  })
+  @ApiQuery({
+    name: 'dateFrom',
+    required: false,
+    type: String,
+    description: 'ISO 8601. Default: yesterday.',
+  })
+  @ApiQuery({
+    name: 'dateTo',
+    required: false,
+    type: String,
+    description: 'ISO 8601. Default: today + 7 days.',
+  })
+  @ApiQuery({ name: 'leagueId', required: false, type: Number })
+  @ApiQuery({
+    name: 'upcomingOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only fixtures where kickoff > now. Default false.',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max fixtures to process (1-200, default 50).',
+  })
+  @ApiQuery({
+    name: 'forceRefresh',
+    required: false,
+    type: Boolean,
+    description:
+      'If true, re-compute predictions even when one already exists. Default false.',
+  })
+  @ApiQuery({
+    name: 'concurrency',
+    required: false,
+    type: Number,
+    description:
+      'Parallel predictions (1-8, default 4). Higher = faster but more Polymarket load.',
+  })
+  async generateTopPicks(
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
+    @Query('leagueId') leagueId?: string,
+    @Query('upcomingOnly') upcomingOnly?: string,
+    @Query('limit') limit?: string,
+    @Query('forceRefresh') forceRefresh?: string,
+    @Query('concurrency') concurrency?: string,
+  ) {
+    const num = (v: string | undefined) => {
+      if (v == null || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    return this.polymarketService.generateTopPicksBatch({
+      dateFrom: dateFrom ? new Date(dateFrom) : undefined,
+      dateTo: dateTo ? new Date(dateTo) : undefined,
+      leagueId: num(leagueId),
+      upcomingOnly: upcomingOnly === 'true',
+      limit: num(limit),
+      skipExisting: forceRefresh !== 'true',
+      concurrency: num(concurrency),
+    });
+  }
+
   @Get('smart-money/top-picks')
   @ApiOperation({
     summary:

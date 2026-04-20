@@ -819,6 +819,220 @@ export class PolymarketService implements OnModuleInit {
    *   - No qualifying sharps backed the market (leanScore null)
    */
   /**
+   * Batch-generate smart-money predictions for a set of fixtures.
+   * Walks the fixture table within a date window, running the same
+   * predict-and-persist flow as the single-fixture POST for each one.
+   *
+   * Runs with bounded concurrency so we don't blow up Polymarket with
+   * 50 parallel requests. Skips fixtures that already have a
+   * smart_money_prediction by default — pass forceRefresh=true to
+   * re-compute them.
+   *
+   * Returns a per-fixture status array so the caller can see which
+   * fixtures were generated / skipped / missed coverage, without
+   * polluting the response with full prediction payloads.
+   */
+  async generateTopPicksBatch(options: {
+    dateFrom?: Date;
+    dateTo?: Date;
+    leagueId?: number;
+    upcomingOnly?: boolean;
+    limit?: number;
+    skipExisting?: boolean;
+    concurrency?: number;
+  }): Promise<{
+    scanned: number;
+    generated: number;
+    skipped: number;
+    failed: number;
+    noCoverage: number;
+    noSharps: number;
+    durationMs: number;
+    results: Array<{
+      fixtureId: number;
+      status:
+        | 'generated'
+        | 'skipped'
+        | 'failed'
+        | 'no-coverage'
+        | 'no-sharps';
+      predictionId?: number;
+      confidence?: number;
+      predictedResult?: string;
+      leaningTeam?: string | null;
+      source?: string;
+      reason?: string;
+      error?: string;
+    }>;
+  }> {
+    const startedAt = Date.now();
+    const limit = Math.min(200, Math.max(1, options.limit ?? 50));
+    const concurrency = Math.min(
+      8,
+      Math.max(1, options.concurrency ?? 4),
+    );
+    const skipExisting = options.skipExisting !== false;
+
+    const now = new Date();
+    const dateFrom =
+      options.dateFrom ?? new Date(now.getTime() - 1 * 86400_000);
+    const dateTo =
+      options.dateTo ?? new Date(now.getTime() + 7 * 86400_000);
+
+    // 1. Fixtures in the window
+    const fixtureConds: any[] = [
+      gte(schema.fixtures.date, dateFrom),
+      lte(schema.fixtures.date, dateTo),
+    ];
+    if (options.leagueId != null) {
+      fixtureConds.push(eq(schema.fixtures.leagueId, options.leagueId));
+    }
+    if (options.upcomingOnly) {
+      fixtureConds.push(sql`${schema.fixtures.date} > NOW()`);
+    }
+
+    const fixtures = await this.db
+      .select({
+        id: schema.fixtures.id,
+        date: schema.fixtures.date,
+        leagueId: schema.fixtures.leagueId,
+      })
+      .from(schema.fixtures)
+      .where(and(...fixtureConds))
+      .orderBy(asc(schema.fixtures.date))
+      .limit(limit);
+
+    if (fixtures.length === 0) {
+      return {
+        scanned: 0,
+        generated: 0,
+        skipped: 0,
+        failed: 0,
+        noCoverage: 0,
+        noSharps: 0,
+        durationMs: Date.now() - startedAt,
+        results: [],
+      };
+    }
+
+    // 2. Filter out fixtures that already have a prediction (skipExisting)
+    let target = fixtures;
+    const skippedList: number[] = [];
+    if (skipExisting) {
+      const existing = await this.db
+        .select({ fixtureId: schema.smartMoneyPredictions.fixtureId })
+        .from(schema.smartMoneyPredictions)
+        .where(
+          inArray(
+            schema.smartMoneyPredictions.fixtureId,
+            fixtures.map((f: any) => f.id),
+          ),
+        );
+      const existingIds = new Set(
+        existing.map((e: any) => Number(e.fixtureId)),
+      );
+      target = fixtures.filter((f: any) => {
+        if (existingIds.has(f.id)) {
+          skippedList.push(f.id);
+          return false;
+        }
+        return true;
+      });
+    }
+
+    // 3. Run predictions with bounded concurrency. Cache-first (fresh=false)
+    //    so leaderboard + positions look-ups shared across fixtures benefit
+    //    from the 30min / 1h TTL.
+    const results: Array<{
+      fixtureId: number;
+      status:
+        | 'generated'
+        | 'skipped'
+        | 'failed'
+        | 'no-coverage'
+        | 'no-sharps';
+      predictionId?: number;
+      confidence?: number;
+      predictedResult?: string;
+      leaningTeam?: string | null;
+      source?: string;
+      reason?: string;
+      error?: string;
+    }> = [];
+
+    for (const id of skippedList) {
+      results.push({ fixtureId: id, status: 'skipped' });
+    }
+
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const idx = cursor++;
+        if (idx >= target.length) return;
+        const f = target[idx];
+        try {
+          const res = await this.predictFromSmartMoney(f.id, {
+            persist: true,
+            fresh: false,
+          });
+          if (res.prediction == null) {
+            const reason = res.reason ?? 'unknown';
+            results.push({
+              fixtureId: f.id,
+              status:
+                reason === 'no-polymarket-coverage' ||
+                reason === 'no-moneyline-market' ||
+                reason === 'fixture-not-found'
+                  ? 'no-coverage'
+                  : 'no-sharps',
+              reason,
+            });
+          } else {
+            const leaningTeam =
+              (res.smartMoneySignal as any)?.sharps?.leaningTeam ?? null;
+            results.push({
+              fixtureId: f.id,
+              status: 'generated',
+              predictionId: res.prediction.id,
+              confidence: res.prediction.confidence,
+              predictedResult: res.prediction.predictedResult,
+              leaningTeam,
+              source: res.prediction.source,
+            });
+          }
+        } catch (err) {
+          results.push({
+            fixtureId: f.id,
+            status: 'failed',
+            error: (err as Error).message,
+          });
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: concurrency }, () => worker()),
+    );
+
+    const generated = results.filter((r) => r.status === 'generated').length;
+    const skipped = results.filter((r) => r.status === 'skipped').length;
+    const failed = results.filter((r) => r.status === 'failed').length;
+    const noCoverage = results.filter((r) => r.status === 'no-coverage').length;
+    const noSharps = results.filter((r) => r.status === 'no-sharps').length;
+
+    return {
+      scanned: fixtures.length,
+      generated,
+      skipped,
+      failed,
+      noCoverage,
+      noSharps,
+      durationMs: Date.now() - startedAt,
+      results: results.sort((a, b) => a.fixtureId - b.fixtureId),
+    };
+  }
+
+  /**
    * Top smart-money picks — the highest-confidence standalone
    * smart-money predictions across our fixtures, with deep filtering
    * and inline Polymarket links.
