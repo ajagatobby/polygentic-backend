@@ -614,6 +614,155 @@ export class PolymarketService implements OnModuleInit {
    *   - Polymarket has no market for this fixture
    *   - No qualifying sharps backed the market (leanScore null)
    */
+  /**
+   * Return every top holder for a Polymarket market, unioning all
+   * available discovery sources (no truncation).
+   *
+   *   - /holders top-20 per outcome
+   *   - /trades aggregation (up to 1000 trades → net position per wallet)
+   *   - Top-100 leaderboard wallets × /positions cross-check
+   *
+   * Actual count per outcome depends on market activity; a busy market
+   * easily exceeds 100, a cold market may yield <40. Pass `enrich=true`
+   * to augment each wallet with lifetime PnL / ROI / streak — adds one
+   * cached pair of /positions + /closed-positions calls per wallet.
+   */
+  async getAllMarketHolders(
+    conditionId: string,
+    opts: { enrich?: boolean } = {},
+  ): Promise<{
+    conditionId: string;
+    totalHolders: number;
+    outcomes: Array<{
+      outcomeIndex: number;
+      outcomeName: string;
+      token: string;
+      holderCount: number;
+      totalAmount: number;
+      holders: Array<{
+        wallet: string;
+        name: string;
+        pseudonym: string;
+        amount: number;
+        outcomeIndex: number;
+        lifetimePnl?: number;
+        lifetimeRoi?: number;
+        last10Wins?: number | null;
+        last10WinRate?: number;
+        currentWinStreak?: number;
+        resolvedCount?: number;
+      }>;
+    }>;
+  }> {
+    const expanded = await this.polymarketDataService.getExpandedHolders(
+      conditionId,
+      {
+        targetPerOutcome: 10_000, // effectively unlimited — no truncation
+        includeLeaderboard: true,
+        tradeSampleSize: 1000,
+        leaderboardSize: 100,
+      },
+    );
+
+    // Optional enrichment: lifetime stats per wallet.
+    let walletStats = new Map<
+      string,
+      {
+        lifetimePnl: number;
+        lifetimeRoi: number;
+        last10Wins: number | null;
+        last10WinRate: number;
+        currentWinStreak: number;
+        resolvedCount: number;
+      }
+    >();
+    if (opts.enrich) {
+      const wallets = new Set<string>();
+      for (const o of expanded) {
+        for (const h of o.holders) wallets.add(h.proxyWallet);
+      }
+      const enrichments = await Promise.all(
+        [...wallets].map(async (w) => {
+          try {
+            const stats =
+              await this.smartMoneySignalService.getWalletLifetimeStats(w);
+            const roi =
+              stats.totalBought > 0 ? stats.totalPnl / stats.totalBought : 0;
+            return {
+              wallet: w,
+              pnl: stats.totalPnl,
+              roi,
+              last10Wins: stats.last10Wins,
+              last10WinRate: stats.last10WinRate,
+              streak: stats.currentWinStreak,
+              resolved: stats.resolvedCount,
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      for (const e of enrichments) {
+        if (!e) continue;
+        walletStats.set(e.wallet, {
+          lifetimePnl: e.pnl,
+          lifetimeRoi: e.roi,
+          last10Wins: e.last10Wins,
+          last10WinRate: e.last10WinRate,
+          currentWinStreak: e.streak,
+          resolvedCount: e.resolved,
+        });
+      }
+    }
+
+    const outcomes = expanded.map((o) => {
+      const outcomeIndex = o.holders[0]?.outcomeIndex ?? 0;
+      const outcomeName =
+        ((o.holders[0]?.name as any)?.outcome as string | undefined) ??
+        (outcomeIndex === 0 ? 'Yes' : 'No');
+      const totalAmount = o.holders.reduce(
+        (sum, h) => sum + Number(h.amount ?? 0),
+        0,
+      );
+      const holders = o.holders.map((h) => {
+        const enr = walletStats.get(h.proxyWallet);
+        return {
+          wallet: h.proxyWallet,
+          name: h.name ?? '',
+          pseudonym: h.pseudonym ?? '',
+          amount: Number(h.amount ?? 0),
+          outcomeIndex: h.outcomeIndex,
+          ...(enr
+            ? {
+                lifetimePnl: enr.lifetimePnl,
+                lifetimeRoi: enr.lifetimeRoi,
+                last10Wins: enr.last10Wins,
+                last10WinRate: enr.last10WinRate,
+                currentWinStreak: enr.currentWinStreak,
+                resolvedCount: enr.resolvedCount,
+              }
+            : {}),
+        };
+      });
+      return {
+        outcomeIndex,
+        outcomeName,
+        token: o.token,
+        holderCount: holders.length,
+        totalAmount: Math.round(totalAmount),
+        holders,
+      };
+    });
+
+    const totalHolders = outcomes.reduce((s, o) => s + o.holderCount, 0);
+
+    return {
+      conditionId,
+      totalHolders,
+      outcomes,
+    };
+  }
+
   async predictFromSmartMoney(
     fixtureId: number,
     options: { persist?: boolean } = {},

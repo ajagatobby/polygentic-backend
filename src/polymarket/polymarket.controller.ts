@@ -40,6 +40,38 @@ export class PolymarketController {
     return this.polymarketService.getPerformanceSummary();
   }
 
+  @Get('holders/:conditionId')
+  @ApiOperation({
+    summary: 'Get every top holder for a Polymarket market (by conditionId)',
+    description:
+      'Unions /holders (top-20 per outcome) with /trades aggregation (up to ' +
+      '1000 trades → net position per wallet) and a top-100 leaderboard ' +
+      'cross-check. Returns all holders per outcome with no cap. ' +
+      'Pass ?enrich=true to augment each wallet with lifetime PnL, ROI, ' +
+      'streak, and last-10 record — slower, adds one /positions + ' +
+      '/closed-positions pair per wallet (cached 30min).',
+  })
+  @ApiQuery({
+    name: 'enrich',
+    required: false,
+    type: Boolean,
+    description:
+      'Include lifetime PnL, ROI, streak, last10 per wallet. Default false.',
+  })
+  async getAllHolders(
+    @Param('conditionId') conditionId: string,
+    @Query('enrich') enrich?: string,
+  ) {
+    if (!conditionId || !conditionId.startsWith('0x')) {
+      throw new BadRequestException(
+        'conditionId must be a 0x-prefixed Polymarket condition ID',
+      );
+    }
+    return this.polymarketService.getAllMarketHolders(conditionId, {
+      enrich: enrich === 'true',
+    });
+  }
+
   @Get('smart-money/predict/:fixtureId')
   @ApiOperation({
     summary:

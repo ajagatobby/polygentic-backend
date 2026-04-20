@@ -120,9 +120,8 @@ export interface SmartMoneyOptions {
 }
 
 /** Aggregated lifetime stats for a single wallet, used by the sharp
- *  qualification path. Kept as a module-local interface so the method
- *  signatures stay concise. */
-interface LifetimeStats {
+ *  qualification path and exposed for enrichment in other services. */
+export interface LifetimeStats {
   totalPnl: number;
   totalBought: number;
   resolvedCount: number;
@@ -151,6 +150,21 @@ export class SmartMoneySignalService {
   };
 
   constructor(private readonly data: PolymarketDataService) {}
+
+  /**
+   * Public: compute lifetime stats for a single wallet by pulling its
+   * open and closed positions from Polymarket, then running the same
+   * aggregation the signal computation uses. Exposed so other services
+   * (e.g. the top-holders endpoint) can enrich wallet records without
+   * duplicating the stats logic.
+   */
+  async getWalletLifetimeStats(wallet: string): Promise<LifetimeStats> {
+    const [open, closed] = await Promise.all([
+      this.data.getUserPositions(wallet, { limit: 200 }),
+      this.data.getUserClosedPositions(wallet, { limit: 200 }),
+    ]);
+    return this.lifetimeStats([...open, ...closed]);
+  }
 
   /**
    * Compute the smart-money signal for a single market.
