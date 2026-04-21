@@ -13,6 +13,7 @@ import {
   snapshotPolymarketHoldersTask,
 } from './sync-data';
 import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
+import { polymarketMarketSnapshotTask } from './polymarket-market-snapshot';
 import { copyTraderSyncTask } from './copy-trader-sync';
 import {
   syncBasketballFixturesTask,
@@ -173,6 +174,25 @@ export const polymarketHoldersSnapshotSchedule = schedules.task({
       undefined as void,
     );
     logger.info('Triggered polymarket holder snapshot task', {
+      runId: handle.id,
+    });
+  },
+});
+
+/**
+ * Every 5 minutes: refresh volume / liquidity / outcomePrices for every
+ * active Polymarket market. Powers the per-fixture market-size filter in
+ * the UI — the read path only hits Postgres.
+ */
+export const polymarketMarketSnapshotSchedule = schedules.task({
+  id: 'scheduled-polymarket-market-snapshot',
+  cron: '*/5 * * * *',
+  run: async () => {
+    logger.info('Scheduled: polymarket market snapshot');
+    const handle = await polymarketMarketSnapshotTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered polymarket market snapshot task', {
       runId: handle.id,
     });
   },

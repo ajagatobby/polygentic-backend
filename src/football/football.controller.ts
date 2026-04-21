@@ -189,6 +189,7 @@ export class FootballController {
     @Query('hasPrediction') hasPrediction?: string,
     @Query('minConfidence') minConfidence?: string,
     @Query('light') light?: string,
+    @Query('include') include?: string,
   ) {
     try {
       // Default: from today, to 7 days out
@@ -202,6 +203,12 @@ export class FootballController {
               .toISOString()
               .split('T')[0]);
 
+      const includeArr = (include ?? '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter((s): s is 'prediction' | 'market' =>
+          s === 'prediction' || s === 'market',
+        );
       let data = await this.footballService.getTodayFixturesWithPredictions({
         from: defaultFrom,
         to: defaultTo,
@@ -214,6 +221,7 @@ export class FootballController {
         club,
         round,
         light: light === '1' || light === 'true',
+        include: includeArr.length > 0 ? includeArr : undefined,
       });
 
       if (hasPrediction === 'true') {

@@ -916,7 +916,9 @@ export class FootballService {
           outcomes: string[];
           outcomePrices: string[] | null;
           liquidity: string | null;
+          volume: string | null;
           volume24hr: string | null;
+          lastSyncedAt: Date | null;
           endDate: Date | null;
         }>;
       }
@@ -937,7 +939,9 @@ export class FootballService {
         outcomes: schema.polymarketMarkets.outcomes,
         outcomePrices: schema.polymarketMarkets.outcomePrices,
         liquidity: schema.polymarketMarkets.liquidity,
+        volume: schema.polymarketMarkets.volume,
         volume24hr: schema.polymarketMarkets.volume24hr,
+        lastSyncedAt: schema.polymarketMarkets.lastSyncedAt,
         endDate: schema.polymarketMarkets.endDate,
         closed: schema.polymarketMarkets.closed,
       })
@@ -968,7 +972,9 @@ export class FootballService {
         outcomes: (r.outcomes ?? []) as string[],
         outcomePrices: (r.outcomePrices ?? null) as string[] | null,
         liquidity: r.liquidity as string | null,
+        volume: r.volume as string | null,
         volume24hr: r.volume24hr as string | null,
+        lastSyncedAt: r.lastSyncedAt as Date | null,
         endDate: r.endDate as Date | null,
       };
       const existing = out.get(r.fixtureId);
@@ -1533,6 +1539,15 @@ export class FootballService {
      * the frontend only need fixture core + basic team info.
      */
     light?: boolean;
+    /**
+     * Opt-in additions to the light payload. Each flag adds one cheap
+     * query (no per-team fan-out). Values:
+     *   - "prediction" → latest pre-match / on-demand prediction row
+     *     (confidence, win-prob triple, edge, predicted goals) per fixture
+     *   - "market"     → polymarket market summary per fixture: volume,
+     *     liquidity, outcomePrices, marketType, conditionId
+     */
+    include?: Array<'prediction' | 'market'>;
   }): Promise<any[]> {
     const conditions: any[] = [];
 
@@ -1647,9 +1662,13 @@ export class FootballService {
     // 14-day windows since getTeamRecentGameHistory alone fans out to
     // 3 queries per team.
     if (filters?.light) {
-      const teamRows =
+      const includeSet = new Set(filters.include ?? []);
+      const includePred = includeSet.has('prediction');
+      const includeMarket = includeSet.has('market');
+
+      const teamRowsPromise =
         teamIds.size > 0
-          ? await this.db
+          ? this.db
               .select({
                 id: schema.teams.id,
                 name: schema.teams.name,
@@ -1663,7 +1682,50 @@ export class FootballService {
                   sql`, `,
                 )})`,
               )
-          : [];
+          : Promise.resolve([] as Array<{
+              id: number;
+              name: string;
+              shortName: string | null;
+              logo: string | null;
+            }>);
+
+      const predictionsPromise = includePred
+        ? this.db
+            .select({
+              id: schema.predictions.id,
+              fixtureId: schema.predictions.fixtureId,
+              homeWinProb: schema.predictions.homeWinProb,
+              drawProb: schema.predictions.drawProb,
+              awayWinProb: schema.predictions.awayWinProb,
+              predictedResult: schema.predictions.predictedResult,
+              confidence: schema.predictions.confidence,
+              predictedHomeGoals: schema.predictions.predictedHomeGoals,
+              predictedAwayGoals: schema.predictions.predictedAwayGoals,
+              valueBets: schema.predictions.valueBets,
+              createdAt: schema.predictions.createdAt,
+            })
+            .from(schema.predictions)
+            .where(
+              sql`${schema.predictions.fixtureId} IN (${sql.join(
+                fixtureIds.map((id: number) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+            .orderBy(desc(schema.predictions.createdAt))
+        : Promise.resolve([] as any[]);
+
+      const marketsPromise = includeMarket
+        ? this.getPolymarketInfoForFixtures(fixtureIds)
+        : Promise.resolve(
+            new Map<number, { eventUrl: string | null; marketCount: number; markets: any[] }>(),
+          );
+
+      const [teamRows, predictionRows, marketsByFixture] = await Promise.all([
+        teamRowsPromise,
+        predictionsPromise,
+        marketsPromise,
+      ]);
+
       const teamMap = new Map<
         number,
         { name: string; shortName: string | null; logo: string | null }
@@ -1675,10 +1737,20 @@ export class FootballService {
           logo: t.logo,
         });
       }
+
+      // Keep the newest prediction per fixture (query is ordered by
+      // createdAt desc so we take the first one we see).
+      const predictionByFixture = new Map<number, any>();
+      for (const p of predictionRows) {
+        if (!predictionByFixture.has(p.fixtureId)) {
+          predictionByFixture.set(p.fixtureId, p);
+        }
+      }
+
       return fixtures.map((fixture: any) => {
         const home = teamMap.get(fixture.homeTeamId);
         const away = teamMap.get(fixture.awayTeamId);
-        return {
+        const row: any = {
           fixture: {
             id: fixture.id,
             date: fixture.date,
@@ -1710,6 +1782,36 @@ export class FootballService {
             logo: away?.logo ?? null,
           },
         };
+
+        if (includePred) {
+          const p = predictionByFixture.get(fixture.id);
+          row.prediction = p
+            ? {
+                id: p.id,
+                homeWinProb: p.homeWinProb,
+                drawProb: p.drawProb,
+                awayWinProb: p.awayWinProb,
+                predictedResult: p.predictedResult,
+                confidence: p.confidence,
+                predictedHomeGoals: p.predictedHomeGoals,
+                predictedAwayGoals: p.predictedAwayGoals,
+                valueBets: p.valueBets,
+              }
+            : null;
+        }
+
+        if (includeMarket) {
+          const m = marketsByFixture.get(fixture.id);
+          row.polymarket = m
+            ? {
+                eventUrl: m.eventUrl,
+                marketCount: m.marketCount,
+                markets: m.markets,
+              }
+            : null;
+        }
+
+        return row;
       });
     }
 

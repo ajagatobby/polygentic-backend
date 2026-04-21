@@ -621,6 +621,106 @@ export class PolymarketGammaService {
     }
   }
 
+  /**
+   * Batch-fetch market price / volume / liquidity for a list of condition IDs.
+   *
+   * Used by the 5-minute Trigger.dev snapshot task to refresh every tracked
+   * market in one request (Gamma supports `condition_ids=` as a repeated
+   * query parameter — pass the list and it returns the matching markets).
+   *
+   * We chunk the request at 80 ids per call to keep the URL length below
+   * the Gamma proxy's ~8 KB cap; each id is ~66 chars so 80 stays safe.
+   */
+  async fetchMarketsByConditionIds(
+    conditionIds: string[],
+  ): Promise<
+    Array<{
+      conditionId: string;
+      marketId: string;
+      outcomePrices: string[];
+      volume: number | null;
+      volume24hr: number | null;
+      liquidity: number | null;
+      active: boolean;
+      closed: boolean;
+      acceptingOrders: boolean;
+    }>
+  > {
+    const unique = Array.from(
+      new Set(conditionIds.filter((id) => !!id && id.length > 0)),
+    );
+    if (unique.length === 0) return [];
+
+    const CHUNK = 80;
+    const out: Array<{
+      conditionId: string;
+      marketId: string;
+      outcomePrices: string[];
+      volume: number | null;
+      volume24hr: number | null;
+      liquidity: number | null;
+      active: boolean;
+      closed: boolean;
+      acceptingOrders: boolean;
+    }> = []
+
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      try {
+        const response = await this.client.get('/markets', {
+          params: {
+            condition_ids: slice,
+            limit: slice.length,
+          },
+          // Axios encodes repeated params as `?condition_ids=a&condition_ids=b`
+          paramsSerializer: {
+            indexes: null,
+          },
+        });
+        const rows: GammaMarket[] = Array.isArray(response.data)
+          ? response.data
+          : (response.data?.data ?? []);
+        for (const raw of rows) {
+          let prices: string[] = [];
+          try {
+            prices =
+              typeof raw.outcomePrices === 'string'
+                ? (JSON.parse(raw.outcomePrices || '[]') as string[])
+                : (raw.outcomePrices as unknown as string[]) ?? [];
+          } catch {
+            prices = [];
+          }
+          out.push({
+            conditionId: raw.conditionId,
+            marketId: String(raw.id),
+            outcomePrices: prices.map((p) => String(p)),
+            volume: Number.isFinite(raw.volume) ? Number(raw.volume) : null,
+            volume24hr: Number.isFinite(raw.volume24hr)
+              ? Number(raw.volume24hr)
+              : null,
+            liquidity: Number.isFinite(raw.liquidity)
+              ? Number(raw.liquidity)
+              : null,
+            active: raw.active ?? true,
+            closed: raw.closed ?? false,
+            acceptingOrders: raw.acceptingOrders ?? true,
+          });
+        }
+      } catch (error) {
+        this.logger.warn(
+          `fetchMarketsByConditionIds chunk ${i / CHUNK} (${slice.length} ids) failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      if (i + CHUNK < unique.length) {
+        await this.delay(PolymarketGammaService.REQUEST_DELAY_MS);
+      }
+    }
+
+    return out;
+  }
+
   // ─── Parsing helpers ────────────────────────────────────────────────
 
   private parseEvent(raw: GammaEvent, tagSlug?: string): ParsedPolymarketEvent {
