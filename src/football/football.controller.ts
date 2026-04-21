@@ -188,6 +188,7 @@ export class FootballController {
     @Query('round') round?: string,
     @Query('hasPrediction') hasPrediction?: string,
     @Query('minConfidence') minConfidence?: string,
+    @Query('light') light?: string,
   ) {
     try {
       // Default: from today, to 7 days out
@@ -212,6 +213,7 @@ export class FootballController {
         teamId: teamId ? Number(teamId) : undefined,
         club,
         round,
+        light: light === '1' || light === 'true',
       });
 
       if (hasPrediction === 'true') {

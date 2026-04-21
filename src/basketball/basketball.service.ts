@@ -705,31 +705,30 @@ export class BasketballService {
       .where(whereClause)
       .orderBy(asc(schema.basketballFixtures.date));
 
-    // Enrich with team data
-    const enriched = await Promise.all(
-      fixtures.map(async (f: any) => {
-        const [homeTeam, awayTeam] = await Promise.all([
-          this.db
+    if (fixtures.length === 0) return [];
+
+    // Batch team lookup — the old code issued 2 select()s per fixture,
+    // so a 14-day window was 300+ round trips. One IN query now.
+    const teamIds = new Set<number>();
+    for (const f of fixtures) {
+      if (f.homeTeamId) teamIds.add(f.homeTeamId);
+      if (f.awayTeamId) teamIds.add(f.awayTeamId);
+    }
+    const teamRows =
+      teamIds.size > 0
+        ? await this.db
             .select()
             .from(schema.basketballTeams)
-            .where(eq(schema.basketballTeams.id, f.homeTeamId))
-            .then((r: any[]) => r[0]),
-          this.db
-            .select()
-            .from(schema.basketballTeams)
-            .where(eq(schema.basketballTeams.id, f.awayTeamId))
-            .then((r: any[]) => r[0]),
-        ]);
+            .where(inArray(schema.basketballTeams.id, [...teamIds]))
+        : [];
+    const teamMap = new Map<number, any>();
+    for (const t of teamRows) teamMap.set(t.id, t);
 
-        return {
-          ...f,
-          homeTeam: homeTeam ?? null,
-          awayTeam: awayTeam ?? null,
-        };
-      }),
-    );
-
-    return enriched;
+    return fixtures.map((f: any) => ({
+      ...f,
+      homeTeam: teamMap.get(f.homeTeamId) ?? null,
+      awayTeam: teamMap.get(f.awayTeamId) ?? null,
+    }));
   }
 
   /**

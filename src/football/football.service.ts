@@ -1527,6 +1527,12 @@ export class FootballService {
     to?: string;
     hasPrediction?: boolean;
     minConfidence?: number;
+    /**
+     * When true, skip all the expensive joins (team history, lineups,
+     * injuries, predictions, smart-money, polymarket). List views on
+     * the frontend only need fixture core + basic team info.
+     */
+    light?: boolean;
   }): Promise<any[]> {
     const conditions: any[] = [];
 
@@ -1633,6 +1639,78 @@ export class FootballService {
     for (const f of fixtures) {
       if (f.homeTeamId) teamIds.add(f.homeTeamId);
       if (f.awayTeamId) teamIds.add(f.awayTeamId);
+    }
+
+    // Fast path for list views — single team-lookup query, no
+    // predictions / lineups / injuries / smart-money / polymarket /
+    // game-history enrichment. Drops response time from ~30s → <1s at
+    // 14-day windows since getTeamRecentGameHistory alone fans out to
+    // 3 queries per team.
+    if (filters?.light) {
+      const teamRows =
+        teamIds.size > 0
+          ? await this.db
+              .select({
+                id: schema.teams.id,
+                name: schema.teams.name,
+                shortName: schema.teams.shortName,
+                logo: schema.teams.logo,
+              })
+              .from(schema.teams)
+              .where(
+                sql`${schema.teams.id} IN (${sql.join(
+                  [...teamIds].map((id) => sql`${id}`),
+                  sql`, `,
+                )})`,
+              )
+          : [];
+      const teamMap = new Map<
+        number,
+        { name: string; shortName: string | null; logo: string | null }
+      >();
+      for (const t of teamRows) {
+        teamMap.set(t.id, {
+          name: t.name,
+          shortName: t.shortName,
+          logo: t.logo,
+        });
+      }
+      return fixtures.map((fixture: any) => {
+        const home = teamMap.get(fixture.homeTeamId);
+        const away = teamMap.get(fixture.awayTeamId);
+        return {
+          fixture: {
+            id: fixture.id,
+            date: fixture.date,
+            status: fixture.status,
+            statusLong: fixture.statusLong,
+            elapsed: fixture.elapsed,
+            round: fixture.round,
+            venueName: fixture.venueName,
+            venueCity: fixture.venueCity,
+            leagueId: fixture.leagueId,
+            leagueName: fixture.leagueName,
+            leagueCountry: fixture.leagueCountry,
+            season: fixture.season,
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+            goalsHome: fixture.goalsHome,
+            goalsAway: fixture.goalsAway,
+          },
+          homeTeam: {
+            id: fixture.homeTeamId,
+            name: home?.name ?? null,
+            shortName: home?.shortName ?? null,
+            logo: home?.logo ?? null,
+          },
+          awayTeam: {
+            id: fixture.awayTeamId,
+            name: away?.name ?? null,
+            shortName: away?.shortName ?? null,
+            logo: away?.logo ?? null,
+          },
+        };
+      });
     }
 
     // Batch fetch predictions, team names, lineups, injuries, and Polymarket
