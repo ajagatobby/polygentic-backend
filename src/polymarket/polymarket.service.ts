@@ -2607,7 +2607,7 @@ export class PolymarketService implements OnModuleInit {
    * uniformly.
    */
   private formatSmartMoneyView(
-    raw: SmartMoneySignal,
+    raw: SmartMoneySignal | null | undefined,
     ctx: {
       homeTeamId: number;
       awayTeamId: number;
@@ -2616,7 +2616,10 @@ export class PolymarketService implements OnModuleInit {
       marketTeamId: number | null;
     },
   ): any {
-    if (raw.leanScore == null) return null;
+    // Not every prediction carries a smart-money signal (confidence-only
+    // picks pass through getTopSmartMoneyPicks too). Short-circuit instead
+    // of crashing on raw.leanScore.
+    if (raw == null || raw.leanScore == null) return null;
     const leanScore = raw.leanScore;
     const absLean = Math.abs(leanScore);
     const sharpsLeanYes = leanScore > 0;
