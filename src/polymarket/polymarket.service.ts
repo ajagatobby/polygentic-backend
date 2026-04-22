@@ -44,7 +44,10 @@ import {
   SmartMoneySignalService,
   SmartMoneySignal,
 } from './services/smart-money-signal.service';
-import { PolymarketDataService } from './services/polymarket-data.service';
+import {
+  PolymarketDataService,
+  PolymarketTrade,
+} from './services/polymarket-data.service';
 
 /**
  * PolymarketService — Orchestrator
@@ -1706,6 +1709,7 @@ export class PolymarketService implements OnModuleInit {
       marketQuestion: string | null;
       outcomeName: string | null;
       totalBought: number;
+      staked: number;
       realizedPnl: number;
       win: boolean;
       endDate: string | null;
@@ -1717,6 +1721,7 @@ export class PolymarketService implements OnModuleInit {
       size: number;
       avgPrice: number;
       currentValue: number;
+      staked: number;
       cashPnl: number;
       percentPnl: number;
     }>;
@@ -1724,24 +1729,28 @@ export class PolymarketService implements OnModuleInit {
       marketQuestion: string | null;
       realizedPnl: number;
       totalBought: number;
+      staked: number;
       endDate: string | null;
     }>;
     biggestLosses: Array<{
       marketQuestion: string | null;
       realizedPnl: number;
       totalBought: number;
+      staked: number;
       endDate: string | null;
     }>;
     allWins: Array<{
       marketQuestion: string | null;
       realizedPnl: number;
       totalBought: number;
+      staked: number;
       endDate: string | null;
     }>;
     allLosses: Array<{
       marketQuestion: string | null;
       realizedPnl: number;
       totalBought: number;
+      staked: number;
       endDate: string | null;
     }>;
     truncated: boolean;
@@ -1793,24 +1802,60 @@ export class PolymarketService implements OnModuleInit {
     if (!wallet) return null;
 
     // Pull the full position book via paginated /positions and
-    // /closed-positions. The single-page fetchers cap at 200 rows each,
-    // which silently truncates whales; here we walk offset until the API
-    // returns a short page (max 20 pages × 500 rows each = 10,000 per
-    // side — enough to cover the biggest traders on Polymarket today).
-    // Lifetime stats are then computed from the paginated set directly,
-    // so totalPnl / resolvedCount / streaks reflect real history instead
-    // of the most recent 400 rows.
-    const [openResult, closedResult] = await Promise.all([
+    // /closed-positions, plus the full trade log. The single-page
+    // position fetchers cap at 200 rows each which silently truncates
+    // whales; pagination walks offset until the API returns a short
+    // page (positions max 20×500 = 10,000 per side; trades 50×500 =
+    // 25,000). The trade log is what lets us compute the *real* peak
+    // USD a user had at risk per position — Polymarket's totalBought
+    // is cumulative across all buys INCLUDING rebuys after partial
+    // sells, so a trader who bought $1K, sold $600, rebought $1K
+    // shows totalBought=$2K but never actually staked more than $1.4K.
+    const [openResult, closedResult, tradesResult] = await Promise.all([
       this.polymarketDataService.getUserPositionsAll(wallet),
       this.polymarketDataService.getUserClosedPositionsAll(wallet),
+      this.polymarketDataService.getUserTradesAll(wallet),
     ]);
     const openPositions = openResult.positions;
     const closedPositions = closedResult.positions;
-    const truncated = openResult.truncated || closedResult.truncated;
+    const truncated =
+      openResult.truncated ||
+      closedResult.truncated ||
+      tradesResult.truncated;
     const stats = this.smartMoneySignalService.computeLifetimeStats([
       ...openPositions,
       ...closedPositions,
     ]);
+
+    // Replay the trade log chronologically, per asset, tracking the
+    // running cost basis of currently-held shares. `peakExposureUsd` is
+    // the maximum that cost basis ever hit — i.e., the largest USD the
+    // user ever had actually at risk on this market. That's what most
+    // users mean by "staked" and what we'll show in the UI instead of
+    // the misleading totalBought.
+    const exposures = this.computeExposuresByAsset(tradesResult.trades);
+    const stakedFor = (
+      assetId: string | undefined,
+      initialValueUsd: number,
+      totalBoughtUsd: number,
+    ): number => {
+      const peak = assetId
+        ? (exposures.get(assetId)?.peakExposureUsd ?? 0)
+        : 0;
+      // Currently-held cost basis (size × avgPrice = initialValue) is a
+      // hard lower bound for an open position — you can't hold that
+      // much at your avg entry price without having paid for it. If our
+      // /activity sweep missed rows (truncated, or neg-risk splits that
+      // don't show as TRADE events) the peak estimate drifts low, so
+      // we floor it at initialValue.
+      const best = Math.max(peak, initialValueUsd);
+      if (best > 0) return best;
+      // Last resort when we have no exposure data AND no held cost
+      // basis (typical of fully-closed positions that pre-date our
+      // trade window): fall back to the API's totalBought. It's noisy
+      // but always upper-bounds the real stake.
+      return Math.max(0, totalBoughtUsd);
+    };
 
     // Gate checks — mirrors the defaults in SmartMoneySignalService.
     const MIN_PNL = 50_000;
@@ -1849,6 +1894,14 @@ export class PolymarketService implements OnModuleInit {
       marketQuestion: p.title ?? p.slug ?? null,
       outcomeName: p.outcome ?? null,
       totalBought: Number(p.totalBought ?? 0),
+      // For partially/fully closed positions, initialValue reflects any
+      // remaining held shares (often 0). totalBought is the last-resort
+      // ceiling — see stakedFor comments.
+      staked: stakedFor(
+        p.asset,
+        Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+        Number(p.totalBought ?? 0),
+      ),
       realizedPnl: Number(p.realizedPnl ?? 0),
       win: Number(p.realizedPnl ?? 0) > 0,
       endDate: p.endDate ?? null,
@@ -1868,6 +1921,11 @@ export class PolymarketService implements OnModuleInit {
         marketQuestion: p.title ?? p.slug ?? null,
         realizedPnl: Number(p.realizedPnl ?? 0),
         totalBought: Number(p.totalBought ?? 0),
+        staked: stakedFor(
+          p.asset,
+          Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+          Number(p.totalBought ?? 0),
+        ),
         endDate: p.endDate ?? null,
       }));
     const allLosses = [...resolvedMerged]
@@ -1880,6 +1938,11 @@ export class PolymarketService implements OnModuleInit {
         marketQuestion: p.title ?? p.slug ?? null,
         realizedPnl: Number(p.realizedPnl ?? 0),
         totalBought: Number(p.totalBought ?? 0),
+        staked: stakedFor(
+          p.asset,
+          Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+          Number(p.totalBought ?? 0),
+        ),
         endDate: p.endDate ?? null,
       }));
     // Keep the top-5 aliases for any consumer that prefers a compact
@@ -1901,6 +1964,14 @@ export class PolymarketService implements OnModuleInit {
         size: Number(p.size ?? 0),
         avgPrice: Number(p.avgPrice ?? 0),
         currentValue: Number(p.currentValue ?? 0),
+        // Peak exposure from /activity replay, floored at current cost
+        // basis (size × avgPrice = initialValue) so we never
+        // underreport what the user visibly holds right now.
+        staked: stakedFor(
+          p.asset,
+          Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+          Number(p.totalBought ?? 0),
+        ),
         cashPnl: Number(p.cashPnl ?? 0),
         percentPnl: Number(p.percentPnl ?? 0),
       }));
@@ -1964,6 +2035,103 @@ export class PolymarketService implements OnModuleInit {
       allLosses,
       truncated,
     };
+  }
+
+  /**
+   * Replay every trade for a wallet chronologically per asset
+   * (outcome token), tracking the running USD cost basis of currently-
+   * held shares. Returns a map from assetId to the peak that cost basis
+   * ever reached — i.e., the real maximum USD the user ever had at risk
+   * on that market.
+   *
+   * Why this exists: Polymarket's /positions endpoint returns
+   * `totalBought`, which is the cumulative gross USD spent on all buys
+   * for the position. If a user buys $500, sells $300 worth at a higher
+   * price, and rebuys $500, totalBought = $1,000. But their peak
+   * cost-basis at risk was only ~$700. Showing totalBought as "staked"
+   * in the UI was actively misleading users about how much they had
+   * risked on a given bet.
+   *
+   * The math uses running average cost. When selling, cost basis drops
+   * proportionally to shares sold × average cost. If a sell would take
+   * shares below zero (i.e. the user "shorted" by selling more than
+   * they held — on Polymarket this means minting the opposite outcome)
+   * we clamp at zero; those cases represent a new buy of the mirrored
+   * asset, tracked under its own assetId.
+   */
+  private computeExposuresByAsset(
+    trades: PolymarketTrade[],
+  ): Map<
+    string,
+    {
+      peakExposureUsd: number;
+      currentCostBasisUsd: number;
+      currentShares: number;
+      realizedPnlFromTrades: number;
+      tradeCount: number;
+    }
+  > {
+    const byAsset = new Map<string, PolymarketTrade[]>();
+    for (const t of trades) {
+      const arr = byAsset.get(t.asset) ?? [];
+      arr.push(t);
+      byAsset.set(t.asset, arr);
+    }
+    const out = new Map<
+      string,
+      {
+        peakExposureUsd: number;
+        currentCostBasisUsd: number;
+        currentShares: number;
+        realizedPnlFromTrades: number;
+        tradeCount: number;
+      }
+    >();
+    for (const [asset, assetTrades] of byAsset) {
+      const sorted = [...assetTrades].sort(
+        (a, b) => a.timestamp - b.timestamp,
+      );
+      let currentShares = 0;
+      let currentCostBasisUsd = 0;
+      let peakExposureUsd = 0;
+      let realizedPnlFromTrades = 0;
+      for (const tr of sorted) {
+        const size = Number(tr.size ?? 0);
+        const price = Number(tr.price ?? 0);
+        if (!(size > 0) || !(price >= 0)) continue;
+        const usdc = size * price;
+        if (tr.side === 'BUY') {
+          currentShares += size;
+          currentCostBasisUsd += usdc;
+        } else {
+          // SELL: reduce cost basis proportionally using running avg.
+          const sellShares = Math.min(size, currentShares);
+          if (currentShares > 0 && sellShares > 0) {
+            const avgCost = currentCostBasisUsd / currentShares;
+            currentCostBasisUsd -= sellShares * avgCost;
+            currentShares -= sellShares;
+            realizedPnlFromTrades += (price - avgCost) * sellShares;
+          }
+          // Any excess (size - sellShares) is a short-sell / mint of
+          // the opposite outcome; ignored here because it doesn't
+          // represent exposure on *this* asset.
+        }
+        // Floor tiny floating-point negatives caused by rounding.
+        if (currentCostBasisUsd < 0) currentCostBasisUsd = 0;
+        if (currentShares < 0) currentShares = 0;
+        if (currentCostBasisUsd > peakExposureUsd) {
+          peakExposureUsd = currentCostBasisUsd;
+        }
+      }
+      out.set(asset, {
+        peakExposureUsd,
+        currentCostBasisUsd,
+        currentShares,
+        realizedPnlFromTrades,
+        tradeCount: sorted.length,
+      });
+    }
+    return out;
   }
 
   /**

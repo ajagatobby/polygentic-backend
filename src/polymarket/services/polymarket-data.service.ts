@@ -263,6 +263,77 @@ export class PolymarketDataService {
   }
 
   /**
+   * Full per-user trade history via `/activity?type=TRADE`, paginated
+   * via offset. Backs the wallet-analyzer's "peak exposure"
+   * computation — the `totalBought` field on /positions is cumulative
+   * gross USD across all buys (including rebuys after partial sells),
+   * which is NOT the amount the user ever had at risk. Reconstructing
+   * actual peak cost basis requires replaying the fill log.
+   *
+   * We hit `/activity` rather than `/trades` because `/trades` aggregates
+   * one row per CLOB order (so a market buy that consumed 20
+   * counterparties shows as 1 row), while `/activity` gives one row per
+   * fill — which is what you need for a faithful share-by-share replay.
+   * Concretely: on a real Polymarket position we tested, `/trades`
+   * returned 9 rows totaling 38K shares / $25K, while `/activity`
+   * returned 173 rows totaling the full 47K shares / $31K that the
+   * user actually holds.
+   *
+   * `truncated` means we filled `maxPages` without seeing an end-of-
+   * list signal. 50 pages × 500 rows = 25,000 fills — fits every
+   * non-pathological wallet with plenty of room.
+   */
+  async getUserTradesAll(
+    proxyWallet: string,
+    opts: { pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ trades: PolymarketTrade[]; truncated: boolean }> {
+    const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
+    const maxPages = Math.max(1, opts.maxPages ?? 50);
+    const cacheKey = `user-activity-all:${proxyWallet}:${pageSize}:${maxPages}`;
+    return this.cached(cacheKey, this.TRADES_TTL_MS, async () => {
+      const seen = new Set<string>();
+      const out: PolymarketTrade[] = [];
+      for (let page = 0; page < maxPages; page++) {
+        let rows: PolymarketTrade[] = [];
+        try {
+          const r = await this.client.get<PolymarketTrade[]>('/activity', {
+            params: {
+              user: proxyWallet,
+              type: 'TRADE',
+              limit: pageSize,
+              offset: page * pageSize,
+            },
+          });
+          rows = Array.isArray(r.data) ? r.data : [];
+        } catch (err) {
+          this.logger.warn(
+            `getUserTradesAll page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
+          );
+          return { trades: out, truncated: false };
+        }
+
+        // Dedup on (transactionHash, asset, timestamp, size). A single
+        // transactionHash can legitimately map to multiple fills (the
+        // same order consuming many counterparties), but the same
+        // (hash, asset, ts, size) tuple repeating means we got the same
+        // row back — i.e., the API ignored offset.
+        let added = 0;
+        for (const row of rows) {
+          const key = `${row.transactionHash}:${row.asset}:${row.size}:${row.timestamp}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(row);
+          added++;
+        }
+        if (added === 0) return { trades: out, truncated: false };
+        if (rows.length < pageSize)
+          return { trades: out, truncated: false };
+      }
+      return { trades: out, truncated: true };
+    });
+  }
+
+  /**
    * All current positions for a wallet (across every market they hold).
    * Returns realized + unrealized PnL data per position — the basis for
    * computing a trader's lifetime ROI.
