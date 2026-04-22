@@ -1893,14 +1893,15 @@ export class PolymarketService implements OnModuleInit {
       conditionId: p.conditionId ?? null,
       marketQuestion: p.title ?? p.slug ?? null,
       outcomeName: p.outcome ?? null,
-      totalBought: Number(p.totalBought ?? 0),
-      // For partially/fully closed positions, initialValue reflects any
-      // remaining held shares (often 0). totalBought is the last-resort
-      // ceiling — see stakedFor comments.
+      // Convert Polymarket's share-denominated totalBought into USD
+      // via avgPrice. The API returns SHARES in totalBought, not USD —
+      // a $34K bet on a 0.1¢ market looks like $34M if you forget.
+      totalBought:
+        Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
       staked: stakedFor(
         p.asset,
         Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
-        Number(p.totalBought ?? 0),
+        Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
       ),
       realizedPnl: Number(p.realizedPnl ?? 0),
       win: Number(p.realizedPnl ?? 0) > 0,
@@ -1920,11 +1921,13 @@ export class PolymarketService implements OnModuleInit {
       .map((p: any) => ({
         marketQuestion: p.title ?? p.slug ?? null,
         realizedPnl: Number(p.realizedPnl ?? 0),
-        totalBought: Number(p.totalBought ?? 0),
+        // API totalBought is in SHARES — convert to USD via avgPrice.
+        totalBought:
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
         staked: stakedFor(
           p.asset,
           Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
-          Number(p.totalBought ?? 0),
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
         ),
         endDate: p.endDate ?? null,
       }));
@@ -1937,11 +1940,13 @@ export class PolymarketService implements OnModuleInit {
       .map((p: any) => ({
         marketQuestion: p.title ?? p.slug ?? null,
         realizedPnl: Number(p.realizedPnl ?? 0),
-        totalBought: Number(p.totalBought ?? 0),
+        // API totalBought is in SHARES — convert to USD via avgPrice.
+        totalBought:
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
         staked: stakedFor(
           p.asset,
           Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
-          Number(p.totalBought ?? 0),
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
         ),
         endDate: p.endDate ?? null,
       }));
@@ -1966,11 +1971,12 @@ export class PolymarketService implements OnModuleInit {
         currentValue: Number(p.currentValue ?? 0),
         // Peak exposure from /activity replay, floored at current cost
         // basis (size × avgPrice = initialValue) so we never
-        // underreport what the user visibly holds right now.
+        // underreport what the user visibly holds right now. The API's
+        // totalBought is SHARES, so convert with × avgPrice.
         staked: stakedFor(
           p.asset,
           Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
-          Number(p.totalBought ?? 0),
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
         ),
         cashPnl: Number(p.cashPnl ?? 0),
         percentPnl: Number(p.percentPnl ?? 0),
@@ -1989,7 +1995,11 @@ export class PolymarketService implements OnModuleInit {
         totalBought: stats.totalBought,
         roi,
         resolvedCount: stats.resolvedCount,
-        typicalBetSize: stats.typicalBetSize,
+        // The UI labels this "median bet" with a $-prefix, so expose
+        // the USD-denominated median rather than the shares one (the
+        // shares median still lives on stats.typicalBetSize for the
+        // smart-money positionMultiple calc).
+        typicalBetSize: stats.typicalBetSizeUsd,
         currentWinStreak: stats.currentWinStreak,
         last10Wins: stats.last10Wins,
         last10WinRate: stats.last10WinRate,

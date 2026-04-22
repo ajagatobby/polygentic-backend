@@ -132,12 +132,29 @@ export interface SmartMoneyOptions {
 }
 
 /** Aggregated lifetime stats for a single wallet, used by the sharp
- *  qualification path and exposed for enrichment in other services. */
+ *  qualification path and exposed for enrichment in other services.
+ *
+ *  Note on units: Polymarket's /positions returns `totalBought` as a
+ *  SHARE count, not USD (USD = shares × avgPrice). We expose both
+ *  denominations so callers pick the right one:
+ *
+ *  - `totalBought` / `typicalBetSizeUsd` — USD, correct for ROI math
+ *    and user-facing display ($N staked, $N median bet).
+ *  - `typicalBetSize` — median SHARES, kept for `positionMultiple`
+ *    which compares a holder's current share balance on a market
+ *    against a wallet's typical share count. Switching that ratio
+ *    to USD would need every call site to carry market prices.
+ */
 export interface LifetimeStats {
+  /** Lifetime realized PnL in USD. */
   totalPnl: number;
+  /** Lifetime gross USD bought across all positions. */
   totalBought: number;
   resolvedCount: number;
+  /** Median share count per position — used for positionMultiple. */
   typicalBetSize: number;
+  /** Median USD bought per position — used for UI "median bet" display. */
+  typicalBetSizeUsd: number;
   currentWinStreak: number;
   last10WinRate: number;
   last10Wins: number | null;
@@ -542,6 +559,7 @@ export class SmartMoneySignalService {
         totalBought: 0,
         resolvedCount: 0,
         typicalBetSize: 0,
+        typicalBetSizeUsd: 0,
         currentWinStreak: 0,
         last10WinRate: 0,
         last10Wins: null,
@@ -550,28 +568,44 @@ export class SmartMoneySignalService {
       };
     }
     let totalPnl = 0;
-    let totalBought = 0;
+    let totalBoughtUsd = 0;
     let resolved = 0;
-    const sizes: number[] = [];
+    const sharesSizes: number[] = [];
+    const usdSizes: number[] = [];
     const resolvedWithDate: Array<{ win: boolean; endDate: string }> = [];
     for (const p of positions) {
       // Realized PnL is the cleanest signal of skill — counts only positions
       // that have been closed. cashPnl includes unrealized.
       totalPnl += Number(p.realizedPnl ?? 0);
-      totalBought += Number(p.totalBought ?? 0);
-      if (p.realizedPnl != null && p.totalBought > 0) {
+      // ⚠ Polymarket's /positions returns `totalBought` in SHARES, not
+      // USD. USD cost = totalBought × avgPrice. Confusing the two was
+      // making volume numbers on penny markets appear 1000× too large
+      // (34M shares at 0.1¢ = $34K in real money).
+      const sharesBought = Number(p.totalBought ?? 0);
+      const avgPrice = Number(p.avgPrice ?? 0);
+      const usdBought = sharesBought * avgPrice;
+      totalBoughtUsd += usdBought;
+      if (p.realizedPnl != null && sharesBought > 0) {
         resolved++;
         resolvedWithDate.push({
           win: Number(p.realizedPnl) > 0,
           endDate: String(p.endDate ?? ''),
         });
       }
-      if (p.totalBought > 0) sizes.push(p.totalBought);
+      if (sharesBought > 0) sharesSizes.push(sharesBought);
+      if (usdBought > 0) usdSizes.push(usdBought);
     }
-    // Median bet size is more robust to outliers than mean.
-    sizes.sort((a, b) => a - b);
+    // Median is more robust to outliers than mean. We compute both the
+    // shares-denominated median (for positionMultiple) and the USD one
+    // (for UI display).
+    sharesSizes.sort((a, b) => a - b);
+    usdSizes.sort((a, b) => a - b);
     const typicalBetSize =
-      sizes.length > 0 ? sizes[Math.floor(sizes.length / 2)] : 0;
+      sharesSizes.length > 0
+        ? sharesSizes[Math.floor(sharesSizes.length / 2)]
+        : 0;
+    const typicalBetSizeUsd =
+      usdSizes.length > 0 ? usdSizes[Math.floor(usdSizes.length / 2)] : 0;
 
     // Sort resolved positions by endDate desc (most recent first). Empty
     // endDate sorts last (treated as oldest).
@@ -609,9 +643,10 @@ export class SmartMoneySignalService {
 
     return {
       totalPnl,
-      totalBought,
+      totalBought: totalBoughtUsd,
       resolvedCount: resolved,
       typicalBetSize,
+      typicalBetSizeUsd,
       currentWinStreak,
       last10WinRate,
       last10Wins,
