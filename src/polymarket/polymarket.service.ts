@@ -1725,6 +1725,8 @@ export class PolymarketService implements OnModuleInit {
       staked: number;
       cashPnl: number;
       percentPnl: number;
+      slug: string | null;
+      eventSlug: string | null;
     }>;
     biggestWins: Array<{
       marketQuestion: string | null;
@@ -1989,6 +1991,8 @@ export class PolymarketService implements OnModuleInit {
         ),
         cashPnl: Number(p.cashPnl ?? 0),
         percentPnl: Number(p.percentPnl ?? 0),
+        slug: p.slug ?? null,
+        eventSlug: p.eventSlug ?? null,
       }));
 
     return {
