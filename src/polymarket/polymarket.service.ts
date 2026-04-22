@@ -2230,6 +2230,14 @@ export class PolymarketService implements OnModuleInit {
     // bounded only by how many unique wallets Polymarket surfaces across
     // /holders + /trades + leaderboard. More candidates in → more
     // qualifying sharps out → more reliable leanScore.
+    //
+    // Pool expansion now runs on BOTH read-only GETs and persist POSTs.
+    // The previous split (GET = native /holders, cap 20/outcome) meant
+    // the match detail page only ever saw 40 wallets max, missing the
+    // long tail of qualified sharps. GET uses a slightly narrower trade
+    // sample to keep latency on the live view reasonable; POST still
+    // casts the widest net since it's writing the canonical prediction
+    // row.
     const poolOptions = options.persist
       ? {
           expandPool: true,
@@ -2241,7 +2249,13 @@ export class PolymarketService implements OnModuleInit {
           tradeSampleSize: 5_000,
           leaderboardSize: 200,
         }
-      : {};
+      : {
+          expandPool: true,
+          targetHoldersPerOutcome: 10_000,
+          includeLeaderboardInPool: true,
+          tradeSampleSize: 2_000,
+          leaderboardSize: 100,
+        };
 
     // Merge DB-stored threshold overrides. Admin-facing endpoint lets
     // operators tune gates without shipping code — non-null DB fields
