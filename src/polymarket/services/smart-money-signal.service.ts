@@ -184,6 +184,16 @@ export class SmartMoneySignalService {
   }
 
   /**
+   * Public: compute lifetime stats from an already-fetched set of
+   * positions. Used by the wallet-analyzer which paginates positions
+   * itself (via getUserPositionsAll + getUserClosedPositionsAll) and
+   * doesn't want a second set of API calls via getWalletLifetimeStats.
+   */
+  computeLifetimeStats(positions: UserPosition[]): LifetimeStats {
+    return this.lifetimeStats(positions);
+  }
+
+  /**
    * Compute the smart-money signal for a single market.
    *
    * Returns `leanScore: null` when fewer than `minSharpCount` qualifying

@@ -1744,6 +1744,7 @@ export class PolymarketService implements OnModuleInit {
       totalBought: number;
       endDate: string | null;
     }>;
+    truncated: boolean;
   } | null> {
     const trimmed = query.trim();
     if (!trimmed) return null;
@@ -1791,17 +1792,25 @@ export class PolymarketService implements OnModuleInit {
 
     if (!wallet) return null;
 
-    // Pull positions (open + closed, 200 each) and compute stats reusing
-    // the same lifetime aggregation the smart-money signal runs.
-    const [openPositions, closedPositions] = await Promise.all([
-      this.polymarketDataService.getUserPositions(wallet, { limit: 200 }),
-      this.polymarketDataService.getUserClosedPositions(wallet, {
-        limit: 200,
-      }),
+    // Pull the full position book via paginated /positions and
+    // /closed-positions. The single-page fetchers cap at 200 rows each,
+    // which silently truncates whales; here we walk offset until the API
+    // returns a short page (max 20 pages × 500 rows each = 10,000 per
+    // side — enough to cover the biggest traders on Polymarket today).
+    // Lifetime stats are then computed from the paginated set directly,
+    // so totalPnl / resolvedCount / streaks reflect real history instead
+    // of the most recent 400 rows.
+    const [openResult, closedResult] = await Promise.all([
+      this.polymarketDataService.getUserPositionsAll(wallet),
+      this.polymarketDataService.getUserClosedPositionsAll(wallet),
     ]);
-    const stats = await this.smartMoneySignalService.getWalletLifetimeStats(
-      wallet,
-    );
+    const openPositions = openResult.positions;
+    const closedPositions = closedResult.positions;
+    const truncated = openResult.truncated || closedResult.truncated;
+    const stats = this.smartMoneySignalService.computeLifetimeStats([
+      ...openPositions,
+      ...closedPositions,
+    ]);
 
     // Gate checks — mirrors the defaults in SmartMoneySignalService.
     const MIN_PNL = 50_000;
@@ -1953,6 +1962,7 @@ export class PolymarketService implements OnModuleInit {
       biggestLosses,
       allWins,
       allLosses,
+      truncated,
     };
   }
 

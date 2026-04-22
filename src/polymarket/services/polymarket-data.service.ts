@@ -311,6 +311,113 @@ export class PolymarketDataService {
   }
 
   /**
+   * Paginated sweep of every open position for a wallet. Required by the
+   * wallet-analyzer endpoint where a partial view of a whale's book
+   * materially changes the reported PnL, resolved count, and streak
+   * numbers. Walks `/positions?offset=` until the API returns a short
+   * page or we hit `maxPages` as a safety stop.
+   *
+   * Distinct from `getUserPositions` which stays at a hard 200-row cap
+   * for hot paths like the /predict smart-money pool — fanning out
+   * 20× per wallet × N wallets would hammer the upstream API.
+   *
+   * `truncated === true` means we exhausted `maxPages` without seeing
+   * an end-of-list signal, so callers know the result is a lower bound.
+   */
+  async getUserPositionsAll(
+    proxyWallet: string,
+    opts: { pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
+    const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
+    const maxPages = Math.max(1, opts.maxPages ?? 20);
+    const cacheKey = `positions-all:${proxyWallet}:${pageSize}:${maxPages}`;
+    return this.cached(cacheKey, this.POSITIONS_TTL_MS, async () => {
+      return this.paginatedPositions(
+        '/positions',
+        proxyWallet,
+        pageSize,
+        maxPages,
+        'getUserPositionsAll',
+      );
+    });
+  }
+
+  /** Paginated sweep of every closed position for a wallet. See getUserPositionsAll. */
+  async getUserClosedPositionsAll(
+    proxyWallet: string,
+    opts: { pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
+    const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
+    const maxPages = Math.max(1, opts.maxPages ?? 20);
+    const cacheKey = `closed-positions-all:${proxyWallet}:${pageSize}:${maxPages}`;
+    return this.cached(cacheKey, this.POSITIONS_TTL_MS, async () => {
+      return this.paginatedPositions(
+        '/closed-positions',
+        proxyWallet,
+        pageSize,
+        maxPages,
+        'getUserClosedPositionsAll',
+      );
+    });
+  }
+
+  private async paginatedPositions(
+    endpoint: '/positions' | '/closed-positions',
+    proxyWallet: string,
+    pageSize: number,
+    maxPages: number,
+    label: string,
+  ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
+    const seen = new Set<string>();
+    const out: UserPosition[] = [];
+    for (let page = 0; page < maxPages; page++) {
+      let rows: UserPosition[] = [];
+      try {
+        const r = await this.client.get<UserPosition[]>(endpoint, {
+          params: {
+            user: proxyWallet,
+            limit: pageSize,
+            offset: page * pageSize,
+          },
+        });
+        rows = Array.isArray(r.data) ? r.data : [];
+      } catch (err) {
+        this.logger.warn(
+          `${label} page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
+        );
+        // Treat a network blip as end-of-list rather than truncation — we
+        // don't actually know there's more, and flagging truncated would
+        // falsely scare the UI.
+        return { positions: out, truncated: false };
+      }
+
+      // Dedup: if the API ignores `offset`, it'll hand us the same page
+      // again and we'd loop forever. The (proxyWallet, asset) tuple is
+      // unique per user × outcome token.
+      let added = 0;
+      for (const row of rows) {
+        const key = `${row.asset}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(row);
+        added++;
+      }
+      if (added === 0) {
+        // Either we reached the end or the API stopped honoring offset —
+        // either way, further paging is pointless.
+        return { positions: out, truncated: false };
+      }
+      if (rows.length < pageSize) {
+        // Short page: explicit end-of-list from the API.
+        return { positions: out, truncated: false };
+      }
+    }
+    // We filled maxPages × pageSize unique rows and the API never signaled
+    // end-of-list. More probably exist.
+    return { positions: out, truncated: true };
+  }
+
+  /**
    * Expanded holder pool for a market — breaks past Polymarket's 20-per-
    * outcome cap on `/holders` by unioning with traders derived from
    * `/trades` (reconstructed net positions) and optionally the global
