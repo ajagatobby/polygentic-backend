@@ -10,6 +10,7 @@ import {
   eq,
   and,
   isNull,
+  isNotNull,
   sql,
   desc,
   asc,
@@ -38,6 +39,11 @@ import {
   BankrollContext,
   TeamStandingsContext,
 } from './services/polymarket-trading.agent';
+import {
+  SmartMoneySignalService,
+  SmartMoneySignal,
+} from './services/smart-money-signal.service';
+import { PolymarketDataService } from './services/polymarket-data.service';
 
 /**
  * PolymarketService — Orchestrator
@@ -62,6 +68,8 @@ export class PolymarketService implements OnModuleInit {
     private readonly clobService: PolymarketClobService,
     private readonly matcherService: PolymarketMatcherService,
     private readonly tradingAgent: PolymarketTradingAgent,
+    private readonly smartMoneySignalService: SmartMoneySignalService,
+    private readonly polymarketDataService: PolymarketDataService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -336,6 +344,210 @@ export class PolymarketService implements OnModuleInit {
     return this.getTradingConfig();
   }
 
+  // ─── Smart-money thresholds (runtime-tunable) ─────────────────────────
+  //
+  // Mirrors the trading-config pattern above. DB row (one per profile)
+  // overrides the hard-coded DEFAULTS in SmartMoneySignalService. Cached
+  // 30s so a prediction cycle doesn't hammer the table.
+
+  private smartMoneyConfigCache:
+    | {
+        profile: string;
+        minLifetimePnl: number | null;
+        minLifetimePnlWithStreak: number | null;
+        minLifetimeRoi: number | null;
+        minResolvedBets: number | null;
+        minSharpCount: number | null;
+        minPositionMultiple: number | null;
+        correlationThreshold: number | null;
+        minLast10WinRate: number | null;
+        minCurrentStreak: number | null;
+        updatedAt: Date | null;
+      }
+    | null = null;
+  private smartMoneyConfigCacheAt = 0;
+
+  /**
+   * Read the current sharp-qualification thresholds. Returns a row with
+   * null fields when no DB override exists — caller treats null as
+   * "use the service default".
+   */
+  async getSmartMoneyConfig(): Promise<{
+    profile: string;
+    minLifetimePnl: number | null;
+    minLifetimePnlWithStreak: number | null;
+    minLifetimeRoi: number | null;
+    minResolvedBets: number | null;
+    minSharpCount: number | null;
+    minPositionMultiple: number | null;
+    correlationThreshold: number | null;
+    minLast10WinRate: number | null;
+    minCurrentStreak: number | null;
+    updatedAt: Date | null;
+  }> {
+    if (
+      this.smartMoneyConfigCache &&
+      Date.now() - this.smartMoneyConfigCacheAt < 30_000
+    ) {
+      return this.smartMoneyConfigCache;
+    }
+
+    const empty = {
+      profile: 'default',
+      minLifetimePnl: null,
+      minLifetimePnlWithStreak: null,
+      minLifetimeRoi: null,
+      minResolvedBets: null,
+      minSharpCount: null,
+      minPositionMultiple: null,
+      correlationThreshold: null,
+      minLast10WinRate: null,
+      minCurrentStreak: null,
+      updatedAt: null,
+    };
+
+    try {
+      const rows = await this.db
+        .select()
+        .from(schema.smartMoneyConfig)
+        .where(eq(schema.smartMoneyConfig.profile, 'default'))
+        .limit(1);
+      const row = rows[0];
+      if (!row) {
+        this.smartMoneyConfigCache = empty;
+        this.smartMoneyConfigCacheAt = Date.now();
+        return empty;
+      }
+      const parsed = {
+        profile: row.profile as string,
+        minLifetimePnl:
+          row.minLifetimePnl != null ? Number(row.minLifetimePnl) : null,
+        minLifetimePnlWithStreak:
+          row.minLifetimePnlWithStreak != null
+            ? Number(row.minLifetimePnlWithStreak)
+            : null,
+        minLifetimeRoi:
+          row.minLifetimeRoi != null ? Number(row.minLifetimeRoi) : null,
+        minResolvedBets:
+          row.minResolvedBets != null ? Number(row.minResolvedBets) : null,
+        minSharpCount:
+          row.minSharpCount != null ? Number(row.minSharpCount) : null,
+        minPositionMultiple:
+          row.minPositionMultiple != null
+            ? Number(row.minPositionMultiple)
+            : null,
+        correlationThreshold:
+          row.correlationThreshold != null
+            ? Number(row.correlationThreshold)
+            : null,
+        minLast10WinRate:
+          row.minLast10WinRate != null ? Number(row.minLast10WinRate) : null,
+        minCurrentStreak:
+          row.minCurrentStreak != null ? Number(row.minCurrentStreak) : null,
+        updatedAt: (row.updatedAt as Date | null) ?? null,
+      };
+      this.smartMoneyConfigCache = parsed;
+      this.smartMoneyConfigCacheAt = Date.now();
+      return parsed;
+    } catch (err) {
+      this.logger.debug(
+        `smart_money_config table not available, using service defaults: ${
+          (err as Error).message
+        }`,
+      );
+      this.smartMoneyConfigCache = empty;
+      this.smartMoneyConfigCacheAt = Date.now();
+      return empty;
+    }
+  }
+
+  /**
+   * Partial update of the sharp thresholds. Upserts the single
+   * profile='default' row. Pass null for a field to clear the override
+   * (revert to service default).
+   */
+  async updateSmartMoneyConfig(
+    updates: Partial<{
+      minLifetimePnl: number | null;
+      minLifetimePnlWithStreak: number | null;
+      minLifetimeRoi: number | null;
+      minResolvedBets: number | null;
+      minSharpCount: number | null;
+      minPositionMultiple: number | null;
+      correlationThreshold: number | null;
+      minLast10WinRate: number | null;
+      minCurrentStreak: number | null;
+    }>,
+  ) {
+    // Convert numeric → string for Drizzle's numeric columns; null clears.
+    const n = (v: number | null | undefined): string | null | undefined => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      return String(v);
+    };
+    const i = (v: number | null | undefined): number | null | undefined => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      return Math.round(v);
+    };
+
+    const payload: any = { updatedAt: new Date() };
+    if (updates.minLifetimePnl !== undefined)
+      payload.minLifetimePnl = n(updates.minLifetimePnl);
+    if (updates.minLifetimePnlWithStreak !== undefined)
+      payload.minLifetimePnlWithStreak = n(updates.minLifetimePnlWithStreak);
+    if (updates.minLifetimeRoi !== undefined)
+      payload.minLifetimeRoi = n(updates.minLifetimeRoi);
+    if (updates.minResolvedBets !== undefined)
+      payload.minResolvedBets = i(updates.minResolvedBets);
+    if (updates.minSharpCount !== undefined)
+      payload.minSharpCount = i(updates.minSharpCount);
+    if (updates.minPositionMultiple !== undefined)
+      payload.minPositionMultiple = n(updates.minPositionMultiple);
+    if (updates.correlationThreshold !== undefined)
+      payload.correlationThreshold = n(updates.correlationThreshold);
+    if (updates.minLast10WinRate !== undefined)
+      payload.minLast10WinRate = n(updates.minLast10WinRate);
+    if (updates.minCurrentStreak !== undefined)
+      payload.minCurrentStreak = i(updates.minCurrentStreak);
+
+    await this.db
+      .insert(schema.smartMoneyConfig)
+      .values({ profile: 'default', ...payload })
+      .onConflictDoUpdate({
+        target: schema.smartMoneyConfig.profile,
+        set: payload,
+      });
+
+    this.smartMoneyConfigCache = null;
+    return this.getSmartMoneyConfig();
+  }
+
+  /**
+   * Returns the thresholds as a Partial<SmartMoneyOptions> ready to be
+   * merged into a computeSignal call. Only non-null DB values are
+   * included — the signal service's own defaults fill the rest.
+   */
+  async getSmartMoneyOptionsOverride(): Promise<Record<string, number>> {
+    const cfg = await this.getSmartMoneyConfig();
+    const out: Record<string, number> = {};
+    if (cfg.minLifetimePnl != null) out.minLifetimePnl = cfg.minLifetimePnl;
+    if (cfg.minLifetimePnlWithStreak != null)
+      out.minLifetimePnlWithStreak = cfg.minLifetimePnlWithStreak;
+    if (cfg.minLifetimeRoi != null) out.minLifetimeRoi = cfg.minLifetimeRoi;
+    if (cfg.minResolvedBets != null) out.minResolvedBets = cfg.minResolvedBets;
+    if (cfg.minSharpCount != null) out.minSharpCount = cfg.minSharpCount;
+    if (cfg.minPositionMultiple != null)
+      out.minPositionMultiple = cfg.minPositionMultiple;
+    if (cfg.correlationThreshold != null)
+      out.correlationThreshold = cfg.correlationThreshold;
+    if (cfg.minLast10WinRate != null)
+      out.minLast10WinRate = cfg.minLast10WinRate;
+    if (cfg.minCurrentStreak != null)
+      out.minCurrentStreak = cfg.minCurrentStreak;
+    return out;
+  }
+
   /**
    * Sync a new budget value to the active bankroll.
    * Updates initialBudget, recalculates currentBalance, and resets
@@ -399,6 +611,2075 @@ export class PolymarketService implements OnModuleInit {
    */
   async getWalletBalance(): Promise<number | null> {
     return this.clobService.getWalletBalance();
+  }
+
+  // ─── On-demand fixture linking ──────────────────────────────────────
+
+  /**
+   * In-memory "looked for but didn't find" cache to avoid hitting Gamma
+   * every time a prediction runs for a fixture Polymarket doesn't cover
+   * (lower leagues, friendlies). Key = fixtureId, value = timestamp of the
+   * last failed lookup.
+   */
+  private readonly onDemandMissCache = new Map<number, number>();
+  private readonly ON_DEMAND_MISS_TTL_MS = 2 * 60 * 60 * 1000; // 2h
+
+  /**
+   * Actively discover + link a fixture to its Polymarket market(s).
+   *
+   * Called during prediction generation when `polymarket_markets.fixture_id`
+   * has no row for this fixture — the scheduled scan either hasn't run yet,
+   * or Polymarket added the market after the last scan. We fetch a recent
+   * slice of soccer events from Gamma (~1000 events ordered by
+   * startDate DESC), run the existing matcher against JUST this one
+   * fixture, and persist any matches above threshold.
+   *
+   * Returns the count of linked markets. Zero means Polymarket has no
+   * market for this fixture (or our matcher can't find it) — caller
+   * proceeds without a smart-money signal.
+   */
+  async linkFixtureOnDemand(fixtureId: number): Promise<{
+    linked: number;
+    alreadyLinked: boolean;
+    cached: boolean;
+  }> {
+    // Already linked? Fast path.
+    const existing = await this.db
+      .select({ id: schema.polymarketMarkets.id })
+      .from(schema.polymarketMarkets)
+      .where(eq(schema.polymarketMarkets.fixtureId, fixtureId))
+      .limit(1);
+    if (existing.length > 0) {
+      return { linked: 0, alreadyLinked: true, cached: false };
+    }
+
+    // Negative cache? Don't hammer Gamma for hopeless fixtures.
+    const missedAt = this.onDemandMissCache.get(fixtureId);
+    if (
+      missedAt != null &&
+      Date.now() - missedAt < this.ON_DEMAND_MISS_TTL_MS
+    ) {
+      return { linked: 0, alreadyLinked: false, cached: true };
+    }
+
+    this.logger.log(
+      `On-demand Polymarket link: searching for fixture ${fixtureId}`,
+    );
+
+    try {
+      // Look up the fixture's league + kickoff + team names so we can try
+      // the fast Tier-2 (league-scoped) and Tier-3 (public-search) lookups
+      // before falling back to the 1000-event global scan.
+      const [fixtureRow] = await this.db
+        .select({
+          date: schema.fixtures.date,
+          leagueId: schema.fixtures.leagueId,
+          homeTeamId: schema.fixtures.homeTeamId,
+          awayTeamId: schema.fixtures.awayTeamId,
+        })
+        .from(schema.fixtures)
+        .where(eq(schema.fixtures.id, fixtureId))
+        .limit(1);
+
+      let homeName: string | null = null;
+      let awayName: string | null = null;
+      if (fixtureRow) {
+        const teamRows = await this.db
+          .select({ id: schema.teams.id, name: schema.teams.name })
+          .from(schema.teams)
+          .where(
+            inArray(schema.teams.id, [
+              fixtureRow.homeTeamId,
+              fixtureRow.awayTeamId,
+            ]),
+          );
+        homeName =
+          teamRows.find((t: any) => t.id === fixtureRow.homeTeamId)?.name ??
+          null;
+        awayName =
+          teamRows.find((t: any) => t.id === fixtureRow.awayTeamId)?.name ??
+          null;
+      }
+
+      let events: Awaited<
+        ReturnType<typeof this.gammaService.fetchRecentSoccerEvents>
+      > = [];
+      let tier: 'league-window' | 'public-search' | 'global-scan' =
+        'global-scan';
+
+      // Tier 2: league-scoped + kickoff window. Single HTTP call, typically
+      // 1-10 events. Works when we have both a kickoff date and a known
+      // Polymarket tag_slug for the fixture's league.
+      const tagSlug =
+        fixtureRow?.leagueId != null
+          ? PolymarketGammaService.tagSlugForLeagueId(fixtureRow.leagueId)
+          : null;
+      if (fixtureRow?.date && tagSlug) {
+        const kickoff = new Date(fixtureRow.date);
+        const tier2 = await this.gammaService.fetchEventsByLeagueAndDate(
+          tagSlug,
+          kickoff,
+          6,
+        );
+        if (tier2.length > 0) {
+          events = tier2;
+          tier = 'league-window';
+          this.logger.log(
+            `Tier 2 (${tagSlug}, ±6h): ${tier2.length} candidate event(s)`,
+          );
+        }
+      }
+
+      // Tier 3: public-search by team names. Catches fixtures in leagues
+      // we haven't mapped (tagSlug === null) and those that Polymarket
+      // tagged only with `soccer` instead of a league-specific tag.
+      if (events.length === 0 && homeName && awayName) {
+        const query = `${homeName} ${awayName}`;
+        const tier3 = await this.gammaService.searchEvents(query, {
+          tagSlugs: tagSlug ? [tagSlug] : undefined,
+          limit: 10,
+        });
+        if (tier3.length > 0) {
+          events = tier3;
+          tier = 'public-search';
+          this.logger.log(
+            `Tier 3 (public-search "${query}"): ${tier3.length} candidate event(s)`,
+          );
+        }
+      }
+
+      // Tier 4 fallback: generic soccer-tag scan. Slow (20 pages × 500) but
+      // last-resort coverage for edge cases where tiers 2 and 3 both miss.
+      if (events.length === 0) {
+        this.logger.log(
+          `Tiers 2+3 missed — falling back to global scan for fixture ${fixtureId}`,
+        );
+        events = await this.gammaService.fetchRecentSoccerEvents({
+          maxEvents: 1000,
+        });
+      }
+
+      // Run the matcher — matchEvents internally calls matchToFixture
+      // which queries the DB for candidate fixtures in a ±7 day window
+      // around each event's start time.
+      const matches = await this.matcherService.matchEvents(events);
+
+      // Filter to matches that link to THIS fixture specifically
+      const ourMatches = matches.filter(
+        (m: any) =>
+          m.marketType === 'match_outcome' && m.fixtureId === fixtureId,
+      );
+
+      if (ourMatches.length === 0) {
+        // No market found — cache the miss so we don't hit Gamma again
+        // immediately for this same fixture.
+        this.onDemandMissCache.set(fixtureId, Date.now());
+        this.logger.log(
+          `On-demand link: no Polymarket market for fixture ${fixtureId} (${events.length} events scanned, tier=${tier})`,
+        );
+        return { linked: 0, alreadyLinked: false, cached: false };
+      }
+
+      // Persist all matches we found for this fixture
+      await this.persistMarkets(ourMatches);
+      this.logger.log(
+        `On-demand link: fixture ${fixtureId} → ${ourMatches.length} market(s) linked (tier=${tier})`,
+      );
+      return {
+        linked: ourMatches.length,
+        alreadyLinked: false,
+        cached: false,
+      };
+    } catch (error) {
+      this.logger.warn(
+        `On-demand link failed for fixture ${fixtureId}: ${(error as Error).message}`,
+      );
+      // Don't cache on error — we want to retry next time
+      return { linked: 0, alreadyLinked: false, cached: false };
+    }
+  }
+
+  /**
+   * Predict a fixture outcome using ONLY the smart-money signal.
+   *
+   * No LLM, no Poisson, no research — this translates Polymarket sharp
+   * wallet positioning directly into a home/draw/away prediction.
+   *
+   * Flow:
+   *   1. Ensure the fixture is linked (run on-demand linker if missing).
+   *   2. Find a moneyline market ("Will TEAM win on DATE?").
+   *   3. Compute the smart-money signal for that conditionId.
+   *   4. Translate leanScore → home/draw/away probabilities with a fixed
+   *      25% draw prior and split the remaining mass by lean magnitude.
+   *   5. Confidence is a 1–10 score derived from sharp count, signal
+   *      confidence, and lean magnitude.
+   *
+   * Returns `prediction: null` with a `reason` when:
+   *   - Polymarket has no market for this fixture
+   *   - No qualifying sharps backed the market (leanScore null)
+   */
+  /**
+   * Batch-generate smart-money predictions for a set of fixtures.
+   * Walks the fixture table within a date window, running the same
+   * predict-and-persist flow as the single-fixture POST for each one.
+   *
+   * Runs with bounded concurrency so we don't blow up Polymarket with
+   * 50 parallel requests. Skips fixtures that already have a
+   * smart_money_prediction by default — pass forceRefresh=true to
+   * re-compute them.
+   *
+   * Returns a per-fixture status array so the caller can see which
+   * fixtures were generated / skipped / missed coverage, without
+   * polluting the response with full prediction payloads.
+   */
+  async generateTopPicksBatch(options: {
+    dateFrom?: Date;
+    dateTo?: Date;
+    leagueId?: number;
+    upcomingOnly?: boolean;
+    limit?: number;
+    skipExisting?: boolean;
+    concurrency?: number;
+  }): Promise<{
+    scanned: number;
+    generated: number;
+    skipped: number;
+    failed: number;
+    noCoverage: number;
+    noSharps: number;
+    durationMs: number;
+    results: Array<{
+      fixtureId: number;
+      status:
+        | 'generated'
+        | 'skipped'
+        | 'failed'
+        | 'no-coverage'
+        | 'no-sharps';
+      predictionId?: number;
+      confidence?: number;
+      predictedResult?: string;
+      leaningTeam?: string | null;
+      source?: string;
+      reason?: string;
+      error?: string;
+    }>;
+  }> {
+    const startedAt = Date.now();
+    const limit = Math.min(200, Math.max(1, options.limit ?? 50));
+    const concurrency = Math.min(
+      8,
+      Math.max(1, options.concurrency ?? 4),
+    );
+    const skipExisting = options.skipExisting !== false;
+
+    const now = new Date();
+    const dateFrom =
+      options.dateFrom ?? new Date(now.getTime() - 1 * 86400_000);
+    const dateTo =
+      options.dateTo ?? new Date(now.getTime() + 7 * 86400_000);
+
+    // 1. Fixtures in the window
+    const fixtureConds: any[] = [
+      gte(schema.fixtures.date, dateFrom),
+      lte(schema.fixtures.date, dateTo),
+    ];
+    if (options.leagueId != null) {
+      fixtureConds.push(eq(schema.fixtures.leagueId, options.leagueId));
+    }
+    if (options.upcomingOnly) {
+      fixtureConds.push(sql`${schema.fixtures.date} > NOW()`);
+    }
+
+    const fixtures = await this.db
+      .select({
+        id: schema.fixtures.id,
+        date: schema.fixtures.date,
+        leagueId: schema.fixtures.leagueId,
+      })
+      .from(schema.fixtures)
+      .where(and(...fixtureConds))
+      .orderBy(asc(schema.fixtures.date))
+      .limit(limit);
+
+    if (fixtures.length === 0) {
+      return {
+        scanned: 0,
+        generated: 0,
+        skipped: 0,
+        failed: 0,
+        noCoverage: 0,
+        noSharps: 0,
+        durationMs: Date.now() - startedAt,
+        results: [],
+      };
+    }
+
+    // 2. Filter out fixtures that already have a prediction (skipExisting)
+    let target = fixtures;
+    const skippedList: number[] = [];
+    if (skipExisting) {
+      const existing = await this.db
+        .select({ fixtureId: schema.smartMoneyPredictions.fixtureId })
+        .from(schema.smartMoneyPredictions)
+        .where(
+          inArray(
+            schema.smartMoneyPredictions.fixtureId,
+            fixtures.map((f: any) => f.id),
+          ),
+        );
+      const existingIds = new Set(
+        existing.map((e: any) => Number(e.fixtureId)),
+      );
+      target = fixtures.filter((f: any) => {
+        if (existingIds.has(f.id)) {
+          skippedList.push(f.id);
+          return false;
+        }
+        return true;
+      });
+    }
+
+    // 3. Run predictions with bounded concurrency. Cache-first (fresh=false)
+    //    so leaderboard + positions look-ups shared across fixtures benefit
+    //    from the 30min / 1h TTL.
+    const results: Array<{
+      fixtureId: number;
+      status:
+        | 'generated'
+        | 'skipped'
+        | 'failed'
+        | 'no-coverage'
+        | 'no-sharps';
+      predictionId?: number;
+      confidence?: number;
+      predictedResult?: string;
+      leaningTeam?: string | null;
+      source?: string;
+      reason?: string;
+      error?: string;
+    }> = [];
+
+    for (const id of skippedList) {
+      results.push({ fixtureId: id, status: 'skipped' });
+    }
+
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const idx = cursor++;
+        if (idx >= target.length) return;
+        const f = target[idx];
+        try {
+          const res = await this.predictFromSmartMoney(f.id, {
+            persist: true,
+            fresh: false,
+          });
+          if (res.prediction == null) {
+            const reason = res.reason ?? 'unknown';
+            results.push({
+              fixtureId: f.id,
+              status:
+                reason === 'no-polymarket-coverage' ||
+                reason === 'no-moneyline-market' ||
+                reason === 'fixture-not-found'
+                  ? 'no-coverage'
+                  : 'no-sharps',
+              reason,
+            });
+          } else {
+            const leaningTeam =
+              (res.smartMoneySignal as any)?.sharps?.leaningTeam ?? null;
+            results.push({
+              fixtureId: f.id,
+              status: 'generated',
+              predictionId: res.prediction.id,
+              confidence: res.prediction.confidence,
+              predictedResult: res.prediction.predictedResult,
+              leaningTeam,
+              source: res.prediction.source,
+            });
+          }
+        } catch (err) {
+          results.push({
+            fixtureId: f.id,
+            status: 'failed',
+            error: (err as Error).message,
+          });
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: concurrency }, () => worker()),
+    );
+
+    const generated = results.filter((r) => r.status === 'generated').length;
+    const skipped = results.filter((r) => r.status === 'skipped').length;
+    const failed = results.filter((r) => r.status === 'failed').length;
+    const noCoverage = results.filter((r) => r.status === 'no-coverage').length;
+    const noSharps = results.filter((r) => r.status === 'no-sharps').length;
+
+    return {
+      scanned: fixtures.length,
+      generated,
+      skipped,
+      failed,
+      noCoverage,
+      noSharps,
+      durationMs: Date.now() - startedAt,
+      results: results.sort((a, b) => a.fixtureId - b.fixtureId),
+    };
+  }
+
+  /**
+   * Top smart-money picks — the highest-confidence standalone
+   * smart-money predictions across our fixtures, with deep filtering
+   * and inline Polymarket links.
+   *
+   * Filter categories:
+   *   Prediction quality: confidence, source, thresholdMode,
+   *     predictedResult, min sharp count / lean magnitude / dollars,
+   *     strength bucket
+   *   Fixture: league, team, date range, kickoff status
+   *   Probabilities: per-outcome min/max
+   *   Resolution: resolved-only, correct-only
+   *
+   * Includes a `polymarket` block per pick with the market question,
+   * direct betting URL, and a recommendedBet sub-object describing the
+   * outcome this prediction implies (with edge vs market price).
+   */
+  async getTopSmartMoneyPicks(filters: {
+    // Prediction quality
+    minConfidence?: number;
+    maxConfidence?: number;
+    source?: 'direct' | 'market';
+    thresholdMode?: 'strict' | 'relaxed';
+    predictedResult?: 'home_win' | 'away_win' | 'draw';
+    minSharpCount?: number;
+    minLeanMagnitude?: number; // 0..1 — applies to |leanScore|
+    strength?: 'strong' | 'moderate' | 'weak';
+    minDollarsFor?: number;
+    leaningTeam?: 'home' | 'away';
+
+    // Fixture
+    leagueId?: number;
+    leagueName?: string;
+    leagueCountry?: string;
+    teamId?: number;
+    teamName?: string;
+    dateFrom?: string; // ISO
+    dateTo?: string;
+    upcomingOnly?: boolean; // only fixtures where date > now
+
+    // Probabilities
+    minHomeWinProb?: number;
+    maxHomeWinProb?: number;
+    minDrawProb?: number;
+    maxDrawProb?: number;
+    minAwayWinProb?: number;
+    maxAwayWinProb?: number;
+
+    // Edge vs market
+    minEdge?: number; // ourProbability − marketImpliedProb for the bet side
+
+    // Resolution
+    resolved?: boolean;
+    wasCorrect?: boolean;
+
+    // Sort + pagination
+    sortBy?:
+      | 'confidence'
+      | 'leanMagnitude'
+      | 'sharpCount'
+      | 'kickoff'
+      | 'createdAt'
+      | 'dollarsFor'
+      | 'edge';
+    sortOrder?: 'asc' | 'desc';
+    limit?: number;
+    offset?: number;
+  }): Promise<{
+    filters: any;
+    total: number;
+    picks: any[];
+  }> {
+    const limit = Math.min(100, Math.max(1, filters.limit ?? 20));
+    const offset = Math.max(0, filters.offset ?? 0);
+
+    // Build the WHERE conditions. Mix of column and JSONB path filters.
+    const conditions: any[] = [];
+
+    // ── Column-level filters ───────────────────────────────────────
+    if (filters.minConfidence != null) {
+      conditions.push(
+        gte(schema.smartMoneyPredictions.confidence, filters.minConfidence),
+      );
+    }
+    if (filters.maxConfidence != null) {
+      conditions.push(
+        lte(schema.smartMoneyPredictions.confidence, filters.maxConfidence),
+      );
+    }
+    if (filters.source) {
+      conditions.push(eq(schema.smartMoneyPredictions.source, filters.source));
+    }
+    if (filters.thresholdMode) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.thresholdMode, filters.thresholdMode),
+      );
+    }
+    if (filters.predictedResult) {
+      conditions.push(
+        eq(
+          schema.smartMoneyPredictions.predictedResult,
+          filters.predictedResult,
+        ),
+      );
+    }
+    if (filters.minHomeWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.homeWinProb} >= ${filters.minHomeWinProb}`,
+      );
+    }
+    if (filters.maxHomeWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.homeWinProb} <= ${filters.maxHomeWinProb}`,
+      );
+    }
+    if (filters.minDrawProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.drawProb} >= ${filters.minDrawProb}`,
+      );
+    }
+    if (filters.maxDrawProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.drawProb} <= ${filters.maxDrawProb}`,
+      );
+    }
+    if (filters.minAwayWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.awayWinProb} >= ${filters.minAwayWinProb}`,
+      );
+    }
+    if (filters.maxAwayWinProb != null) {
+      conditions.push(
+        sql`${schema.smartMoneyPredictions.awayWinProb} <= ${filters.maxAwayWinProb}`,
+      );
+    }
+    if (filters.resolved === true) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.predictionStatus, 'resolved'),
+      );
+    } else if (filters.resolved === false) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.predictionStatus, 'pending'),
+      );
+    }
+    if (filters.wasCorrect != null) {
+      conditions.push(
+        eq(schema.smartMoneyPredictions.wasCorrect, filters.wasCorrect),
+      );
+    }
+
+    // ── JSONB filters on smart_money_signal ────────────────────────
+    if (filters.minSharpCount != null) {
+      conditions.push(
+        sql`(${schema.smartMoneyPredictions.smartMoneySignal}->>'sharpCount')::int >= ${filters.minSharpCount}`,
+      );
+    }
+    if (filters.minLeanMagnitude != null) {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) >= ${filters.minLeanMagnitude}`,
+      );
+    }
+    if (filters.strength === 'strong') {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) >= 0.5`,
+      );
+    } else if (filters.strength === 'moderate') {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) >= 0.3 AND ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) < 0.5`,
+      );
+    } else if (filters.strength === 'weak') {
+      conditions.push(
+        sql`ABS((${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric) < 0.3`,
+      );
+    }
+    if (filters.minDollarsFor != null) {
+      // dollarsFor = max(sharpDollarsOutcome0, sharpDollarsOutcome1)
+      // whichever side the sharps lean
+      conditions.push(
+        sql`GREATEST(
+            (${schema.smartMoneyPredictions.smartMoneySignal}->>'sharpDollarsOutcome0')::numeric,
+            (${schema.smartMoneyPredictions.smartMoneySignal}->>'sharpDollarsOutcome1')::numeric
+          ) >= ${filters.minDollarsFor}`,
+      );
+    }
+
+    // ── Fixture joins applied later — track which filters require them
+    if (filters.leagueId != null) {
+      conditions.push(eq(schema.fixtures.leagueId, filters.leagueId));
+    }
+    if (filters.leagueName) {
+      conditions.push(
+        sql`${schema.fixtures.leagueName} ILIKE ${'%' + filters.leagueName + '%'}`,
+      );
+    }
+    if (filters.leagueCountry) {
+      conditions.push(
+        sql`${schema.fixtures.leagueCountry} ILIKE ${'%' + filters.leagueCountry + '%'}`,
+      );
+    }
+    if (filters.teamId != null) {
+      conditions.push(
+        sql`(${schema.fixtures.homeTeamId} = ${filters.teamId} OR ${schema.fixtures.awayTeamId} = ${filters.teamId})`,
+      );
+    }
+    if (filters.dateFrom) {
+      conditions.push(gte(schema.fixtures.date, new Date(filters.dateFrom)));
+    }
+    if (filters.dateTo) {
+      conditions.push(lte(schema.fixtures.date, new Date(filters.dateTo)));
+    }
+    if (filters.upcomingOnly) {
+      conditions.push(sql`${schema.fixtures.date} > NOW()`);
+    }
+    // leaningTeam — sharps lean home = (signal points to the home team
+    // as the winner). Computed: (marketTeamId == homeTeamId AND
+    // leanScore > 0) OR (marketTeamId == awayTeamId AND leanScore < 0)
+    if (filters.leaningTeam === 'home') {
+      conditions.push(
+        sql`(
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.homeTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric > 0)
+          OR
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.awayTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric < 0)
+        )`,
+      );
+    } else if (filters.leaningTeam === 'away') {
+      conditions.push(
+        sql`(
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.awayTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric > 0)
+          OR
+          ((${schema.smartMoneyPredictions.smartMoneySignal}->>'marketTeamId')::int = ${schema.fixtures.homeTeamId}
+           AND (${schema.smartMoneyPredictions.smartMoneySignal}->>'leanScore')::numeric < 0)
+        )`,
+      );
+    }
+
+    // ── Sort ────────────────────────────────────────────────────────
+    const dir = filters.sortOrder === 'asc' ? 'asc' : 'desc';
+    let orderBy: any;
+    switch (filters.sortBy) {
+      case 'leanMagnitude':
+        orderBy = sql.raw(
+          `ABS((smart_money_signal->>'leanScore')::numeric) ${dir}`,
+        );
+        break;
+      case 'sharpCount':
+        orderBy = sql.raw(
+          `((smart_money_signal->>'sharpCount')::int) ${dir}`,
+        );
+        break;
+      case 'kickoff':
+        orderBy = sql.raw(`fixtures.date ${dir}`);
+        break;
+      case 'createdAt':
+        orderBy = sql.raw(
+          `smart_money_predictions.created_at ${dir}`,
+        );
+        break;
+      case 'dollarsFor':
+        orderBy = sql.raw(
+          `GREATEST(
+            (smart_money_signal->>'sharpDollarsOutcome0')::numeric,
+            (smart_money_signal->>'sharpDollarsOutcome1')::numeric
+          ) ${dir}`,
+        );
+        break;
+      case 'confidence':
+      default:
+        orderBy = sql.raw(`smart_money_predictions.confidence ${dir}`);
+        break;
+    }
+
+    // ── Base query ─────────────────────────────────────────────────
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // Use a single join so all fixture filters apply.
+    const baseQuery = this.db
+      .select({
+        pred: schema.smartMoneyPredictions,
+        fixtureId: schema.fixtures.id,
+        fixtureDate: schema.fixtures.date,
+        fixtureStatus: schema.fixtures.status,
+        fixtureStatusLong: schema.fixtures.statusLong,
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+        leagueId: schema.fixtures.leagueId,
+        leagueName: schema.fixtures.leagueName,
+        leagueCountry: schema.fixtures.leagueCountry,
+        goalsHome: schema.fixtures.goalsHome,
+        goalsAway: schema.fixtures.goalsAway,
+      })
+      .from(schema.smartMoneyPredictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.smartMoneyPredictions.fixtureId, schema.fixtures.id),
+      );
+
+    const [rows, countRows] = await Promise.all([
+      whereClause
+        ? baseQuery
+            .where(whereClause)
+            .orderBy(orderBy)
+            .limit(limit)
+            .offset(offset)
+        : baseQuery.orderBy(orderBy).limit(limit).offset(offset),
+      this.db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.smartMoneyPredictions)
+        .innerJoin(
+          schema.fixtures,
+          eq(schema.smartMoneyPredictions.fixtureId, schema.fixtures.id),
+        )
+        .where(whereClause ?? sql`true`),
+    ]);
+
+    if (rows.length === 0) {
+      return {
+        filters,
+        total: Number(countRows[0]?.count ?? 0),
+        picks: [],
+      };
+    }
+
+    // ── Team name filter (post-query) ──────────────────────────────
+    // (cheaper than joining twice; team names are rarely a hot filter)
+
+    // ── Enrich with teams + polymarket links ───────────────────────
+    const teamIds = new Set<number>();
+    const fixtureIds: number[] = [];
+    for (const r of rows) {
+      if (r.homeTeamId) teamIds.add(r.homeTeamId);
+      if (r.awayTeamId) teamIds.add(r.awayTeamId);
+      fixtureIds.push(r.fixtureId);
+    }
+
+    const [teamRows, marketRows] = await Promise.all([
+      teamIds.size > 0
+        ? this.db
+            .select({
+              id: schema.teams.id,
+              name: schema.teams.name,
+              shortName: schema.teams.shortName,
+              logo: schema.teams.logo,
+            })
+            .from(schema.teams)
+            .where(inArray(schema.teams.id, [...teamIds]))
+        : Promise.resolve([]),
+      this.db
+        .select({
+          fixtureId: schema.polymarketMarkets.fixtureId,
+          teamId: schema.polymarketMarkets.teamId,
+          conditionId: schema.polymarketMarkets.conditionId,
+          marketQuestion: schema.polymarketMarkets.marketQuestion,
+          marketType: schema.polymarketMarkets.marketType,
+          slug: schema.polymarketMarkets.slug,
+          eventSlug: schema.polymarketMarkets.eventSlug,
+          outcomes: schema.polymarketMarkets.outcomes,
+          outcomePrices: schema.polymarketMarkets.outcomePrices,
+          midpoints: schema.polymarketMarkets.midpoints,
+        })
+        .from(schema.polymarketMarkets)
+        .where(
+          and(
+            inArray(schema.polymarketMarkets.fixtureId, fixtureIds),
+            eq(schema.polymarketMarkets.marketType, 'match_outcome'),
+          ),
+        ),
+    ]);
+
+    const teamMap = new Map<number, any>();
+    for (const t of teamRows) teamMap.set(t.id, t);
+
+    // Markets grouped by fixture
+    const marketsByFixture = new Map<number, any[]>();
+    for (const m of marketRows) {
+      const list = marketsByFixture.get(m.fixtureId as number) ?? [];
+      list.push(m);
+      marketsByFixture.set(m.fixtureId as number, list);
+    }
+
+    // ── Assemble picks ─────────────────────────────────────────────
+    const picks = rows
+      .map((r: any) => {
+        const pred = r.pred;
+        const homeTeam = teamMap.get(r.homeTeamId);
+        const awayTeam = teamMap.get(r.awayTeamId);
+        const homeName = homeTeam?.name ?? null;
+        const awayName = awayTeam?.name ?? null;
+
+        // Post-query teamName filter
+        if (filters.teamName) {
+          const needle = filters.teamName.toLowerCase();
+          const matched =
+            (homeName ?? '').toLowerCase().includes(needle) ||
+            (awayName ?? '').toLowerCase().includes(needle);
+          if (!matched) return null;
+        }
+
+        // Find the moneyline market that matches the signal's
+        // marketTeamId — that's the one the sharp signal was
+        // computed against and the one the user should bet on.
+        const signal = pred.smartMoneySignal ?? null;
+        const marketTeamId = signal?.marketTeamId ?? null;
+        const fixtureMarkets = marketsByFixture.get(r.fixtureId) ?? [];
+        const chosenMarket =
+          fixtureMarkets.find(
+            (m) =>
+              m.teamId === marketTeamId &&
+              m.conditionId &&
+              /^will\s+.+?\s+win/i.test(String(m.marketQuestion ?? '')),
+          ) ??
+          fixtureMarkets.find(
+            (m) =>
+              m.conditionId &&
+              /^will\s+.+?\s+win/i.test(String(m.marketQuestion ?? '')),
+          ) ??
+          null;
+
+        const marketUrl = chosenMarket?.slug
+          ? `https://polymarket.com/market/${chosenMarket.slug}`
+          : null;
+        const eventUrl = chosenMarket?.eventSlug
+          ? `https://polymarket.com/event/${chosenMarket.eventSlug}`
+          : null;
+
+        // Recommended bet: map predicted result → Polymarket outcome
+        // on the chosen market. For "Will TEAM win?" market:
+        //   marketIsHome + predictedResult=home_win → YES (backs home)
+        //   marketIsHome + predictedResult=away_win → NO (backs away/draw)
+        //   marketIsHome + predictedResult=draw     → NO (draw covered by NO)
+        //   marketIsAway + predictedResult=away_win → YES
+        //   else NO
+        let recommendedBet: any = null;
+        if (chosenMarket && marketTeamId != null) {
+          const marketIsHome = marketTeamId === r.homeTeamId;
+          const marketTeamName = marketIsHome ? homeName : awayName;
+          const otherTeamName = marketIsHome ? awayName : homeName;
+          const wantYes =
+            (marketIsHome && pred.predictedResult === 'home_win') ||
+            (!marketIsHome && pred.predictedResult === 'away_win');
+          const outcome = wantYes ? 'Yes' : 'No';
+          const backs = wantYes
+            ? marketTeamName
+            : otherTeamName != null
+              ? `${otherTeamName} or Draw`
+              : 'No';
+          const mid = chosenMarket.midpoints?.[wantYes ? 0 : 1];
+          const outPrice = chosenMarket.outcomePrices?.[wantYes ? 0 : 1];
+          const impliedPrice =
+            mid != null
+              ? Number(mid)
+              : outPrice != null
+                ? Number(outPrice)
+                : null;
+
+          // Our implied probability for this bet.
+          // YES = the market team wins; NO = market team doesn't win
+          // (draw + other side win).
+          const homeWinProb = Number(pred.homeWinProb ?? 0);
+          const drawProb = Number(pred.drawProb ?? 0);
+          const awayWinProb = Number(pred.awayWinProb ?? 0);
+          let ourProb = 0;
+          if (wantYes) {
+            ourProb = marketIsHome ? homeWinProb : awayWinProb;
+          } else {
+            ourProb = marketIsHome
+              ? drawProb + awayWinProb
+              : drawProb + homeWinProb;
+          }
+          const edge =
+            impliedPrice != null ? Number((ourProb - impliedPrice).toFixed(4)) : null;
+
+          recommendedBet = {
+            outcome,
+            backs,
+            impliedPrice:
+              impliedPrice != null ? Number(impliedPrice.toFixed(4)) : null,
+            ourProbability: Number(ourProb.toFixed(4)),
+            edge,
+          };
+        }
+
+        return {
+          fixture: {
+            id: r.fixtureId,
+            date: r.fixtureDate,
+            status: r.fixtureStatus,
+            statusLong: r.fixtureStatusLong,
+            goalsHome: r.goalsHome,
+            goalsAway: r.goalsAway,
+            league: {
+              id: r.leagueId,
+              name: r.leagueName,
+              country: r.leagueCountry,
+            },
+            homeTeam: homeTeam
+              ? {
+                  id: r.homeTeamId,
+                  name: homeTeam.name,
+                  shortName: homeTeam.shortName,
+                  logo: homeTeam.logo,
+                }
+              : { id: r.homeTeamId, name: null, logo: null },
+            awayTeam: awayTeam
+              ? {
+                  id: r.awayTeamId,
+                  name: awayTeam.name,
+                  shortName: awayTeam.shortName,
+                  logo: awayTeam.logo,
+                }
+              : { id: r.awayTeamId, name: null, logo: null },
+          },
+          prediction: {
+            id: pred.id,
+            homeWinProb: Number(pred.homeWinProb),
+            drawProb: Number(pred.drawProb),
+            awayWinProb: Number(pred.awayWinProb),
+            predictedResult: pred.predictedResult,
+            confidence: pred.confidence,
+            source: pred.source,
+            thresholdMode: pred.thresholdMode,
+            predictionStatus: pred.predictionStatus,
+            actualResult: pred.actualResult,
+            wasCorrect: pred.wasCorrect,
+            probabilityAccuracy:
+              pred.probabilityAccuracy != null
+                ? Number(pred.probabilityAccuracy)
+                : null,
+            createdAt: pred.createdAt,
+            updatedAt: pred.updatedAt,
+          },
+          signal: this.formatSmartMoneyView(signal, {
+            homeTeamId: r.homeTeamId,
+            awayTeamId: r.awayTeamId,
+            homeName,
+            awayName,
+            marketTeamId,
+          }),
+          copyTrader: this.buildCopyTrader(signal, {
+            homeTeamId: r.homeTeamId,
+            awayTeamId: r.awayTeamId,
+            homeName,
+            awayName,
+            marketTeamId,
+            marketUrl,
+            eventUrl,
+          }),
+          polymarket: chosenMarket
+            ? {
+                conditionId: chosenMarket.conditionId,
+                marketQuestion: chosenMarket.marketQuestion,
+                marketUrl,
+                eventUrl,
+                url: marketUrl ?? eventUrl,
+                recommendedBet,
+              }
+            : null,
+        };
+      })
+      .filter((p): p is NonNullable<typeof p> => p != null);
+
+    // Apply minEdge post-enrichment (depends on recommendedBet.edge)
+    const edgeFiltered =
+      filters.minEdge != null
+        ? picks.filter(
+            (p) =>
+              p.polymarket?.recommendedBet?.edge != null &&
+              p.polymarket.recommendedBet.edge >= (filters.minEdge as number),
+          )
+        : picks;
+
+    return {
+      filters,
+      total: Number(countRows[0]?.count ?? 0),
+      picks: edgeFiltered,
+    };
+  }
+
+  /**
+   * Fetch the persisted smart-money-only prediction for a fixture, or
+   * null if none exists. Separate table from the main `predictions`, so
+   * LLM predictions and smart-money predictions never mix.
+   */
+  async getSmartMoneyPredictionForFixture(
+    fixtureId: number,
+  ): Promise<any | null> {
+    const [row] = await this.db
+      .select()
+      .from(schema.smartMoneyPredictions)
+      .where(eq(schema.smartMoneyPredictions.fixtureId, fixtureId))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Bulk fetch — used by list endpoints that need to attach the
+   * smart-money prediction to each fixture without N+1 lookups.
+   */
+  async getSmartMoneyPredictionsForFixtures(
+    fixtureIds: number[],
+  ): Promise<Map<number, any>> {
+    if (fixtureIds.length === 0) return new Map();
+    const rows = await this.db
+      .select()
+      .from(schema.smartMoneyPredictions)
+      .where(inArray(schema.smartMoneyPredictions.fixtureId, fixtureIds));
+    const map = new Map<number, any>();
+    for (const r of rows) map.set(r.fixtureId, r);
+    return map;
+  }
+
+  /**
+   * Return every top holder for a Polymarket market, unioning all
+   * available discovery sources (no truncation by default).
+   *
+   *   - /holders top-20 per outcome
+   *   - /trades aggregation (up to 1000 trades → net position per wallet)
+   *   - Top-100 leaderboard wallets × /positions cross-check
+   *
+   * Supports a comprehensive filter set so callers can scope the pool
+   * before it ships over the wire. Any filter that touches lifetime
+   * stats (pnl, roi, last10, last20, streak, resolved) auto-enables
+   * enrichment so the values exist to filter against.
+   */
+  async getAllMarketHolders(
+    conditionId: string,
+    opts: {
+      enrich?: boolean;
+      // Bet-level filters (no enrichment needed)
+      outcome?: 0 | 1;
+      minAmount?: number;
+      maxAmount?: number;
+      // Lifetime-stat filters (auto-enable enrichment)
+      minPnl?: number;
+      maxPnl?: number;
+      minRoi?: number;
+      maxRoi?: number;
+      minLast10Wins?: number;
+      minLast20Wins?: number;
+      minStreak?: number;
+      minResolved?: number;
+      // Output controls
+      sortBy?:
+        | 'amount'
+        | 'pnl'
+        | 'roi'
+        | 'last10Wins'
+        | 'last20Wins'
+        | 'streak';
+      sortOrder?: 'asc' | 'desc';
+      limit?: number;
+    } = {},
+  ): Promise<{
+    conditionId: string;
+    totalHolders: number;
+    outcomes: Array<{
+      outcomeIndex: number;
+      outcomeName: string;
+      token: string;
+      holderCount: number;
+      totalAmount: number;
+      holders: Array<{
+        wallet: string;
+        name: string;
+        pseudonym: string;
+        amount: number;
+        outcomeIndex: number;
+        outcomeName: string;
+        lifetimePnl?: number;
+        lifetimeRoi?: number;
+        last10Wins?: number | null;
+        last10WinRate?: number;
+        last20Wins?: number | null;
+        last20WinRate?: number;
+        currentWinStreak?: number;
+        resolvedCount?: number;
+      }>;
+    }>;
+  }> {
+    const expanded = await this.polymarketDataService.getExpandedHolders(
+      conditionId,
+      {
+        targetPerOutcome: 10_000, // effectively unlimited — no truncation
+        includeLeaderboard: true,
+        tradeSampleSize: 1000,
+        leaderboardSize: 100,
+      },
+    );
+
+    // Auto-enable enrichment when a filter or sort needs lifetime stats.
+    const needsStatsForFilter =
+      opts.minPnl != null ||
+      opts.maxPnl != null ||
+      opts.minRoi != null ||
+      opts.maxRoi != null ||
+      opts.minLast10Wins != null ||
+      opts.minLast20Wins != null ||
+      opts.minStreak != null ||
+      opts.minResolved != null;
+    const needsStatsForSort =
+      opts.sortBy != null && opts.sortBy !== 'amount';
+    const enrichEffective =
+      opts.enrich === true || needsStatsForFilter || needsStatsForSort;
+
+    // Optional enrichment: lifetime stats per wallet.
+    let walletStats = new Map<
+      string,
+      {
+        lifetimePnl: number;
+        lifetimeRoi: number;
+        last10Wins: number | null;
+        last10WinRate: number;
+        last20Wins: number | null;
+        last20WinRate: number;
+        currentWinStreak: number;
+        resolvedCount: number;
+      }
+    >();
+    if (enrichEffective) {
+      const wallets = new Set<string>();
+      for (const o of expanded) {
+        for (const h of o.holders) wallets.add(h.proxyWallet);
+      }
+      const enrichments = await Promise.all(
+        [...wallets].map(async (w) => {
+          try {
+            const stats =
+              await this.smartMoneySignalService.getWalletLifetimeStats(w);
+            const roi =
+              stats.totalBought > 0 ? stats.totalPnl / stats.totalBought : 0;
+            return {
+              wallet: w,
+              pnl: stats.totalPnl,
+              roi,
+              last10Wins: stats.last10Wins,
+              last10WinRate: stats.last10WinRate,
+              last20Wins: stats.last20Wins,
+              last20WinRate: stats.last20WinRate,
+              streak: stats.currentWinStreak,
+              resolved: stats.resolvedCount,
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      for (const e of enrichments) {
+        if (!e) continue;
+        walletStats.set(e.wallet, {
+          lifetimePnl: e.pnl,
+          lifetimeRoi: e.roi,
+          last10Wins: e.last10Wins,
+          last10WinRate: e.last10WinRate,
+          last20Wins: e.last20Wins,
+          last20WinRate: e.last20WinRate,
+          currentWinStreak: e.streak,
+          resolvedCount: e.resolved,
+        });
+      }
+    }
+
+    // Pre-compute sort comparator + limit once — applied per outcome.
+    // Map the short sort key to the actual field name on the holder
+    // object (e.g. sortBy=streak → currentWinStreak).
+    const sortFieldMap: Record<string, string> = {
+      amount: 'amount',
+      pnl: 'lifetimePnl',
+      roi: 'lifetimeRoi',
+      last10Wins: 'last10Wins',
+      last20Wins: 'last20Wins',
+      streak: 'currentWinStreak',
+    };
+    const sortBy = opts.sortBy ?? 'amount';
+    const sortField = sortFieldMap[sortBy] ?? 'amount';
+    const dir = opts.sortOrder === 'asc' ? 1 : -1;
+    const cmp = (a: any, b: any) => {
+      const av = Number(a[sortField] ?? 0);
+      const bv = Number(b[sortField] ?? 0);
+      if (av === bv) return 0;
+      return av > bv ? dir : -dir;
+    };
+    const perOutcomeLimit =
+      opts.limit != null && opts.limit > 0 ? opts.limit : null;
+
+    const outcomes = expanded
+      // Outcome-level filter — drops the opposite side entirely when caller
+      // specified one side.
+      .filter((o) => {
+        if (opts.outcome == null) return true;
+        const idx = o.holders[0]?.outcomeIndex ?? -1;
+        return idx === opts.outcome;
+      })
+      .map((o) => {
+        const outcomeIndex = o.holders[0]?.outcomeIndex ?? 0;
+        const outcomeName =
+          ((o.holders[0]?.name as any)?.outcome as string | undefined) ??
+          (outcomeIndex === 0 ? 'Yes' : 'No');
+        const totalAmount = o.holders.reduce(
+          (sum, h) => sum + Number(h.amount ?? 0),
+          0,
+        );
+
+        // Map raw holders → response shape with optional enrichment merged.
+        const mapped = o.holders.map((h) => {
+          const enr = walletStats.get(h.proxyWallet);
+          return {
+            wallet: h.proxyWallet,
+            name: h.name ?? '',
+            pseudonym: h.pseudonym ?? '',
+            amount: Number(h.amount ?? 0),
+            outcomeIndex: h.outcomeIndex,
+            outcomeName,
+            ...(enr
+              ? {
+                  lifetimePnl: enr.lifetimePnl,
+                  lifetimeRoi: enr.lifetimeRoi,
+                  last10Wins: enr.last10Wins,
+                  last10WinRate: enr.last10WinRate,
+                  last20Wins: enr.last20Wins,
+                  last20WinRate: enr.last20WinRate,
+                  currentWinStreak: enr.currentWinStreak,
+                  resolvedCount: enr.resolvedCount,
+                }
+              : {}),
+          };
+        });
+
+        // Apply filters. Lifetime-stat filters drop wallets that have no
+        // enrichment (can't verify they pass the gate).
+        const filtered = mapped.filter((h) => {
+          if (opts.minAmount != null && h.amount < opts.minAmount) return false;
+          if (opts.maxAmount != null && h.amount > opts.maxAmount) return false;
+          if (opts.minPnl != null && (h.lifetimePnl ?? -Infinity) < opts.minPnl)
+            return false;
+          if (opts.maxPnl != null && (h.lifetimePnl ?? Infinity) > opts.maxPnl)
+            return false;
+          if (opts.minRoi != null && (h.lifetimeRoi ?? -Infinity) < opts.minRoi)
+            return false;
+          if (opts.maxRoi != null && (h.lifetimeRoi ?? Infinity) > opts.maxRoi)
+            return false;
+          if (
+            opts.minLast10Wins != null &&
+            ((h.last10Wins ?? -1) < opts.minLast10Wins)
+          )
+            return false;
+          if (
+            opts.minLast20Wins != null &&
+            ((h.last20Wins ?? -1) < opts.minLast20Wins)
+          )
+            return false;
+          if (
+            opts.minStreak != null &&
+            (h.currentWinStreak ?? -1) < opts.minStreak
+          )
+            return false;
+          if (
+            opts.minResolved != null &&
+            (h.resolvedCount ?? -1) < opts.minResolved
+          )
+            return false;
+          return true;
+        });
+
+        filtered.sort(cmp);
+        const limited = perOutcomeLimit
+          ? filtered.slice(0, perOutcomeLimit)
+          : filtered;
+
+        return {
+          outcomeIndex,
+          outcomeName,
+          token: o.token,
+          holderCount: limited.length,
+          totalAmount: Math.round(totalAmount),
+          holders: limited,
+        };
+      });
+
+    const totalHolders = outcomes.reduce((s, o) => s + o.holderCount, 0);
+
+    return {
+      conditionId,
+      totalHolders,
+      outcomes,
+    };
+  }
+
+  async predictFromSmartMoney(
+    fixtureId: number,
+    options: { persist?: boolean; fresh?: boolean } = {},
+  ): Promise<{
+    fixture: {
+      id: number;
+      date: Date | null;
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+      leagueId: number | null;
+      leagueName: string | null;
+    } | null;
+    prediction: {
+      id?: number;
+      homeWinProb: number;
+      drawProb: number;
+      awayWinProb: number;
+      predictedResult: 'home' | 'draw' | 'away';
+      confidence: number;
+      source: 'direct' | 'market';
+      thresholdMode?: 'strict' | 'relaxed';
+      note: string;
+      createdAt?: Date;
+    } | null;
+    smartMoneySignal: any;
+    copyTrader?: any;
+    marketSignal?: any;
+    polymarket?: {
+      marketQuestion: string;
+      marketTeam: string;
+      conditionId: string;
+      marketUrl: string | null;
+      eventUrl: string | null;
+      url: string | null;
+    };
+    stored?: boolean;
+    reason?: string;
+  }> {
+    // Fresh mode: nuke every cache that could serve stale data so the
+    // whole pipeline re-fetches from Polymarket — holders, trades,
+    // leaderboard, per-wallet positions, closed positions, and the
+    // on-demand negative cache.
+    //
+    // Default: POST = fresh, GET = cache. Callers can override via
+    // options.fresh to force either behaviour.
+    const useFresh = options.fresh ?? options.persist ?? false;
+    if (useFresh) {
+      this.onDemandMissCache.delete(fixtureId);
+      this.polymarketDataService.invalidateAll();
+    }
+
+    // Step 1: ensure the fixture is linked to Polymarket.
+    const existingLink = await this.db
+      .select({ id: schema.polymarketMarkets.id })
+      .from(schema.polymarketMarkets)
+      .where(eq(schema.polymarketMarkets.fixtureId, fixtureId))
+      .limit(1);
+    if (existingLink.length === 0) {
+      await this.linkFixtureOnDemand(fixtureId);
+    }
+
+    // Step 2: load the fixture + teams.
+    const [fixture] = await this.db
+      .select({
+        id: schema.fixtures.id,
+        date: schema.fixtures.date,
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+        leagueId: schema.fixtures.leagueId,
+        leagueName: schema.fixtures.leagueName,
+      })
+      .from(schema.fixtures)
+      .where(eq(schema.fixtures.id, fixtureId))
+      .limit(1);
+
+    if (!fixture) {
+      return {
+        fixture: null,
+        prediction: null,
+        smartMoneySignal: null,
+        reason: 'fixture-not-found',
+      };
+    }
+
+    const teamRows = await this.db
+      .select({ id: schema.teams.id, name: schema.teams.name })
+      .from(schema.teams)
+      .where(inArray(schema.teams.id, [fixture.homeTeamId, fixture.awayTeamId]));
+    const homeName =
+      teamRows.find((t: any) => t.id === fixture.homeTeamId)?.name ?? null;
+    const awayName =
+      teamRows.find((t: any) => t.id === fixture.awayTeamId)?.name ?? null;
+
+    const fixtureView = {
+      id: fixture.id,
+      date: fixture.date,
+      homeTeamId: fixture.homeTeamId,
+      awayTeamId: fixture.awayTeamId,
+      homeName,
+      awayName,
+      leagueId: fixture.leagueId,
+      leagueName: fixture.leagueName,
+    };
+
+    // Step 3: find a moneyline market for this fixture.
+    const linkedMarkets = await this.db
+      .select({
+        id: schema.polymarketMarkets.id,
+        conditionId: schema.polymarketMarkets.conditionId,
+        teamId: schema.polymarketMarkets.teamId,
+        marketQuestion: schema.polymarketMarkets.marketQuestion,
+        slug: schema.polymarketMarkets.slug,
+        eventSlug: schema.polymarketMarkets.eventSlug,
+        clobTokenIds: schema.polymarketMarkets.clobTokenIds,
+        outcomes: schema.polymarketMarkets.outcomes,
+        outcomePrices: schema.polymarketMarkets.outcomePrices,
+        midpoints: schema.polymarketMarkets.midpoints,
+        liquidity: schema.polymarketMarkets.liquidity,
+        volume24hr: schema.polymarketMarkets.volume24hr,
+      })
+      .from(schema.polymarketMarkets)
+      .where(
+        and(
+          eq(schema.polymarketMarkets.fixtureId, fixtureId),
+          isNotNull(schema.polymarketMarkets.conditionId),
+        ),
+      );
+
+    if (linkedMarkets.length === 0) {
+      return {
+        fixture: fixtureView,
+        prediction: null,
+        smartMoneySignal: null,
+        reason: 'no-polymarket-coverage',
+      };
+    }
+
+    const MONEYLINE_RX = /^Will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}\??$/i;
+    const candidates: Array<{
+      marketId: number;
+      conditionId: string;
+      teamName: string;
+      matchSide: 'home' | 'away';
+      similarity: number;
+      slug: string | null;
+      eventSlug: string | null;
+      clobTokenIds: string[] | null;
+      outcomes: string[] | null;
+      outcomePrices: string[] | null;
+      midpoints: string[] | null;
+      liquidity: string | null;
+      volume24hr: string | null;
+    }> = [];
+    for (const m of linkedMarkets) {
+      const q = String(m.marketQuestion ?? '').trim();
+      const match = q.match(MONEYLINE_RX);
+      if (!match) continue;
+      const teamInQuestion = match[1].trim();
+      const homeSim = this.nameSimilarity(teamInQuestion, homeName ?? '');
+      const awaySim = this.nameSimilarity(teamInQuestion, awayName ?? '');
+      if (homeSim < 0.5 && awaySim < 0.5) continue;
+      candidates.push({
+        marketId: m.id as number,
+        conditionId: m.conditionId as string,
+        teamName: teamInQuestion,
+        matchSide: homeSim >= awaySim ? 'home' : 'away',
+        similarity: Math.max(homeSim, awaySim),
+        slug: (m.slug as string | null) ?? null,
+        eventSlug: (m.eventSlug as string | null) ?? null,
+        clobTokenIds: (m.clobTokenIds as string[] | null) ?? null,
+        outcomes: (m.outcomes as string[] | null) ?? null,
+        outcomePrices: (m.outcomePrices as string[] | null) ?? null,
+        midpoints: (m.midpoints as string[] | null) ?? null,
+        liquidity: (m.liquidity as string | null) ?? null,
+        volume24hr: (m.volume24hr as string | null) ?? null,
+      });
+    }
+
+    if (candidates.length === 0) {
+      return {
+        fixture: fixtureView,
+        prediction: null,
+        smartMoneySignal: null,
+        reason: 'no-moneyline-market',
+      };
+    }
+
+    candidates.sort((a, b) => {
+      if (a.matchSide !== b.matchSide) return a.matchSide === 'home' ? -1 : 1;
+      return b.similarity - a.similarity;
+    });
+    const chosen = candidates[0];
+    const marketTeamId =
+      chosen.matchSide === 'home' ? fixture.homeTeamId : fixture.awayTeamId;
+
+    // Step 3b: on fresh mode, refresh market pricing live from the CLOB
+    // before signal compute. The data-api cache was already nuked at the
+    // top of this method, so every /holders, /trades, /leaderboard, and
+    // /positions call below is guaranteed fresh.
+    if (useFresh) {
+      try {
+        const yesTokenId = chosen.clobTokenIds?.[0];
+        const noTokenId = chosen.clobTokenIds?.[1];
+        const [yesPricing, noPricing] = await Promise.all([
+          yesTokenId
+            ? this.clobService.getMarketPricingSnapshot(yesTokenId)
+            : Promise.resolve(null),
+          noTokenId
+            ? this.clobService.getMarketPricingSnapshot(noTokenId)
+            : Promise.resolve(null),
+        ]);
+        if (yesPricing || noPricing) {
+          const freshMidpoints = [
+            yesPricing ? String(yesPricing.midpoint) : null,
+            noPricing ? String(noPricing.midpoint) : null,
+          ];
+          // Update the in-memory chosen record so any downstream use
+          // (market fallback, marketSignal block) sees live prices.
+          if (freshMidpoints[0] != null) {
+            chosen.midpoints = chosen.midpoints
+              ? [freshMidpoints[0], chosen.midpoints[1] ?? freshMidpoints[1] ?? '']
+              : [freshMidpoints[0], freshMidpoints[1] ?? ''];
+          }
+          // Also persist back to the row so subsequent GETs benefit.
+          await this.db
+            .update(schema.polymarketMarkets)
+            .set({
+              midpoints: freshMidpoints.filter((v) => v != null) as string[],
+              lastSyncedAt: new Date(),
+            })
+            .where(eq(schema.polymarketMarkets.id, chosen.marketId));
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Live price refresh failed for condition ${chosen.conditionId}: ${
+            (err as Error).message
+          }`,
+        );
+      }
+    }
+
+    // Step 4: compute signal for the chosen market. Two-pass:
+    //   Pass 1 — strict defaults ($50k PnL, 10% ROI, 50+ resolved, 3+ sharps).
+    //   Pass 2 — relaxed thresholds if strict yields nothing. Lets us still
+    //            surface *some* sharps (e.g. a single 7/10 hot hand on a
+    //            mid-ROI wallet) when the strict pool comes back empty.
+    // If both passes fail, the caller falls back to the market midpoint.
+    //
+    // Pool expansion: on persist (POST) we widen the candidate pool past
+    // Polymarket's 20-holder cap via /trades aggregation + leaderboard
+    // cross-check. GETs stay on the cheaper native /holders query.
+    //
+    // targetHoldersPerOutcome is set to a very large number so no wallet
+    // gets dropped by the per-outcome cap — the effective pool size is
+    // bounded only by how many unique wallets Polymarket surfaces across
+    // /holders + /trades + leaderboard. More candidates in → more
+    // qualifying sharps out → more reliable leanScore.
+    const poolOptions = options.persist
+      ? {
+          expandPool: true,
+          targetHoldersPerOutcome: 10_000,
+          includeLeaderboardInPool: true,
+          // Deeper trade pagination + wider leaderboard cross-check so
+          // the union catches every active wallet on the market, not
+          // just the top tier.
+          tradeSampleSize: 5_000,
+          leaderboardSize: 200,
+        }
+      : {};
+
+    // Merge DB-stored threshold overrides. Admin-facing endpoint lets
+    // operators tune gates without shipping code — non-null DB fields
+    // win, nulls fall through to the signal service's hard-coded
+    // defaults.
+    const dbOverride = await this.getSmartMoneyOptionsOverride();
+
+    let signal = await this.smartMoneySignalService.computeSignal(
+      chosen.conditionId,
+      { ...dbOverride, ...poolOptions },
+    );
+    let thresholdMode: 'strict' | 'relaxed' = 'strict';
+    if (signal.leanScore == null) {
+      const relaxed = await this.smartMoneySignalService.computeSignal(
+        chosen.conditionId,
+        {
+          ...dbOverride,
+          ...poolOptions,
+          minLifetimePnl: 10_000,
+          minLifetimePnlWithStreak: 5_000,
+          minLifetimeRoi: 0.05,
+          minResolvedBets: 20,
+          minSharpCount: 1,
+          minPositionMultiple: 0.3,
+          minLast10WinRate: 0.7,
+          minCurrentStreak: 5,
+        },
+      );
+      if (relaxed.leanScore != null) {
+        signal = relaxed;
+        thresholdMode = 'relaxed';
+      }
+    }
+
+    // Step 5: translate to home/draw/away probabilities.
+    // Two paths depending on what's available:
+    //   (a) Sharp-money signal exists → use leanScore.
+    //   (b) No qualifying sharps → fall back to the market's own implied
+    //       probability from cached midpoints/outcomePrices. The market
+    //       itself is still informative even without a qualifying sharp
+    //       population — it's a prediction market, after all.
+    const DRAW_PRIOR = 0.25;
+    const marketIsHome = marketTeamId === fixture.homeTeamId;
+
+    let homeWinProb: number;
+    let awayWinProb: number;
+    let drawProb = DRAW_PRIOR;
+    let confidence: number;
+    let source: 'direct' | 'market';
+    let note: string;
+
+    if (signal.leanScore != null) {
+      // (a) Sharp-money path.
+      const mass = 1 - DRAW_PRIOR;
+      const lopsidedness = Math.abs(signal.leanScore);
+      const winnerProb = mass * (0.5 + lopsidedness / 2);
+      const loserProb = mass - winnerProb;
+      const sharpsLeanYes = signal.leanScore > 0;
+      const leaningIsHome = sharpsLeanYes ? marketIsHome : !marketIsHome;
+      homeWinProb = leaningIsHome ? winnerProb : loserProb;
+      awayWinProb = leaningIsHome ? loserProb : winnerProb;
+
+      const rawConfidence =
+        4 +
+        Math.abs(signal.leanScore) * 3 +
+        signal.signalConfidence * 2 +
+        Math.min(1, signal.sharpCount / 15);
+      // Relaxed-threshold sharps are less proven, so cap confidence at 7.
+      const cap = thresholdMode === 'relaxed' ? 7 : 10;
+      confidence = Math.round(Math.max(1, Math.min(cap, rawConfidence)));
+      source = 'direct';
+      note =
+        thresholdMode === 'relaxed'
+          ? 'No sharps qualified under strict criteria ($50k lifetime PnL / 10% ROI / 50+ resolved). Relaxed thresholds ($10k / 5% / 20+) surfaced the wallets below. Confidence capped at 7/10 because these are less proven traders.'
+          : 'Derived solely from Polymarket sharp-money positioning with a fixed 25% draw prior. Not a calibrated probability — interpret as "what the sharp crowd thinks", not "actual outcome likelihood".';
+    } else {
+      // (b) Market-price fallback. Use midpoints when available, else the
+      // outcomePrices snapshot (which Gamma returns).
+      const parsePrice = (v: unknown): number | null => {
+        if (v == null) return null;
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 && n <= 1 ? n : null;
+      };
+
+      const yesMid = parsePrice(chosen.midpoints?.[0]);
+      const yesOutcomePrice = parsePrice(chosen.outcomePrices?.[0]);
+      const yesPrice = yesMid ?? yesOutcomePrice;
+
+      if (yesPrice == null) {
+        return {
+          fixture: fixtureView,
+          prediction: null,
+          smartMoneySignal: null,
+          reason: 'no-qualifying-sharps-and-no-market-price',
+        };
+      }
+
+      // yesPrice = market's implied P(market-team wins).
+      const marketTeamWinProb = yesPrice;
+      // Split the complement between draw and the other team using the
+      // fixed 25% draw prior, capped to remaining mass.
+      const complement = 1 - marketTeamWinProb;
+      drawProb = Math.min(DRAW_PRIOR, Math.max(0, complement));
+      const otherTeamWinProb = Math.max(0, complement - drawProb);
+
+      if (marketIsHome) {
+        homeWinProb = marketTeamWinProb;
+        awayWinProb = otherTeamWinProb;
+      } else {
+        awayWinProb = marketTeamWinProb;
+        homeWinProb = otherTeamWinProb;
+      }
+
+      // Confidence for market-only fallback: lower than sharp-money.
+      // Scales with liquidity (deeper book = more reliable price).
+      const liquidity = Number(chosen.liquidity ?? 0);
+      const liquidityScore = Math.min(1, liquidity / 20_000); // saturates at $20k
+      const volume24 = Number(chosen.volume24hr ?? 0);
+      const volumeScore = Math.min(1, volume24 / 5_000); // saturates at $5k
+      const spreadFromMid = Math.abs(marketTeamWinProb - 0.5) * 2; // 0..1
+      const rawConfidence =
+        2 + liquidityScore * 2 + volumeScore * 1 + spreadFromMid * 1; // max 6
+      confidence = Math.round(Math.max(1, Math.min(6, rawConfidence)));
+      source = 'market';
+      note = `No qualifying sharps on this market — falling back to Polymarket market midpoint (${marketTeamWinProb.toFixed(2)} on "${chosen.teamName}"). Derived with a fixed 25% draw prior. Confidence is capped at 6/10 because this reflects the market price, not informed sharp positioning.`;
+    }
+
+    // Step 6: pick (highest probability wins).
+    const predictedResult: 'home' | 'draw' | 'away' =
+      homeWinProb >= drawProb && homeWinProb >= awayWinProb
+        ? 'home'
+        : awayWinProb >= drawProb
+          ? 'away'
+          : 'draw';
+
+    const predictionPayload = {
+      homeWinProb: Number(homeWinProb.toFixed(4)),
+      drawProb: Number(drawProb.toFixed(4)),
+      awayWinProb: Number(awayWinProb.toFixed(4)),
+      predictedResult,
+      confidence,
+      source,
+      // thresholdMode is only meaningful for `source: 'direct'`. For the
+      // market fallback it's always 'strict' by default (no threshold in
+      // play), so we drop it there to avoid misleading consumers.
+      ...(source === 'direct' ? { thresholdMode } : {}),
+      note,
+    };
+
+    // Signal view: clean sharp-money view when we have one, otherwise a
+    // lightweight market-price block so the response always explains
+    // where the numbers came from.
+    const viewSignal =
+      signal.leanScore != null
+        ? this.formatSmartMoneyView(signal, {
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+            homeName,
+            awayName,
+            marketTeamId,
+          })
+        : null;
+
+    const marketSignal =
+      source === 'market'
+        ? {
+            source: 'polymarket-market' as const,
+            marketTeam: marketIsHome ? homeName : awayName,
+            impliedYesPrice: Number(
+              Number(chosen.midpoints?.[0] ?? chosen.outcomePrices?.[0]).toFixed(
+                4,
+              ),
+            ),
+            impliedNoPrice: Number(
+              Number(chosen.midpoints?.[1] ?? chosen.outcomePrices?.[1]).toFixed(
+                4,
+              ),
+            ),
+            liquidity: chosen.liquidity != null ? Number(chosen.liquidity) : null,
+            volume24hr:
+              chosen.volume24hr != null ? Number(chosen.volume24hr) : null,
+            note:
+              'Live market midpoint cached from the last Polymarket sync — used because no qualifying sharps were found on the holder list.',
+          }
+        : null;
+
+    // Optional persistence — upserts into the smart_money_predictions
+    // table (one row per fixture). Kept separate from the main
+    // `predictions` table so LLM predictions and smart-money-only
+    // predictions don't mix in aggregate queries or fixture response
+    // payloads.
+    let storedId: number | undefined;
+    let storedCreatedAt: Date | undefined;
+    if (options.persist) {
+      const predictedResultDb =
+        predictedResult === 'home'
+          ? 'home_win'
+          : predictedResult === 'away'
+            ? 'away_win'
+            : 'draw';
+      const storedSignal =
+        signal.leanScore != null ? { ...signal, marketTeamId } : null;
+      const modelVersion =
+        source === 'market' ? 'smart-money-v1-market' : 'smart-money-v1';
+
+      const values = {
+        fixtureId,
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        homeWinProb: String(predictionPayload.homeWinProb),
+        drawProb: String(predictionPayload.drawProb),
+        awayWinProb: String(predictionPayload.awayWinProb),
+        confidence: predictionPayload.confidence,
+        predictedResult: predictedResultDb,
+        source,
+        thresholdMode: source === 'direct' ? thresholdMode : null,
+        modelVersion,
+        smartMoneySignal: storedSignal as any,
+        marketSignal: (marketSignal ?? null) as any,
+        predictionStatus: 'pending' as const,
+        updatedAt: new Date(),
+      };
+
+      const [row] = await this.db
+        .insert(schema.smartMoneyPredictions)
+        .values(values)
+        .onConflictDoUpdate({
+          target: schema.smartMoneyPredictions.fixtureId,
+          set: values,
+        })
+        .returning();
+      storedId = row.id;
+      storedCreatedAt = row.createdAt;
+    }
+
+    const marketUrl = chosen.slug
+      ? `https://polymarket.com/market/${chosen.slug}`
+      : null;
+    const eventUrl = chosen.eventSlug
+      ? `https://polymarket.com/event/${chosen.eventSlug}`
+      : null;
+
+    const copyTrader = this.buildCopyTrader(
+      signal.leanScore != null ? signal : null,
+      {
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        homeName,
+        awayName,
+        marketTeamId,
+        marketUrl,
+        eventUrl,
+      },
+    );
+
+    return {
+      fixture: fixtureView,
+      prediction: {
+        ...predictionPayload,
+        ...(storedId != null
+          ? { id: storedId, createdAt: storedCreatedAt }
+          : {}),
+      },
+      smartMoneySignal: viewSignal,
+      copyTrader,
+      marketSignal,
+      polymarket: {
+        marketQuestion: `Will ${chosen.teamName} win?`,
+        marketTeam: chosen.teamName,
+        conditionId: chosen.conditionId,
+        marketUrl,
+        eventUrl,
+        url: marketUrl ?? eventUrl,
+      },
+      ...(options.persist ? { stored: storedId != null } : {}),
+    };
+  }
+
+  /**
+   * Lightweight team-name similarity — mirrors the helper in agents.service
+   * so this module stays self-contained. 0..1 where 1 = exact.
+   */
+  private nameSimilarity(a: string, b: string): number {
+    const norm = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/\b(fc|cf|sc|afc|ac|as|ss|us|rc|cd|ud|rcd|sd|ca|se)\b/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    if (na.includes(nb) || nb.includes(na)) return 0.85;
+    const wa = new Set(na.split(' '));
+    const wb = new Set(nb.split(' '));
+    const overlap = [...wa].filter((w) => wb.has(w)).length;
+    const denom = Math.min(wa.size, wb.size);
+    if (denom === 0) return 0;
+    return overlap / denom;
+  }
+
+  /**
+   * Build a copy-trader recommendation for a fixture's smart-money
+   * signal. Picks the single hottest qualifying sharp (by the same
+   * ordering used in topSharps: last10 → last20 → streak → PnL) and
+   * packages their exact bet as something the user can copy in one
+   * click.
+   *
+   * Returns one of three action states:
+   *
+   *   "copy"       — Top sharp aligns with the aggregate sharp lean AND
+   *                  has strong recent form. Highest-confidence follow.
+   *   "conflicted" — Top sharp disagrees with the aggregate (hot hand
+   *                  vs whale money). The user must pick a side — the
+   *                  response tells them both readings.
+   *   "weak"       — No sharp has meaningfully hot form. No good
+   *                  candidate to copy.
+   */
+  private buildCopyTrader(
+    raw: SmartMoneySignal | null,
+    ctx: {
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+      marketTeamId: number | null;
+      marketUrl: string | null;
+      eventUrl: string | null;
+    },
+  ): any {
+    if (!raw || raw.leanScore == null) return null;
+    const topSharp = raw.topSharps?.[0];
+    if (!topSharp) return null;
+
+    // Reproduce the vote-weight math so we can surface the single
+    // number the ordering is built on.
+    const last10 = topSharp.last10Wins != null ? topSharp.last10WinRate : 0.5;
+    const last20 = topSharp.last20Wins != null ? topSharp.last20WinRate : 0.5;
+    const formScore = (2 * last10 + last20) / 3;
+    const formWeight = 0.15 + 2.35 * formScore;
+    const streakBonus = Math.min(2.5, (topSharp.currentWinStreak ?? 0) * 0.25);
+    const voteWeight = Number((formWeight + streakBonus).toFixed(3));
+
+    // Decide action state based on form strength + alignment.
+    const sharpsLeanYes = raw.leanScore > 0;
+    const copyBetsYes = topSharp.outcomeIndex === 0;
+    const alignsWithAggregate = sharpsLeanYes === copyBetsYes;
+    let action: 'copy' | 'conflicted' | 'weak';
+    let reason: string;
+    if (voteWeight < 1.3) {
+      action = 'weak';
+      reason = `Top sharp has mediocre recent form (${topSharp.last10Wins ?? '—'}/10, ${topSharp.last20Wins ?? '—'}/20). No clear copy candidate — skip or wait for a sharper signal.`;
+    } else if (alignsWithAggregate) {
+      action = 'copy';
+      reason =
+        `Hottest hand (${topSharp.last10Wins}/10 recent, ${topSharp.last20Wins}/20 extended) ` +
+        `agrees with the aggregate sharp lean. Copy their bet directly — highest-confidence follow.`;
+    } else {
+      action = 'conflicted';
+      reason =
+        `Hottest hand (${topSharp.last10Wins}/10 recent, ${topSharp.last20Wins}/20 extended) ` +
+        `disagrees with the aggregate — the big money's on one side, the form's on the other. ` +
+        `Copy if you trust recent performance over dollar-weighted consensus.`;
+    }
+
+    // Map the sharp's bet back to plain-English team language.
+    const marketIsHome = ctx.marketTeamId === ctx.homeTeamId;
+    const marketTeamName = marketIsHome ? ctx.homeName : ctx.awayName;
+    const otherTeamName = marketIsHome ? ctx.awayName : ctx.homeName;
+    const betOutcome = copyBetsYes
+      ? raw.outcome0Name ?? 'Yes'
+      : raw.outcome1Name ?? 'No';
+    const betBacks = copyBetsYes
+      ? marketTeamName
+      : otherTeamName != null
+        ? `${otherTeamName} or Draw`
+        : 'No';
+
+    return {
+      wallet: topSharp.proxyWallet ?? null,
+      name: topSharp.name ?? null,
+      credentials: {
+        lifetimePnl: Number(topSharp.lifetimePnl ?? 0),
+        lifetimeRoi: Number(topSharp.lifetimeRoi ?? 0),
+        last10Wins: topSharp.last10Wins ?? null,
+        last20Wins: topSharp.last20Wins ?? null,
+        currentWinStreak: topSharp.currentWinStreak ?? 0,
+        voteWeight,
+      },
+      bet: {
+        outcome: betOutcome,
+        backs: betBacks,
+        amount: Math.round(Number(topSharp.amount ?? 0)),
+        alignsWithAggregate,
+      },
+      recommendation: {
+        action,
+        reason,
+      },
+      polymarket: {
+        url: ctx.marketUrl ?? ctx.eventUrl,
+        marketUrl: ctx.marketUrl,
+        eventUrl: ctx.eventUrl,
+      },
+    };
+  }
+
+  /**
+   * View transform for the smart-money-only endpoint. Mirrors the shape
+   * used by the football service so consumers can treat both responses
+   * uniformly.
+   */
+  private formatSmartMoneyView(
+    raw: SmartMoneySignal | null | undefined,
+    ctx: {
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+      marketTeamId: number | null;
+    },
+  ): any {
+    // Not every prediction carries a smart-money signal (confidence-only
+    // picks pass through getTopSmartMoneyPicks too). Short-circuit instead
+    // of crashing on raw.leanScore.
+    if (raw == null || raw.leanScore == null) return null;
+    const leanScore = raw.leanScore;
+    const absLean = Math.abs(leanScore);
+    const sharpsLeanYes = leanScore > 0;
+
+    let leaningTeam: string | null = null;
+    if (ctx.marketTeamId != null) {
+      const marketIsHome = ctx.marketTeamId === ctx.homeTeamId;
+      const leaningIsHome = sharpsLeanYes ? marketIsHome : !marketIsHome;
+      leaningTeam = leaningIsHome ? ctx.homeName : ctx.awayName;
+    }
+
+    const strength: 'strong' | 'moderate' | 'weak' =
+      absLean >= 0.5 ? 'strong' : absLean >= 0.3 ? 'moderate' : 'weak';
+
+    const dollarsFor = sharpsLeanYes
+      ? raw.sharpDollarsOutcome0
+      : raw.sharpDollarsOutcome1;
+    const dollarsAgainst = sharpsLeanYes
+      ? raw.sharpDollarsOutcome1
+      : raw.sharpDollarsOutcome0;
+
+    // Label for what a YES / NO bet implies in plain language.
+    // Direct moneyline market: YES = market team wins, NO = other team or draw.
+    const marketIsHome = ctx.marketTeamId === ctx.homeTeamId;
+    const marketTeamName = marketIsHome ? ctx.homeName : ctx.awayName;
+    const otherTeamName = marketIsHome ? ctx.awayName : ctx.homeName;
+    const yesBacks = marketTeamName;
+    const noBacks =
+      otherTeamName != null ? `${otherTeamName} or Draw` : 'No';
+
+    return {
+      source: raw.signalKind ?? 'direct',
+      sharps: {
+        leaningTeam,
+        count: raw.sharpCount,
+        strength,
+        dollarsFor: Math.round(dollarsFor),
+        dollarsAgainst: Math.round(dollarsAgainst),
+      },
+      topSharps: (raw.topSharps ?? []).map((s) => {
+        const betYes = s.outcomeIndex === 0;
+        return {
+          wallet: s.proxyWallet ?? null,
+          name: s.name ?? null,
+          lifetimePnl: Number(s.lifetimePnl ?? 0),
+          lifetimeRoi: Number(s.lifetimeRoi ?? 0),
+          last10Wins: s.last10Wins ?? null,
+          last20Wins: s.last20Wins ?? null,
+          currentWinStreak: Number(s.currentWinStreak ?? 0),
+          bet: {
+            outcome: betYes
+              ? raw.outcome0Name ?? 'Yes'
+              : raw.outcome1Name ?? 'No',
+            backs: betYes ? yesBacks : noBacks,
+            amount: Math.round(Number(s.amount ?? 0)),
+            alignsWithSharps: sharpsLeanYes === betYes,
+          },
+        };
+      }),
+    };
   }
 
   // ─── Main agent loop ────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
@@ -46,6 +46,102 @@ export interface TeamRecentStats {
   };
 }
 
+export interface TeamFormWindowSummary {
+  sampleSize: number;
+  wins: number;
+  draws: number;
+  losses: number;
+  points: number;
+  pointsPerGame: number;
+  goalsFor: number;
+  goalsAgainst: number;
+  goalDiff: number;
+  winRate: number;
+  unbeatenRate: number;
+}
+
+export interface TeamFormWindows {
+  last5: TeamFormWindowSummary;
+  last10: TeamFormWindowSummary;
+}
+
+export interface SeasonRematchContext {
+  isSeasonRematch: boolean;
+  previousMeeting: {
+    fixtureId: number;
+    date: string;
+    round: string | null;
+    homeTeamId: number;
+    awayTeamId: number;
+    homeGoals: number | null;
+    awayGoals: number | null;
+    result: 'home_win' | 'away_win' | 'draw' | 'unknown';
+    winnerTeamId: number | null;
+    wasReverseFixture: boolean;
+  } | null;
+}
+
+export interface OpponentStrengthSnapshot {
+  teamId: number;
+  leaguePosition: number | null;
+  points: number | null;
+  goalsForAvg: number | null;
+  goalsAgainstAvg: number | null;
+  attackRating: string | null;
+  defenseRating: string | null;
+}
+
+export interface OpponentStrengthWindowSummary {
+  sampleSize: number;
+  avgOpponentLeaguePosition: number | null;
+  avgOpponentPoints: number | null;
+  avgOpponentGoalsForAvg: number | null;
+  avgOpponentGoalsAgainstAvg: number | null;
+  top6OpponentShare: number | null;
+  top10OpponentShare: number | null;
+}
+
+export interface OpponentStrengthProfile {
+  currentOpponent: OpponentStrengthSnapshot | null;
+  last5: OpponentStrengthWindowSummary;
+  last10: OpponentStrengthWindowSummary;
+}
+
+export interface TeamRecentGameHistoryItem {
+  fixtureId: number;
+  date: string;
+  leagueId: number | null;
+  leagueName: string | null;
+  round: string | null;
+  venue: 'home' | 'away';
+  opponent: {
+    teamId: number;
+    name: string | null;
+  };
+  score: {
+    goalsFor: number;
+    goalsAgainst: number;
+    homeGoals: number | null;
+    awayGoals: number | null;
+  };
+  result: 'win' | 'draw' | 'loss';
+  winnerTeamId: number | null;
+  formation: string | null;
+  opponentFormation: string | null;
+  stats: {
+    shotsOnTarget: number | null;
+    totalShots: number | null;
+    possession: number | null;
+    expectedGoals: number | null;
+  };
+  opponentStats: {
+    shotsOnTarget: number | null;
+    totalShots: number | null;
+    possession: number | null;
+    expectedGoals: number | null;
+  };
+}
+
 export interface CollectedMatchData {
   fixture: any;
   homeTeam: { team: any; form: any[] } | null;
@@ -63,6 +159,24 @@ export interface CollectedMatchData {
     home: TeamRecentStats | null;
     away: TeamRecentStats | null;
   };
+  formWindows: {
+    home: TeamFormWindows | null;
+    away: TeamFormWindows | null;
+  };
+  recentGameHistory: {
+    home: TeamRecentGameHistoryItem[];
+    away: TeamRecentGameHistoryItem[];
+  };
+  opponentStrength: {
+    home: OpponentStrengthProfile | null;
+    away: OpponentStrengthProfile | null;
+  };
+  seasonRematch: SeasonRematchContext;
+  /** Quantified player absence impact scores (set by agents.service after data collection) */
+  playerImpact?: {
+    home: any;
+    away: any;
+  } | null;
 }
 
 @Injectable()
@@ -106,6 +220,13 @@ export class DataCollectorAgent {
       apiPrediction,
       homeRecentStats,
       awayRecentStats,
+      homeFormWindows,
+      awayFormWindows,
+      homeRecentHistory,
+      awayRecentHistory,
+      homeOpponentStrength,
+      awayOpponentStrength,
+      seasonRematch,
     ] = await Promise.allSettled([
       this.footballService.getTeamById(fixture.homeTeamId),
       this.footballService.getTeamById(fixture.awayTeamId),
@@ -121,6 +242,25 @@ export class DataCollectorAgent {
       this.fetchApiPredictionSafe(fixtureId),
       this.getTeamRecentStats(fixture.homeTeamId, fixtureId, fixture.leagueId),
       this.getTeamRecentStats(fixture.awayTeamId, fixtureId, fixture.leagueId),
+      this.getTeamFormWindows(fixture.homeTeamId, fixtureId, fixture.leagueId),
+      this.getTeamFormWindows(fixture.awayTeamId, fixtureId, fixture.leagueId),
+      this.getTeamRecentGameHistory(fixture.homeTeamId, fixtureId, 5),
+      this.getTeamRecentGameHistory(fixture.awayTeamId, fixtureId, 5),
+      this.getOpponentStrengthProfile(
+        fixture.homeTeamId,
+        fixture.awayTeamId,
+        fixtureId,
+        fixture.leagueId,
+        fixture.season,
+      ),
+      this.getOpponentStrengthProfile(
+        fixture.awayTeamId,
+        fixture.homeTeamId,
+        fixtureId,
+        fixture.leagueId,
+        fixture.season,
+      ),
+      this.getSeasonRematchContext(fixture),
     ]);
 
     // 3. Get odds data by matching team names
@@ -143,13 +283,32 @@ export class DataCollectorAgent {
         home: this.unwrap(homeRecentStats),
         away: this.unwrap(awayRecentStats),
       },
+      formWindows: {
+        home: this.unwrap(homeFormWindows),
+        away: this.unwrap(awayFormWindows),
+      },
+      recentGameHistory: {
+        home: this.unwrap(homeRecentHistory) ?? [],
+        away: this.unwrap(awayRecentHistory) ?? [],
+      },
+      opponentStrength: {
+        home: this.unwrap(homeOpponentStrength),
+        away: this.unwrap(awayOpponentStrength),
+      },
+      seasonRematch: this.unwrap(seasonRematch) ?? {
+        isSeasonRematch: false,
+        previousMeeting: null,
+      },
     };
 
     this.logger.log(
       `Data collected for fixture ${fixtureId}: ` +
         `h2h=${result.h2h.length}, injuries=${result.injuries.length}, ` +
         `lineups=${result.lineups.length}, odds_consensus=${result.odds.consensus.length}, ` +
-        `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}`,
+        `homeStats=${result.recentStats.home?.matchCount ?? 0}, awayStats=${result.recentStats.away?.matchCount ?? 0}, ` +
+        `homeHistory=${result.recentGameHistory.home.length}, awayHistory=${result.recentGameHistory.away.length}, ` +
+        `seasonRematch=${result.seasonRematch.isSeasonRematch}, ` +
+        `opponentStrength=${result.opponentStrength.home != null && result.opponentStrength.away != null}`,
     );
 
     return result;
@@ -238,11 +397,48 @@ export class DataCollectorAgent {
         .orderBy(desc(schema.injuries.updatedAt))
         .limit(50);
 
-      return injuries;
+      return injuries.filter((inj: any) =>
+        this.isConfirmedUnavailable(inj.type, inj.reason),
+      );
     } catch (error) {
       this.logger.warn(`Injuries fetch failed: ${error.message}`);
       return [];
     }
+  }
+
+  private isConfirmedUnavailable(
+    type: string | null,
+    reason: string | null,
+  ): boolean {
+    const t = String(type ?? '').toLowerCase();
+    const r = String(reason ?? '').toLowerCase();
+
+    if (!t && !r) return false;
+
+    if (
+      t.includes('questionable') ||
+      t.includes('doubtful') ||
+      t.includes('probable') ||
+      t.includes('fitness')
+    ) {
+      return false;
+    }
+
+    if (
+      t.includes('missing') ||
+      t.includes('out') ||
+      t.includes('suspended') ||
+      t.includes('ban')
+    ) {
+      return true;
+    }
+
+    // Fallback when provider omits type but reason clearly confirms absence.
+    if (r.includes('suspended') || r.includes('ban')) {
+      return true;
+    }
+
+    return false;
   }
 
   private async getTeamForm(
@@ -305,6 +501,323 @@ export class DataCollectorAgent {
     } catch (error) {
       this.logger.warn(`Odds fetch for fixture failed: ${error.message}`);
       return { consensus: [], bookmakers: [] };
+    }
+  }
+
+  /**
+   * Build overall-form windows from completed league matches only.
+   */
+  private async getTeamFormWindows(
+    teamId: number,
+    currentFixtureId: number,
+    leagueId: number,
+  ): Promise<TeamFormWindows | null> {
+    try {
+      const recentFixtures = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+            eq(schema.fixtures.status, 'FT'),
+            eq(schema.fixtures.leagueId, leagueId),
+            sql`${schema.fixtures.id} != ${currentFixtureId}`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(10);
+
+      if (recentFixtures.length === 0) return null;
+
+      const summarize = (fixtures: any[]): TeamFormWindowSummary => {
+        let wins = 0;
+        let draws = 0;
+        let losses = 0;
+        let goalsFor = 0;
+        let goalsAgainst = 0;
+
+        for (const f of fixtures) {
+          const isHome = f.homeTeamId === teamId;
+          const gf = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+          const ga = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+
+          goalsFor += gf;
+          goalsAgainst += ga;
+
+          if (gf > ga) wins++;
+          else if (gf < ga) losses++;
+          else draws++;
+        }
+
+        const sampleSize = fixtures.length;
+        const points = wins * 3 + draws;
+
+        return {
+          sampleSize,
+          wins,
+          draws,
+          losses,
+          points,
+          pointsPerGame:
+            sampleSize > 0 ? Number((points / sampleSize).toFixed(2)) : 0,
+          goalsFor,
+          goalsAgainst,
+          goalDiff: goalsFor - goalsAgainst,
+          winRate: sampleSize > 0 ? Number((wins / sampleSize).toFixed(2)) : 0,
+          unbeatenRate:
+            sampleSize > 0
+              ? Number(((wins + draws) / sampleSize).toFixed(2))
+              : 0,
+        };
+      };
+
+      return {
+        last5: summarize(recentFixtures.slice(0, 5)),
+        last10: summarize(recentFixtures),
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Form windows fetch failed for team ${teamId}: ${error.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Detects whether this is a same-competition, same-season rematch,
+   * and returns the latest prior meeting context.
+   */
+  private async getSeasonRematchContext(
+    fixture: any,
+  ): Promise<SeasonRematchContext> {
+    try {
+      if (!fixture?.season) {
+        return { isSeasonRematch: false, previousMeeting: null };
+      }
+
+      const previousRows = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            eq(schema.fixtures.leagueId, fixture.leagueId),
+            eq(schema.fixtures.season, fixture.season),
+            sql`${schema.fixtures.id} != ${fixture.id}`,
+            sql`${schema.fixtures.date} < ${fixture.date}`,
+            sql`(
+              (${schema.fixtures.homeTeamId} = ${fixture.homeTeamId} AND ${schema.fixtures.awayTeamId} = ${fixture.awayTeamId}) OR
+              (${schema.fixtures.homeTeamId} = ${fixture.awayTeamId} AND ${schema.fixtures.awayTeamId} = ${fixture.homeTeamId})
+            )`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(1);
+
+      const previous = previousRows?.[0];
+      if (!previous) {
+        return { isSeasonRematch: false, previousMeeting: null };
+      }
+
+      const homeGoals = previous.goalsHome;
+      const awayGoals = previous.goalsAway;
+
+      let result: 'home_win' | 'away_win' | 'draw' | 'unknown' = 'unknown';
+      let winnerTeamId: number | null = null;
+
+      if (homeGoals != null && awayGoals != null) {
+        if (homeGoals > awayGoals) {
+          result = 'home_win';
+          winnerTeamId = previous.homeTeamId;
+        } else if (awayGoals > homeGoals) {
+          result = 'away_win';
+          winnerTeamId = previous.awayTeamId;
+        } else {
+          result = 'draw';
+        }
+      }
+
+      return {
+        isSeasonRematch: true,
+        previousMeeting: {
+          fixtureId: previous.id,
+          date: new Date(previous.date).toISOString(),
+          round: previous.round ?? null,
+          homeTeamId: previous.homeTeamId,
+          awayTeamId: previous.awayTeamId,
+          homeGoals,
+          awayGoals,
+          result,
+          winnerTeamId,
+          wasReverseFixture:
+            previous.homeTeamId === fixture.awayTeamId &&
+            previous.awayTeamId === fixture.homeTeamId,
+        },
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Season rematch context failed for fixture ${fixture?.id}: ${error.message}`,
+      );
+      return { isSeasonRematch: false, previousMeeting: null };
+    }
+  }
+
+  /**
+   * Returns team-level recent games with match result + key stat context.
+   */
+  private async getTeamRecentGameHistory(
+    teamId: number,
+    currentFixtureId: number,
+    limit = 5,
+  ): Promise<TeamRecentGameHistoryItem[]> {
+    try {
+      const completedStatuses = ['FT', 'AET', 'PEN'];
+
+      const fixtures = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            inArray(schema.fixtures.status, completedStatuses),
+            sql`${schema.fixtures.id} != ${currentFixtureId}`,
+            sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(limit);
+
+      if (fixtures.length === 0) return [];
+
+      const fixtureIds = fixtures.map((f: any) => f.id);
+
+      const opponentIds = new Set<number>();
+      for (const f of fixtures) {
+        opponentIds.add(f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId);
+      }
+
+      const [teamRows, statRows, lineupRows] = await Promise.all([
+        this.db
+          .select({ id: schema.teams.id, name: schema.teams.name })
+          .from(schema.teams)
+          .where(
+            sql`${schema.teams.id} IN (${sql.join(
+              [...opponentIds].map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+        this.db
+          .select()
+          .from(schema.fixtureStatistics)
+          .where(
+            sql`${schema.fixtureStatistics.fixtureId} IN (${sql.join(
+              fixtureIds.map((id: number) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+        this.db
+          .select({
+            fixtureId: schema.fixtureLineups.fixtureId,
+            teamId: schema.fixtureLineups.teamId,
+            formation: schema.fixtureLineups.formation,
+          })
+          .from(schema.fixtureLineups)
+          .where(
+            sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+              fixtureIds.map((id: number) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+      ]);
+
+      const opponentNameById = new Map<number, string>();
+      for (const t of teamRows) opponentNameById.set(t.id, t.name);
+
+      const statByFixtureTeam = new Map<string, any>();
+      for (const s of statRows) {
+        statByFixtureTeam.set(`${s.fixtureId}:${s.teamId}`, s);
+      }
+
+      const formationByFixtureTeam = new Map<string, string | null>();
+      for (const l of lineupRows) {
+        formationByFixtureTeam.set(
+          `${l.fixtureId}:${l.teamId}`,
+          l.formation ?? null,
+        );
+      }
+
+      return fixtures.map((f: any) => {
+        const isHome = f.homeTeamId === teamId;
+        const opponentTeamId = isHome ? f.awayTeamId : f.homeTeamId;
+        const goalsFor = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+        const goalsAgainst = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+
+        let result: 'win' | 'draw' | 'loss' = 'draw';
+        let winnerTeamId: number | null = null;
+        if (goalsFor > goalsAgainst) {
+          result = 'win';
+          winnerTeamId = teamId;
+        } else if (goalsFor < goalsAgainst) {
+          result = 'loss';
+          winnerTeamId = opponentTeamId;
+        }
+
+        const teamStats = statByFixtureTeam.get(`${f.id}:${teamId}`);
+        const opponentStats = statByFixtureTeam.get(
+          `${f.id}:${opponentTeamId}`,
+        );
+
+        return {
+          fixtureId: f.id,
+          date: new Date(f.date).toISOString(),
+          leagueId: f.leagueId ?? null,
+          leagueName: f.leagueName ?? null,
+          round: f.round ?? null,
+          venue: isHome ? 'home' : 'away',
+          opponent: {
+            teamId: opponentTeamId,
+            name: opponentNameById.get(opponentTeamId) ?? null,
+          },
+          score: {
+            goalsFor,
+            goalsAgainst,
+            homeGoals: f.goalsHome ?? null,
+            awayGoals: f.goalsAway ?? null,
+          },
+          result,
+          winnerTeamId,
+          formation: formationByFixtureTeam.get(`${f.id}:${teamId}`) ?? null,
+          opponentFormation:
+            formationByFixtureTeam.get(`${f.id}:${opponentTeamId}`) ?? null,
+          stats: {
+            shotsOnTarget: teamStats?.shotsOnGoal ?? null,
+            totalShots: teamStats?.totalShots ?? null,
+            possession:
+              teamStats?.possession != null
+                ? Number(teamStats.possession)
+                : null,
+            expectedGoals:
+              teamStats?.expectedGoals != null
+                ? Number(teamStats.expectedGoals)
+                : null,
+          },
+          opponentStats: {
+            shotsOnTarget: opponentStats?.shotsOnGoal ?? null,
+            totalShots: opponentStats?.totalShots ?? null,
+            possession:
+              opponentStats?.possession != null
+                ? Number(opponentStats.possession)
+                : null,
+            expectedGoals:
+              opponentStats?.expectedGoals != null
+                ? Number(opponentStats.expectedGoals)
+                : null,
+          },
+        };
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Recent game history fetch failed for team ${teamId}: ${error.message}`,
+      );
+      return [];
     }
   }
 
@@ -477,6 +990,183 @@ export class DataCollectorAgent {
           cornerKicks: 0,
         },
       };
+    }
+  }
+
+  /**
+   * Estimates schedule strength from opponent quality in a team's last 5/10
+   * completed league matches, plus a snapshot of the current opponent.
+   */
+  private async getOpponentStrengthProfile(
+    teamId: number,
+    currentOpponentTeamId: number,
+    currentFixtureId: number,
+    leagueId: number,
+    season: number | null,
+  ): Promise<OpponentStrengthProfile | null> {
+    try {
+      const recentFixtures = await this.db
+        .select()
+        .from(schema.fixtures)
+        .where(
+          and(
+            sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+            eq(schema.fixtures.status, 'FT'),
+            eq(schema.fixtures.leagueId, leagueId),
+            sql`${schema.fixtures.id} != ${currentFixtureId}`,
+          ),
+        )
+        .orderBy(desc(schema.fixtures.date))
+        .limit(10);
+
+      const opponentIds = new Set<number>([currentOpponentTeamId]);
+      for (const f of recentFixtures) {
+        opponentIds.add(f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId);
+      }
+
+      const teamForms = await this.db
+        .select()
+        .from(schema.teamForm)
+        .where(
+          and(
+            eq(schema.teamForm.leagueId, leagueId),
+            sql`${schema.teamForm.teamId} IN (${sql.join(
+              [...opponentIds].map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+            season != null ? eq(schema.teamForm.season, season) : sql`1 = 1`,
+          ),
+        )
+        .orderBy(desc(schema.teamForm.season), desc(schema.teamForm.updatedAt));
+
+      const formByTeam = new Map<number, any>();
+      for (const tf of teamForms) {
+        if (!formByTeam.has(tf.teamId)) {
+          formByTeam.set(tf.teamId, tf);
+        }
+      }
+
+      const summarizeWindow = (
+        fixtures: any[],
+      ): OpponentStrengthWindowSummary => {
+        if (fixtures.length === 0) {
+          return {
+            sampleSize: 0,
+            avgOpponentLeaguePosition: null,
+            avgOpponentPoints: null,
+            avgOpponentGoalsForAvg: null,
+            avgOpponentGoalsAgainstAvg: null,
+            top6OpponentShare: null,
+            top10OpponentShare: null,
+          };
+        }
+
+        const opponentForms: any[] = fixtures
+          .map((f: any) => {
+            const oppId = f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId;
+            return formByTeam.get(oppId) ?? null;
+          })
+          .filter((tf: any) => tf != null);
+
+        if (opponentForms.length === 0) {
+          return {
+            sampleSize: fixtures.length,
+            avgOpponentLeaguePosition: null,
+            avgOpponentPoints: null,
+            avgOpponentGoalsForAvg: null,
+            avgOpponentGoalsAgainstAvg: null,
+            top6OpponentShare: null,
+            top10OpponentShare: null,
+          };
+        }
+
+        const avg = (arr: number[]) =>
+          arr.length > 0
+            ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2))
+            : null;
+
+        const positions = opponentForms
+          .map((tf: any) =>
+            tf.leaguePosition != null ? Number(tf.leaguePosition) : null,
+          )
+          .filter((v: number | null): v is number => v != null);
+        const points = opponentForms
+          .map((tf: any) => (tf.points != null ? Number(tf.points) : null))
+          .filter((v: number | null): v is number => v != null);
+        const gf = opponentForms
+          .map((tf: any) =>
+            tf.goalsForAvg != null ? Number(tf.goalsForAvg) : null,
+          )
+          .filter((v: number | null): v is number => v != null);
+        const ga = opponentForms
+          .map((tf: any) =>
+            tf.goalsAgainstAvg != null ? Number(tf.goalsAgainstAvg) : null,
+          )
+          .filter((v: number | null): v is number => v != null);
+
+        const positionCount = positions.length;
+        const top6 =
+          positionCount > 0
+            ? Number(
+                (
+                  positions.filter((p) => p <= 6).length / positionCount
+                ).toFixed(2),
+              )
+            : null;
+        const top10 =
+          positionCount > 0
+            ? Number(
+                (
+                  positions.filter((p) => p <= 10).length / positionCount
+                ).toFixed(2),
+              )
+            : null;
+
+        return {
+          sampleSize: fixtures.length,
+          avgOpponentLeaguePosition: avg(positions),
+          avgOpponentPoints: avg(points),
+          avgOpponentGoalsForAvg: avg(gf),
+          avgOpponentGoalsAgainstAvg: avg(ga),
+          top6OpponentShare: top6,
+          top10OpponentShare: top10,
+        };
+      };
+
+      const currentOpponentForm = formByTeam.get(currentOpponentTeamId) ?? null;
+
+      return {
+        currentOpponent: currentOpponentForm
+          ? {
+              teamId: currentOpponentTeamId,
+              leaguePosition:
+                currentOpponentForm.leaguePosition != null
+                  ? Number(currentOpponentForm.leaguePosition)
+                  : null,
+              points:
+                currentOpponentForm.points != null
+                  ? Number(currentOpponentForm.points)
+                  : null,
+              goalsForAvg:
+                currentOpponentForm.goalsForAvg != null
+                  ? Number(currentOpponentForm.goalsForAvg)
+                  : null,
+              goalsAgainstAvg:
+                currentOpponentForm.goalsAgainstAvg != null
+                  ? Number(currentOpponentForm.goalsAgainstAvg)
+                  : null,
+              attackRating: currentOpponentForm.attackRating ?? null,
+              defenseRating: currentOpponentForm.defenseRating ?? null,
+            }
+          : null,
+        last5: summarizeWindow(recentFixtures.slice(0, 5)),
+        last10: summarizeWindow(recentFixtures),
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Opponent strength profile failed for team ${teamId}: ${error.message}`,
+      );
+      return null;
     }
   }
 

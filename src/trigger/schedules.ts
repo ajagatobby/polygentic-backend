@@ -10,8 +10,11 @@ import {
   syncInjuriesTask,
   syncStandingsTask,
   syncOddsTask,
+  snapshotPolymarketHoldersTask,
 } from './sync-data';
 import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
+import { polymarketMarketSnapshotTask } from './polymarket-market-snapshot';
+import { copyTraderSyncTask } from './copy-trader-sync';
 import {
   syncBasketballFixturesTask,
   syncBasketballCompletedFixturesTask,
@@ -157,6 +160,44 @@ export const oddsSyncSchedule = schedules.task({
   },
 });
 
+/**
+ * Once per day at 5 AM UTC: snapshot Polymarket holders for every open
+ * tracked market. Required for walk-forward backtesting of the
+ * smart-money signal (the live API only returns CURRENT holders).
+ */
+export const polymarketHoldersSnapshotSchedule = schedules.task({
+  id: 'scheduled-snapshot-polymarket-holders',
+  cron: '0 5 * * *',
+  run: async () => {
+    logger.info('Scheduled: snapshot polymarket holders');
+    const handle = await snapshotPolymarketHoldersTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered polymarket holder snapshot task', {
+      runId: handle.id,
+    });
+  },
+});
+
+/**
+ * Every 5 minutes: refresh volume / liquidity / outcomePrices for every
+ * active Polymarket market. Powers the per-fixture market-size filter in
+ * the UI — the read path only hits Postgres.
+ */
+export const polymarketMarketSnapshotSchedule = schedules.task({
+  id: 'scheduled-polymarket-market-snapshot',
+  cron: '*/5 * * * *',
+  run: async () => {
+    logger.info('Scheduled: polymarket market snapshot');
+    const handle = await polymarketMarketSnapshotTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered polymarket market snapshot task', {
+      runId: handle.id,
+    });
+  },
+});
+
 // ─── Basketball data sync schedules ─────────────────────────────────
 //
 // Conservative schedules for the API-Basketball free tier (100 req/day).
@@ -244,5 +285,22 @@ export const polymarketTradeSchedule = schedules.task({
     logger.info('Scheduled: Polymarket trading cycle');
     const handle = await polymarketTradeTask.trigger(undefined as void);
     logger.info('Triggered Polymarket trade task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 5 minutes: trigger the copy-trader sync. The task itself
+ * self-throttles via copy_trader_config.sync_interval_minutes — this
+ * cron is the ceiling, not the floor. Admins can tune the actual
+ * cadence (1-60 min) via PATCH /api/polymarket/copy-traders/config
+ * without redeploying.
+ */
+export const copyTraderSyncSchedule = schedules.task({
+  id: 'scheduled-copy-trader-sync',
+  cron: '*/5 * * * *',
+  run: async () => {
+    logger.info('Scheduled: copy-trader sync');
+    const handle = await copyTraderSyncTask.trigger(undefined as void);
+    logger.info('Triggered copy-trader sync task', { runId: handle.id });
   },
 });

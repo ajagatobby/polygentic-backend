@@ -1,15 +1,43 @@
 import { Injectable, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { eq, and, gte, lte, desc, isNull, sql, asc } from 'drizzle-orm';
+import OpenAI from 'openai';
+import {
+  eq,
+  and,
+  gte,
+  lte,
+  desc,
+  isNull,
+  isNotNull,
+  sql,
+  asc,
+  inArray,
+} from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { DataCollectorAgent, CollectedMatchData } from './data-collector.agent';
 import { ResearchAgent, ResearchResult } from './research.agent';
 import { AnalysisAgent, PredictionOutput } from './analysis.agent';
+import { CriticAgent, CriticOutput } from './critic.agent';
+import {
+  FirstPrinciplesAgent,
+  FirstPrinciplesOutput,
+} from './first-principles.agent';
 import { PoissonModelService } from './poisson-model.service';
+import {
+  PlayerImpactService,
+  TeamAbsenceImpact,
+} from './player-impact.service';
 import { FootballService } from '../football/football.service';
 import { OddsService } from '../odds/odds.service';
 import { AlertsService } from '../alerts/alerts.service';
 import { PredictionMemoryService } from './prediction-memory.service';
+import {
+  LeaguePriorsService,
+  type LeaguePriors,
+} from './league-priors.service';
+import { SmartMoneySignalService } from '../polymarket/services/smart-money-signal.service';
+import type { SmartMoneySignal } from '../polymarket/services/smart-money-signal.service';
+import { PolymarketService } from '../polymarket/polymarket.service';
 import {
   PredictionType,
   PerformanceFeedback,
@@ -22,6 +50,8 @@ export { PredictionType, PerformanceFeedback } from './types';
 @Injectable()
 export class AgentsService {
   private readonly logger = new Logger(AgentsService.name);
+  private readonly openai?: OpenAI;
+  private readonly insightsModel: string;
 
   constructor(
     @Inject('DRIZZLE') private db: any,
@@ -29,12 +59,23 @@ export class AgentsService {
     private readonly dataCollector: DataCollectorAgent,
     private readonly researchAgent: ResearchAgent,
     private readonly analysisAgent: AnalysisAgent,
+    private readonly criticAgent: CriticAgent,
+    private readonly firstPrinciplesAgent: FirstPrinciplesAgent,
     private readonly poissonModel: PoissonModelService,
+    private readonly playerImpact: PlayerImpactService,
     private readonly footballService: FootballService,
     private readonly oddsService: OddsService,
     private readonly alertsService: AlertsService,
     private readonly predictionMemory: PredictionMemoryService,
-  ) {}
+    private readonly leaguePriorsService: LeaguePriorsService,
+    private readonly smartMoneySignalService: SmartMoneySignalService,
+    private readonly polymarketService: PolymarketService,
+  ) {
+    const openaiKey = this.config.get<string>('OPENAI_API_KEY');
+    if (openaiKey) this.openai = new OpenAI({ apiKey: openaiKey });
+    this.insightsModel =
+      this.config.get<string>('PREDICTION_INSIGHTS_MODEL') || 'gpt-5.4';
+  }
 
   // ─── Core prediction pipeline ───────────────────────────────────────
 
@@ -68,11 +109,48 @@ export class AgentsService {
       throw error;
     }
 
-    // Step 2: Web research + performance feedback + Poisson model + memory recall (in parallel)
+    // Step 1b: Compute player impact scores for injuries/absences
+    let playerImpactScores: {
+      home: TeamAbsenceImpact;
+      away: TeamAbsenceImpact;
+    } | null = null;
+    try {
+      playerImpactScores = await this.playerImpact.computeImpactScores(
+        matchData.injuries,
+        matchData.fixture.homeTeamId,
+        matchData.fixture.awayTeamId,
+        matchData.fixture.leagueId,
+        fixtureId,
+      );
+
+      const homeAbsences = playerImpactScores.home.players.filter(
+        (p) => p.impactLabel !== 'MINIMAL',
+      );
+      const awayAbsences = playerImpactScores.away.players.filter(
+        (p) => p.impactLabel !== 'MINIMAL',
+      );
+      if (homeAbsences.length > 0 || awayAbsences.length > 0) {
+        this.logger.log(
+          `Player impact for fixture ${fixtureId}: ` +
+            `Home absences=${homeAbsences.length} (xG×${playerImpactScores.home.xgMultiplier}, xGA×${playerImpactScores.home.xgaMultiplier}), ` +
+            `Away absences=${awayAbsences.length} (xG×${playerImpactScores.away.xgMultiplier}, xGA×${playerImpactScores.away.xgaMultiplier})`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Player impact scoring failed for fixture ${fixtureId}: ${error.message}`,
+      );
+    }
+
+    // Attach player impact to matchData so downstream agents can use it
+    matchData.playerImpact = playerImpactScores;
+
+    // Step 2: Web research + performance feedback + Poisson model + memory recall + league priors (in parallel)
     let research: ResearchResult;
     let feedback: PerformanceFeedback | null = null;
     let poissonOutput: PoissonModelOutput | null = null;
     let memories: string | null = null;
+    let leaguePriors: LeaguePriors | null = null;
     try {
       const homeName =
         matchData.homeTeam?.team?.name ??
@@ -81,27 +159,36 @@ export class AgentsService {
         matchData.awayTeam?.team?.name ??
         `Team ${matchData.fixture.awayTeamId}`;
 
-      const [researchResult, feedbackResult, poissonResult, memoriesResult] =
-        await Promise.allSettled([
-          this.researchAgent.research(matchData),
-          this.getPerformanceFeedback(),
-          this.poissonModel.predict(
-            matchData.fixture.homeTeamId,
-            matchData.fixture.awayTeamId,
-            matchData.fixture.leagueId,
-            fixtureId,
-          ),
-          this.predictionMemory.recallForPrediction({
-            homeTeamName: homeName,
-            awayTeamName: awayName,
-            homeTeamId: matchData.fixture.homeTeamId,
-            awayTeamId: matchData.fixture.awayTeamId,
-            leagueId: matchData.fixture.leagueId,
-            leagueName:
-              matchData.fixture.leagueName ??
-              `League ${matchData.fixture.leagueId}`,
-          }),
-        ]);
+      const [
+        researchResult,
+        feedbackResult,
+        poissonResult,
+        memoriesResult,
+        priorsResult,
+      ] = await Promise.allSettled([
+        this.researchAgent.research(matchData),
+        this.getPerformanceFeedback(),
+        this.poissonModel.predict(
+          matchData.fixture.homeTeamId,
+          matchData.fixture.awayTeamId,
+          matchData.fixture.leagueId,
+          fixtureId,
+          playerImpactScores ?? undefined,
+        ),
+        this.predictionMemory.recallForPrediction({
+          homeTeamName: homeName,
+          awayTeamName: awayName,
+          homeTeamId: matchData.fixture.homeTeamId,
+          awayTeamId: matchData.fixture.awayTeamId,
+          leagueId: matchData.fixture.leagueId,
+          leagueName:
+            matchData.fixture.leagueName ??
+            `League ${matchData.fixture.leagueId}`,
+        }),
+        this.leaguePriorsService.getLeaguePriors(matchData.fixture.leagueId),
+      ]);
+      leaguePriors =
+        priorsResult.status === 'fulfilled' ? priorsResult.value : null;
 
       research =
         researchResult.status === 'fulfilled'
@@ -157,7 +244,7 @@ export class AgentsService {
       };
     }
 
-    // Step 3: Analysis (Claude reasons independently, memories provide context)
+    // Step 3: Analysis (main reasoner)
     let prediction: PredictionOutput;
     try {
       prediction = await this.analysisAgent.analyze(
@@ -166,6 +253,7 @@ export class AgentsService {
         feedback,
         poissonOutput,
         memories,
+        leaguePriors,
       );
     } catch (error) {
       this.logger.error(
@@ -174,12 +262,68 @@ export class AgentsService {
       throw error;
     }
 
+    // Step 3a: Critic + First-principles challenge pass
+    let criticReview: CriticOutput | null = null;
+    let firstPrinciples: FirstPrinciplesOutput | null = null;
+    try {
+      const [criticResult, fpResult] = await Promise.allSettled([
+        this.criticAgent.review(matchData, research, prediction),
+        this.firstPrinciplesAgent.rethink(matchData),
+      ]);
+
+      if (criticResult.status === 'fulfilled') {
+        criticReview = criticResult.value;
+      }
+      if (fpResult.status === 'fulfilled') {
+        firstPrinciples = fpResult.value;
+      }
+
+      prediction = this.applyChallengePass(
+        prediction,
+        firstPrinciples,
+        criticReview,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Challenge pass failed for fixture ${fixtureId}: ${error.message}`,
+      );
+    }
+
     // Step 3b: Ensemble — blend Claude + Poisson + Bookmaker odds
     prediction = this.ensemblePredictions(prediction, poissonOutput, matchData);
 
+    // Step 3c: Smart-money signal (when fixture is linked to a Polymarket
+    // market). This does not directly modify probabilities — instead it
+    // adjusts confidence: agreement with sharp money → bonus, disagreement
+    // → penalty, no signal → no change. Probabilities will be revisited
+    // once the backtest confirms the signal carries usable predictive value.
+    let smartMoneySignal: SmartMoneySignal | null = null;
+    try {
+      smartMoneySignal = await this.computeSmartMoneySignal(fixtureId);
+      if (smartMoneySignal && smartMoneySignal.leanScore != null) {
+        prediction = this.applySmartMoneyConfidenceAdjustment(
+          prediction,
+          smartMoneySignal,
+          matchData,
+        );
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Smart-money signal unavailable for ${fixtureId}: ${
+          (error as Error).message
+        }`,
+      );
+    }
+
+    // TODO [Phase 3]: Apply isotonic regression calibration to final probabilities
+    // once we have 200+ resolved predictions. Isotonic regression maps raw model
+    // probabilities to empirically calibrated ones, fixing systematic miscalibration.
+    // Implementation: train an isotonic regressor on (predicted_prob, actual_outcome)
+    // pairs, then apply to homeWinProb/drawProb/awayWinProb before storage.
+
     // Step 4: Store prediction
     const modelVersion =
-      this.config.get<string>('PREDICTION_MODEL') || 'claude-sonnet-4-20250514';
+      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
     const stored = await this.storePrediction(
       fixtureId,
       matchData,
@@ -187,6 +331,7 @@ export class AgentsService {
       prediction,
       predictionType,
       modelVersion,
+      smartMoneySignal,
     );
 
     const durationMs = Date.now() - startTime;
@@ -383,9 +528,15 @@ export class AgentsService {
    */
   async resolvePredictions(): Promise<{
     resolved: number;
+    voided: number;
     errors: string[];
   }> {
-    // Get unresolved predictions where the fixture is now finished (FT)
+    // Completed fixture statuses: Full Time, After Extra Time, Penalties
+    const COMPLETED_STATUSES = ['FT', 'AET', 'PEN'];
+    // Void fixture statuses: Postponed, Cancelled, Abandoned, Awarded, Walkover
+    const VOID_STATUSES = ['PST', 'CANC', 'ABD', 'AWD', 'WO'];
+
+    // Get unresolved predictions where the fixture is now finished or voided
     const unresolved = await this.db
       .select({
         prediction: schema.predictions,
@@ -398,16 +549,38 @@ export class AgentsService {
       )
       .where(
         and(
-          isNull(schema.predictions.resolvedAt),
-          eq(schema.fixtures.status, 'FT'),
+          eq(schema.predictions.predictionStatus, 'pending'),
+          inArray(schema.fixtures.status, [
+            ...COMPLETED_STATUSES,
+            ...VOID_STATUSES,
+          ]),
         ),
       );
 
     let resolved = 0;
+    let voided = 0;
     const errors: string[] = [];
 
     for (const { prediction, fixture } of unresolved) {
       try {
+        // ── Handle voided fixtures (postponed/cancelled/abandoned) ──
+        if (VOID_STATUSES.includes(fixture.status)) {
+          await this.db
+            .update(schema.predictions)
+            .set({
+              predictionStatus: 'void',
+              resolvedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.predictions.id, prediction.id));
+          voided++;
+          this.logger.log(
+            `Voided prediction ${prediction.id} — fixture ${fixture.id} status: ${fixture.status}`,
+          );
+          continue;
+        }
+
+        // ── Handle completed fixtures ──
         const actualHomeGoals = fixture.goalsHome;
         const actualAwayGoals = fixture.goalsAway;
 
@@ -419,15 +592,15 @@ export class AgentsService {
         else if (actualHomeGoals < actualAwayGoals) actualResult = 'away_win';
         else actualResult = 'draw';
 
-        // Determine predicted result
+        // Use stored predictedResult (locked at prediction time).
+        // Fall back to re-deriving from probs for legacy predictions without it.
         const homeProb = Number(prediction.homeWinProb);
         const drawProb = Number(prediction.drawProb);
         const awayProb = Number(prediction.awayWinProb);
-        const predictedResult = this.getPredictedResultFromProbs(
-          homeProb,
-          drawProb,
-          awayProb,
-        );
+        const predictedResult =
+          prediction.predictedResult ??
+          this.getPredictedResultFromProbs(homeProb, drawProb, awayProb);
+
         const wasCorrect = predictedResult === actualResult;
 
         // Calculate Brier score (lower is better, 0 = perfect)
@@ -445,6 +618,8 @@ export class AgentsService {
             actualAwayGoals,
             actualResult,
             wasCorrect,
+            predictedResult, // backfill for legacy rows that had null
+            predictionStatus: 'resolved',
             probabilityAccuracy: String(brierScore.toFixed(6)),
             resolvedAt: new Date(),
             updatedAt: new Date(),
@@ -472,11 +647,13 @@ export class AgentsService {
       }
     }
 
-    if (resolved > 0) {
-      this.logger.log(`Resolved ${resolved} predictions`);
+    if (resolved > 0 || voided > 0) {
+      this.logger.log(
+        `Resolved ${resolved} predictions, voided ${voided} predictions`,
+      );
     }
 
-    return { resolved, errors };
+    return { resolved, voided, errors };
   }
 
   // ─── Query methods ──────────────────────────────────────────────────
@@ -596,8 +773,8 @@ export class AgentsService {
    *  - Date range:  `from` + `to` (YYYY-MM-DD)
    *  - Shorthand:   `days` (e.g. 2 = today + next 2 days)
    *
-   * For each fixture, picks the "best" prediction by priority:
-   * pre_match > daily > on_demand.
+   * For each fixture, picks the most recent prediction — an on_demand
+   * rerun supersedes older pre_match / daily runs.
    */
   async getPredictionsByMatchDate(filters: {
     date?: string;
@@ -769,20 +946,21 @@ export class AgentsService {
       entry.allPredictions.push(row.prediction);
     }
 
-    // Pick best prediction per fixture (pre_match > daily > on_demand)
-    const typePriority: Record<string, number> = {
-      pre_match: 0,
-      daily: 1,
-      on_demand: 2,
-    };
-
+    // Pick best prediction per fixture: the most recent run wins. An
+    // on_demand rerun is explicitly triggered with fresher data, so it
+    // should supersede older pre_match / daily predictions.
     for (const entry of fixtureMap.values()) {
       entry.allPredictions.sort(
         (a: any, b: any) =>
-          (typePriority[a.predictionType] ?? 99) -
-          (typePriority[b.predictionType] ?? 99),
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       );
       entry.prediction = entry.allPredictions[0] ?? null;
+      entry.allPredictions = entry.allPredictions.map((p: any) => ({
+        id: p.id,
+        predictionType: p.predictionType,
+        confidence: p.confidence,
+        createdAt: p.createdAt,
+      }));
     }
 
     const data = Array.from(fixtureMap.values());
@@ -807,6 +985,345 @@ export class AgentsService {
       .orderBy(desc(schema.predictions.createdAt));
 
     return this.enrichPredictionsWithTeamNames(rows);
+  }
+
+  /**
+   * Data-driven prediction analytics endpoint.
+   * Returns raw metrics + LLM-generated pattern insights.
+   */
+  async getPredictionInsights(filters?: {
+    predictionType?: PredictionType;
+    limit?: number;
+    minLeagueSample?: number;
+  }): Promise<any> {
+    const limit = Math.min(Math.max(filters?.limit ?? 500, 50), 2000);
+    const minLeagueSample = Math.min(
+      Math.max(filters?.minLeagueSample ?? 10, 3),
+      100,
+    );
+
+    const conditions = [eq(schema.predictions.predictionStatus, 'resolved')];
+    if (filters?.predictionType) {
+      conditions.push(
+        eq(schema.predictions.predictionType, filters.predictionType),
+      );
+    }
+
+    const resolved = await this.db
+      .select({
+        prediction: schema.predictions,
+        fixture: schema.fixtures,
+      })
+      .from(schema.predictions)
+      .innerJoin(
+        schema.fixtures,
+        eq(schema.predictions.fixtureId, schema.fixtures.id),
+      )
+      .where(and(...conditions))
+      .orderBy(desc(schema.predictions.resolvedAt))
+      .limit(limit);
+
+    if (resolved.length === 0) {
+      return {
+        generatedAt: new Date().toISOString(),
+        filters: {
+          predictionType: filters?.predictionType ?? 'all',
+          limit,
+          minLeagueSample,
+        },
+        totals: {
+          sampleSize: 0,
+          resolved: 0,
+          correct: 0,
+          accuracy: 0,
+          avgBrier: null,
+        },
+        patterns: {
+          summary: 'No resolved predictions available yet for insights.',
+          keyPatterns: [],
+          strongestLeagues: [],
+          weakestLeagues: [],
+          confidenceCalibration: [],
+          improvementSignals: [],
+        },
+      };
+    }
+
+    const total = resolved.length;
+    const correct = resolved.filter(
+      (r: any) => r.prediction.wasCorrect === true,
+    ).length;
+    const accuracy = total > 0 ? correct / total : 0;
+    const avgBrier =
+      total > 0
+        ? resolved.reduce(
+            (sum: number, r: any) =>
+              sum + (Number(r.prediction.probabilityAccuracy) || 0),
+            0,
+          ) / total
+        : null;
+
+    const byTypeMap: Record<
+      string,
+      { total: number; correct: number; avgBrierSum: number }
+    > = {};
+    const byLeagueMap: Record<
+      string,
+      {
+        total: number;
+        correct: number;
+        avgBrierSum: number;
+        leagueId: number;
+        country: string | null;
+      }
+    > = {};
+
+    const confidenceBuckets = {
+      high: { total: 0, correct: 0 }, // 8-10
+      medium: { total: 0, correct: 0 }, // 5-7
+      low: { total: 0, correct: 0 }, // 1-4
+    };
+
+    const predictedOutcomeCounts = { home_win: 0, draw: 0, away_win: 0 };
+    const actualOutcomeCounts = { home_win: 0, draw: 0, away_win: 0 };
+
+    for (const { prediction, fixture } of resolved) {
+      const type = prediction.predictionType as string;
+      if (!byTypeMap[type]) {
+        byTypeMap[type] = { total: 0, correct: 0, avgBrierSum: 0 };
+      }
+      byTypeMap[type].total++;
+      if (prediction.wasCorrect) byTypeMap[type].correct++;
+      byTypeMap[type].avgBrierSum +=
+        Number(prediction.probabilityAccuracy) || 0;
+
+      const leagueName = fixture.leagueName ?? `League ${fixture.leagueId}`;
+      if (!byLeagueMap[leagueName]) {
+        byLeagueMap[leagueName] = {
+          total: 0,
+          correct: 0,
+          avgBrierSum: 0,
+          leagueId: fixture.leagueId,
+          country: fixture.leagueCountry,
+        };
+      }
+      byLeagueMap[leagueName].total++;
+      if (prediction.wasCorrect) byLeagueMap[leagueName].correct++;
+      byLeagueMap[leagueName].avgBrierSum +=
+        Number(prediction.probabilityAccuracy) || 0;
+
+      const conf = Number(prediction.confidence ?? 5);
+      if (conf >= 8) {
+        confidenceBuckets.high.total++;
+        if (prediction.wasCorrect) confidenceBuckets.high.correct++;
+      } else if (conf >= 5) {
+        confidenceBuckets.medium.total++;
+        if (prediction.wasCorrect) confidenceBuckets.medium.correct++;
+      } else {
+        confidenceBuckets.low.total++;
+        if (prediction.wasCorrect) confidenceBuckets.low.correct++;
+      }
+
+      const predictedResult =
+        prediction.predictedResult ??
+        this.getPredictedResultFromProbs(
+          Number(prediction.homeWinProb),
+          Number(prediction.drawProb),
+          Number(prediction.awayWinProb),
+        );
+
+      if (
+        predictedResult === 'home_win' ||
+        predictedResult === 'draw' ||
+        predictedResult === 'away_win'
+      ) {
+        predictedOutcomeCounts[predictedResult]++;
+      }
+
+      if (
+        prediction.actualResult === 'home_win' ||
+        prediction.actualResult === 'draw' ||
+        prediction.actualResult === 'away_win'
+      ) {
+        actualOutcomeCounts[prediction.actualResult]++;
+      }
+    }
+
+    const byType = Object.entries(byTypeMap).map(([type, v]) => ({
+      predictionType: type,
+      total: v.total,
+      correct: v.correct,
+      accuracy: v.total > 0 ? Number((v.correct / v.total).toFixed(4)) : 0,
+      avgBrier:
+        v.total > 0 ? Number((v.avgBrierSum / v.total).toFixed(6)) : null,
+    }));
+
+    const leagueRows = Object.entries(byLeagueMap).map(([league, v]) => ({
+      league,
+      leagueId: v.leagueId,
+      country: v.country,
+      total: v.total,
+      correct: v.correct,
+      accuracy: v.total > 0 ? Number((v.correct / v.total).toFixed(4)) : 0,
+      avgBrier:
+        v.total > 0 ? Number((v.avgBrierSum / v.total).toFixed(6)) : null,
+    }));
+
+    const leaguesWithSample = leagueRows.filter(
+      (r) => r.total >= minLeagueSample,
+    );
+
+    const strongestLeagues = [...leaguesWithSample]
+      .sort((a, b) => b.accuracy - a.accuracy)
+      .slice(0, 5);
+
+    const weakestLeagues = [...leaguesWithSample]
+      .sort((a, b) => a.accuracy - b.accuracy)
+      .slice(0, 5);
+
+    // Simple time trend: recent half vs previous half
+    const midpoint = Math.floor(resolved.length / 2);
+    const recentHalf = resolved.slice(0, midpoint);
+    const previousHalf = resolved.slice(midpoint);
+
+    const calcAcc = (rows: any[]) =>
+      rows.length > 0
+        ? rows.filter((r: any) => r.prediction.wasCorrect === true).length /
+          rows.length
+        : 0;
+
+    const calcBrier = (rows: any[]) =>
+      rows.length > 0
+        ? rows.reduce(
+            (sum: number, r: any) =>
+              sum + (Number(r.prediction.probabilityAccuracy) || 0),
+            0,
+          ) / rows.length
+        : null;
+
+    const recentAccuracy = calcAcc(recentHalf);
+    const previousAccuracy = calcAcc(previousHalf);
+    const recentBrier = calcBrier(recentHalf);
+    const previousBrier = calcBrier(previousHalf);
+
+    const predictionTestRows = await this.db
+      .select({
+        test: schema.predictionTests,
+        fixture: schema.fixtures,
+      })
+      .from(schema.predictionTests)
+      .leftJoin(
+        schema.fixtures,
+        eq(schema.predictionTests.fixtureId, schema.fixtures.id),
+      )
+      .orderBy(desc(schema.predictionTests.createdAt))
+      .limit(1000);
+
+    const testsTotal = predictionTestRows.length;
+    const testsImproved = predictionTestRows.filter(
+      (r: any) => r.test.improved === true,
+    ).length;
+    const testsRetestCorrect = predictionTestRows.filter(
+      (r: any) => r.test.retestWasCorrect === true,
+    ).length;
+
+    const rawMetrics = {
+      sampleSize: total,
+      overall: {
+        accuracy: Number(accuracy.toFixed(4)),
+        avgBrier: avgBrier != null ? Number(avgBrier.toFixed(6)) : null,
+      },
+      trend: {
+        recentHalfSize: recentHalf.length,
+        previousHalfSize: previousHalf.length,
+        recentAccuracy: Number(recentAccuracy.toFixed(4)),
+        previousAccuracy: Number(previousAccuracy.toFixed(4)),
+        accuracyDelta: Number((recentAccuracy - previousAccuracy).toFixed(4)),
+        recentBrier:
+          recentBrier != null ? Number(recentBrier.toFixed(6)) : null,
+        previousBrier:
+          previousBrier != null ? Number(previousBrier.toFixed(6)) : null,
+        brierDelta:
+          recentBrier != null && previousBrier != null
+            ? Number((recentBrier - previousBrier).toFixed(6))
+            : null,
+      },
+      byType,
+      leagueCount: leagueRows.length,
+      strongestLeagues,
+      weakestLeagues,
+      confidenceBuckets: {
+        high: {
+          ...confidenceBuckets.high,
+          accuracy:
+            confidenceBuckets.high.total > 0
+              ? Number(
+                  (
+                    confidenceBuckets.high.correct /
+                    confidenceBuckets.high.total
+                  ).toFixed(4),
+                )
+              : 0,
+        },
+        medium: {
+          ...confidenceBuckets.medium,
+          accuracy:
+            confidenceBuckets.medium.total > 0
+              ? Number(
+                  (
+                    confidenceBuckets.medium.correct /
+                    confidenceBuckets.medium.total
+                  ).toFixed(4),
+                )
+              : 0,
+        },
+        low: {
+          ...confidenceBuckets.low,
+          accuracy:
+            confidenceBuckets.low.total > 0
+              ? Number(
+                  (
+                    confidenceBuckets.low.correct / confidenceBuckets.low.total
+                  ).toFixed(4),
+                )
+              : 0,
+        },
+      },
+      predictedOutcomeCounts,
+      actualOutcomeCounts,
+      retestSummary: {
+        total: testsTotal,
+        improved: testsImproved,
+        improvedRate:
+          testsTotal > 0 ? Number((testsImproved / testsTotal).toFixed(4)) : 0,
+        retestCorrect: testsRetestCorrect,
+        retestCorrectRate:
+          testsTotal > 0
+            ? Number((testsRetestCorrect / testsTotal).toFixed(4))
+            : 0,
+      },
+    };
+
+    const patterns = await this.generateInsightsWithOpenAI(rawMetrics);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      model: this.insightsModel,
+      filters: {
+        predictionType: filters?.predictionType ?? 'all',
+        limit,
+        minLeagueSample,
+      },
+      totals: {
+        sampleSize: total,
+        resolved: total,
+        correct,
+        accuracy: Number(accuracy.toFixed(4)),
+        avgBrier: avgBrier != null ? Number(avgBrier.toFixed(6)) : null,
+      },
+      rawMetrics,
+      patterns,
+    };
   }
 
   /**
@@ -948,20 +1465,12 @@ export class AgentsService {
       )
       .orderBy(asc(schema.fixtures.date), desc(schema.predictions.createdAt));
 
-    // Deduplicate: keep best prediction per fixture (pre_match > daily > on_demand)
-    const typePriority: Record<string, number> = {
-      pre_match: 0,
-      daily: 1,
-      on_demand: 2,
-    };
+    // Deduplicate: keep the most recent prediction per fixture. Rows come
+    // back ordered by createdAt DESC, so the first row per fixtureId is
+    // already the newest — an on_demand rerun supersedes older runs.
     const fixtureMap = new Map<number, (typeof rows)[0]>();
     for (const row of rows) {
-      const existing = fixtureMap.get(row.fixtureId);
-      if (
-        !existing ||
-        (typePriority[row.prediction.predictionType] ?? 99) <
-          (typePriority[existing.prediction.predictionType] ?? 99)
-      ) {
+      if (!fixtureMap.has(row.fixtureId)) {
         fixtureMap.set(row.fixtureId, row);
       }
     }
@@ -1184,9 +1693,9 @@ export class AgentsService {
         )
         .where(sql`${schema.predictions.resolvedAt} IS NOT NULL`)
         .orderBy(desc(schema.predictions.resolvedAt))
-        .limit(200); // Last 200 resolved predictions
+        .limit(500); // Last 500 resolved predictions for better statistical reliability
 
-      if (resolved.length < 10) {
+      if (resolved.length < 5) {
         // Not enough data for meaningful feedback
         return null;
       }
@@ -1299,19 +1808,64 @@ export class AgentsService {
       const actualAwayPct = actualCounts.away_win / total;
 
       // Check for systematic probability miscalibration
-      if (avgDrawProb < actualDrawPct - 0.05) {
+      // Use tighter thresholds (3% instead of 5%) to catch biases earlier
+      if (avgDrawProb < actualDrawPct - 0.03) {
         biasInsights.push(
-          `You have been UNDERESTIMATING draw probability. Your average draw prob is ${(avgDrawProb * 100).toFixed(1)}% but draws actually occur ${(actualDrawPct * 100).toFixed(1)}% of the time. Increase draw probability.`,
+          `CRITICAL: You have been UNDERESTIMATING draw probability. Your average draw prob is ${(avgDrawProb * 100).toFixed(1)}% but draws actually occur ${(actualDrawPct * 100).toFixed(1)}% of the time. Increase draw probability by at least ${((actualDrawPct - avgDrawProb) * 100).toFixed(1)} percentage points.`,
         );
       }
-      if (avgHomeProb > actualHomePct + 0.05) {
+      if (avgDrawProb > actualDrawPct + 0.03) {
         biasInsights.push(
-          `You have been OVERESTIMATING home win probability. Your average is ${(avgHomeProb * 100).toFixed(1)}% but home wins occur ${(actualHomePct * 100).toFixed(1)}% of the time.`,
+          `You have been OVERESTIMATING draw probability. Your average is ${(avgDrawProb * 100).toFixed(1)}% but draws actually occur ${(actualDrawPct * 100).toFixed(1)}% of the time.`,
         );
       }
-      if (avgAwayProb > actualAwayPct + 0.05) {
+      if (avgHomeProb > actualHomePct + 0.03) {
         biasInsights.push(
-          `You have been OVERESTIMATING away win probability. Your average is ${(avgAwayProb * 100).toFixed(1)}% but away wins occur ${(actualAwayPct * 100).toFixed(1)}% of the time.`,
+          `CRITICAL: You have been OVERESTIMATING home win probability. Your average is ${(avgHomeProb * 100).toFixed(1)}% but home wins occur ${(actualHomePct * 100).toFixed(1)}% of the time. Reduce home win probability by at least ${((avgHomeProb - actualHomePct) * 100).toFixed(1)} percentage points.`,
+        );
+      }
+      if (avgHomeProb < actualHomePct - 0.03) {
+        biasInsights.push(
+          `You have been UNDERESTIMATING home win probability. Your average is ${(avgHomeProb * 100).toFixed(1)}% but home wins occur ${(actualHomePct * 100).toFixed(1)}% of the time.`,
+        );
+      }
+      if (avgAwayProb > actualAwayPct + 0.03) {
+        biasInsights.push(
+          `You have been OVERESTIMATING away win probability. Your average is ${(avgAwayProb * 100).toFixed(1)}% but away wins occur ${(actualAwayPct * 100).toFixed(1)}% of the time. Reduce away win probability by at least ${((avgAwayProb - actualAwayPct) * 100).toFixed(1)} percentage points.`,
+        );
+      }
+      if (avgAwayProb < actualAwayPct - 0.03) {
+        biasInsights.push(
+          `You have been UNDERESTIMATING away win probability. Your average is ${(avgAwayProb * 100).toFixed(1)}% but away wins occur ${(actualAwayPct * 100).toFixed(1)}% of the time.`,
+        );
+      }
+
+      // Check for draw prediction rate (separate from probability)
+      const drawPredRate =
+        byResult.draw.predicted > 0 ? byResult.draw.predicted / total : 0;
+      if (drawPredRate < 0.15) {
+        biasInsights.push(
+          `CRITICAL: You are only predicting draws ${(drawPredRate * 100).toFixed(1)}% of the time, but draws occur ${(actualDrawPct * 100).toFixed(1)}% of the time. You are missing ~${((actualDrawPct - drawPredRate) * total).toFixed(0)} draw outcomes. Increase draw predictions significantly.`,
+        );
+      }
+
+      // Check for overconfident favorite predictions
+      const homeWinAcc =
+        byResult.home_win.predicted > 0
+          ? byResult.home_win.correct / byResult.home_win.predicted
+          : 0;
+      const awayWinAcc =
+        byResult.away_win.predicted > 0
+          ? byResult.away_win.correct / byResult.away_win.predicted
+          : 0;
+      if (homeWinAcc < 0.45 && byResult.home_win.predicted > 10) {
+        biasInsights.push(
+          `Your home win predictions are only ${(homeWinAcc * 100).toFixed(1)}% accurate. You are predicting too many home wins. Be more conservative — consider draw predictions for close matches.`,
+        );
+      }
+      if (awayWinAcc < 0.35 && byResult.away_win.predicted > 10) {
+        biasInsights.push(
+          `Your away win predictions are only ${(awayWinAcc * 100).toFixed(1)}% accurate. You are predicting too many away wins. Consider draws more often.`,
         );
       }
 
@@ -1329,14 +1883,31 @@ export class AgentsService {
           ? confidenceBuckets.low.correct / confidenceBuckets.low.total
           : 0;
 
-      if (confidenceBuckets.high.total > 5 && highAcc < 0.6) {
+      if (confidenceBuckets.high.total > 3 && highAcc < 0.55) {
         biasInsights.push(
-          `High-confidence predictions (8-10) are only ${(highAcc * 100).toFixed(1)}% accurate. You are OVERCONFIDENT. Reserve high confidence for genuinely clear-cut matches.`,
+          `CRITICAL: High-confidence predictions (8-10) are only ${(highAcc * 100).toFixed(1)}% accurate (${confidenceBuckets.high.correct}/${confidenceBuckets.high.total}). You are SEVERELY OVERCONFIDENT. Reserve high confidence for genuinely clear-cut matches only.`,
         );
       }
-      if (confidenceBuckets.low.total > 5 && lowAcc > medAcc) {
+      if (confidenceBuckets.high.total > 3 && highAcc < 0.7) {
         biasInsights.push(
-          `Low-confidence predictions are more accurate than medium-confidence ones. Your confidence scoring is not well calibrated.`,
+          `High-confidence predictions (8-10) are ${(highAcc * 100).toFixed(1)}% accurate. For confidence 8-10 to be meaningful, accuracy should be >70%. Lower your confidence scores.`,
+        );
+      }
+      if (confidenceBuckets.low.total > 3 && lowAcc > medAcc) {
+        biasInsights.push(
+          `Low-confidence predictions (${(lowAcc * 100).toFixed(1)}%) are more accurate than medium-confidence ones (${(medAcc * 100).toFixed(1)}%). Your confidence scoring is inverted — recalibrate.`,
+        );
+      }
+
+      // Overall accuracy warning
+      const overallAcc = correct / total;
+      if (overallAcc < 0.4) {
+        biasInsights.push(
+          `CRITICAL: Overall accuracy is only ${(overallAcc * 100).toFixed(1)}%. This is BELOW RANDOM for 3-way prediction (~33%). Your model has systematic biases. Focus on: (1) predicting more draws, (2) being less confident in favorites, (3) using base rates as anchors.`,
+        );
+      } else if (overallAcc < 0.5) {
+        biasInsights.push(
+          `Overall accuracy is ${(overallAcc * 100).toFixed(1)}%. Target is >50%. Focus on improving draw detection and reducing overconfidence in favorites.`,
         );
       }
 
@@ -1348,9 +1919,9 @@ export class AgentsService {
       for (const [name, data] of Object.entries(leagueMap)) {
         const acc = data.total > 0 ? data.correct / data.total : 0;
         leagueBreakdown[name] = { ...data, accuracy: acc };
-        if (data.total >= 5 && acc < 0.4) {
+        if (data.total >= 3 && acc < 0.35) {
           biasInsights.push(
-            `Poor performance in ${name}: ${(acc * 100).toFixed(1)}% accuracy over ${data.total} predictions. Consider that this league may have different dynamics.`,
+            `POOR performance in ${name}: ${(acc * 100).toFixed(1)}% accuracy over ${data.total} predictions. This league may have different dynamics (different draw rates, home advantage, etc.). Adjust your priors.`,
           );
         }
       }
@@ -1749,22 +2320,33 @@ export class AgentsService {
   /**
    * Ensemble Claude's prediction with Poisson model and bookmaker consensus.
    *
-   * Weights (configurable via env):
-   * - Claude (LLM analysis): 40% — contextual reasoning, qualitative factors
-   * - Poisson model: 25% — mathematical, xG-based, well-calibrated
-   * - Bookmaker consensus: 35% — market-efficient, incorporates all information
+   * KEY INSIGHT: While bookmaker closing odds are well-calibrated for probabilities,
+   * they are NOT optimised for 1X2 prediction accuracy. Their draw probabilities
+   * are often accurate but always "second place" to a win outcome — meaning a
+   * pure bookmaker-weighted model structurally under-predicts draws.
    *
-   * If Poisson or bookmaker data is unavailable, weights are redistributed.
+   * Rebalanced weights (v2 — addresses favourite bias):
+   * - Bookmaker consensus: 40% — still the best-calibrated signal but reduced
+   *   to prevent the system from just echoing the market favourite
+   * - Poisson model: 30% — mathematical, xG-based, independent from market
+   * - Claude (LLM analysis): 30% — contextual reasoning (injuries, motivation,
+   *   tactical matchups, form) that bookmakers price in slowly
+   *
+   * Giving Claude more weight allows qualitative factors (e.g. a key goalkeeper
+   * injury, dead-rubber motivation, derby intensity) to shift predictions away
+   * from the bookmaker favourite when warranted.
+   *
+   * If any signal is unavailable, weights are redistributed proportionally.
    */
   private ensemblePredictions(
     claudePrediction: PredictionOutput,
     poissonOutput: PoissonModelOutput | null,
     matchData: CollectedMatchData,
   ): PredictionOutput {
-    // Get weights from config (or defaults)
-    const baseClaudeWeight = 0.4;
-    const basePoissonWeight = 0.25;
-    const baseBookmakerWeight = 0.35;
+    // Rebalanced weights v2: less bookmaker dominance, more contextual analysis
+    const baseBookmakerWeight = 0.4;
+    const basePoissonWeight = 0.3;
+    const baseClaudeWeight = 0.3;
 
     // Extract bookmaker consensus probabilities
     let bookmakerProbs: {
@@ -1803,23 +2385,33 @@ export class AgentsService {
     let bookmakerWeight: number;
 
     if (hasPoissonData && hasBookmakerData) {
-      // All three signals available
-      // Scale Poisson weight by its confidence
+      // All three signals available — use evidence-based weights
+      // Scale Poisson weight by its confidence, but use a floor so it always
+      // contributes meaningfully (minimum 50% of its base weight)
+      const poissonConfMultiplier = Math.max(
+        0.5,
+        Math.min(1.0, poissonOutput!.confidence * 1.5),
+      );
       claudeWeight = baseClaudeWeight;
-      poissonWeight = basePoissonWeight * poissonOutput!.confidence;
+      poissonWeight = basePoissonWeight * poissonConfMultiplier;
       bookmakerWeight = baseBookmakerWeight;
     } else if (hasPoissonData && !hasBookmakerData) {
-      // No bookmaker data — split between Claude and Poisson
-      claudeWeight = 0.6;
-      poissonWeight = 0.4 * poissonOutput!.confidence;
+      // No bookmaker data — Poisson takes the lead, Claude secondary
+      const poissonConfMultiplier = Math.max(
+        0.5,
+        Math.min(1.0, poissonOutput!.confidence * 1.5),
+      );
+      claudeWeight = 0.35;
+      poissonWeight = 0.65 * poissonConfMultiplier;
       bookmakerWeight = 0;
     } else if (!hasPoissonData && hasBookmakerData) {
-      // No Poisson data — split between Claude and bookmaker
-      claudeWeight = 0.5;
+      // No Poisson data — avoid fully shadowing Claude with market priors.
+      // Heavy bookmaker dominance tended to over-pick favourites and suppress draws.
+      claudeWeight = 0.45;
       poissonWeight = 0;
-      bookmakerWeight = 0.5;
+      bookmakerWeight = 0.55;
     } else {
-      // Only Claude available
+      // Only Claude available — worst case, use historical calibration adjustment
       claudeWeight = 1.0;
       poissonWeight = 0;
       bookmakerWeight = 0;
@@ -1848,28 +2440,226 @@ export class AgentsService {
       (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.away : 0);
 
     // Normalize
-    const total = homeWinProb + drawProb + awayWinProb;
+    let total = homeWinProb + drawProb + awayWinProb;
     homeWinProb /= total;
     drawProb /= total;
     awayWinProb /= total;
 
-    // Blend expected goals
+    // ── Post-ensemble calibration: draw floor adjustment ──────────────
+    // Football draws occur ~25-28% of the time across major leagues.
+    // Both LLMs and naive models systematically underestimate draw probability.
+    //
+    // Two-tier floor:
+    // - Tier 1 (close matches, max win < 0.50): draw floor = 0.25
+    //   These matches are genuinely uncertain; draws are common (~30%+)
+    // - Tier 2 (moderate matches, max win < 0.60): draw floor = 0.23
+    //   Slight favourite, but draw is still realistic (~25%)
+    // - Tier 3 (clear favourite, max win >= 0.60): draw floor = 0.20
+    //   Only extreme mismatches should have draw below this
+    const dominantProb = Math.max(homeWinProb, awayWinProb);
+    let drawFloor: number;
+    if (dominantProb < 0.5) {
+      drawFloor = 0.25; // Close match — draws very common
+    } else if (dominantProb < 0.6) {
+      drawFloor = 0.23; // Moderate favourite — draw still realistic
+    } else {
+      drawFloor = 0.2; // Clear favourite — lower draw floor
+    }
+
+    // Context-aware draw uplift for parity matches.
+    // These are high-draw profiles that pure probability blending often misses.
+    const homePos = Number(matchData.standings?.home?.leaguePosition ?? 0);
+    const awayPos = Number(matchData.standings?.away?.leaguePosition ?? 0);
+    if (homePos > 0 && awayPos > 0) {
+      const posGap = Math.abs(homePos - awayPos);
+      if (posGap <= 3) {
+        drawFloor = Math.max(drawFloor, 0.28);
+      } else if (posGap <= 5) {
+        drawFloor = Math.max(drawFloor, 0.26);
+      }
+    }
+
+    const homeXgDiff =
+      (matchData.recentStats?.home?.averages?.xG ?? 0) -
+      (matchData.recentStats?.home?.averages?.xGA ?? 0);
+    const awayXgDiff =
+      (matchData.recentStats?.away?.averages?.xG ?? 0) -
+      (matchData.recentStats?.away?.averages?.xGA ?? 0);
+    if (homeXgDiff !== 0 || awayXgDiff !== 0) {
+      const xgGap = Math.abs(homeXgDiff - awayXgDiff);
+      if (xgGap < 0.2) {
+        drawFloor = Math.max(drawFloor, 0.27);
+      } else if (xgGap < 0.35) {
+        drawFloor = Math.max(drawFloor, 0.25);
+      }
+    }
+
+    if (drawProb < drawFloor) {
+      // Draw is underweighted — apply stronger calibration with 85% gap closure
+      const drawBoost = (drawFloor - drawProb) * 0.85;
+      drawProb += drawBoost;
+      // Subtract proportionally from home and away
+      const homeShare = homeWinProb / (homeWinProb + awayWinProb);
+      homeWinProb -= drawBoost * homeShare;
+      awayWinProb -= drawBoost * (1 - homeShare);
+
+      // Re-normalize
+      total = homeWinProb + drawProb + awayWinProb;
+      homeWinProb /= total;
+      drawProb /= total;
+      awayWinProb /= total;
+    }
+
+    // ── Competitive-match dampening ───────────────────────────────────
+    // When the favourite's probability is modest (< 0.50), the match is
+    // genuinely uncertain. Dampen toward equal probabilities to avoid
+    // false confidence in a marginal favourite.
+    let maxProb = Math.max(homeWinProb, drawProb, awayWinProb);
+    if (maxProb < 0.5 && maxProb > 0.38) {
+      // Tight match — pull probabilities 5% toward the mean (1/3)
+      const dampeningFactor = 0.95;
+      const mean = 1 / 3;
+      homeWinProb =
+        homeWinProb * dampeningFactor + mean * (1 - dampeningFactor);
+      drawProb = drawProb * dampeningFactor + mean * (1 - dampeningFactor);
+      awayWinProb =
+        awayWinProb * dampeningFactor + mean * (1 - dampeningFactor);
+
+      // Re-normalize
+      total = homeWinProb + drawProb + awayWinProb;
+      homeWinProb /= total;
+      drawProb /= total;
+      awayWinProb /= total;
+
+      maxProb = Math.max(homeWinProb, drawProb, awayWinProb);
+    }
+
+    // ── Overconfidence dampening ──────────────────────────────────────
+    // If any single outcome probability exceeds 0.65, dampen it.
+    // Even heavy favorites lose 20-25% of the time.
+    if (maxProb > 0.65) {
+      const dampeningFactor = 0.9; // Pull extreme probs 10% toward the mean
+      const mean = 1 / 3;
+      homeWinProb =
+        homeWinProb * dampeningFactor + mean * (1 - dampeningFactor);
+      drawProb = drawProb * dampeningFactor + mean * (1 - dampeningFactor);
+      awayWinProb =
+        awayWinProb * dampeningFactor + mean * (1 - dampeningFactor);
+
+      // Re-normalize
+      total = homeWinProb + drawProb + awayWinProb;
+      homeWinProb /= total;
+      drawProb /= total;
+      awayWinProb /= total;
+    }
+
+    // Blend expected goals (Poisson model is better calibrated for goals)
     let predictedHomeGoals = claudePrediction.predictedHomeGoals;
     let predictedAwayGoals = claudePrediction.predictedAwayGoals;
     if (hasPoissonData) {
+      // Poisson model should dominate goal expectations
+      const poissonGoalWeight = 0.65;
       predictedHomeGoals =
-        claudeWeight * claudePrediction.predictedHomeGoals +
-        (1 - claudeWeight) * poissonOutput!.expectedHomeGoals;
+        (1 - poissonGoalWeight) * claudePrediction.predictedHomeGoals +
+        poissonGoalWeight * poissonOutput!.expectedHomeGoals;
       predictedAwayGoals =
-        claudeWeight * claudePrediction.predictedAwayGoals +
-        (1 - claudeWeight) * poissonOutput!.expectedAwayGoals;
+        (1 - poissonGoalWeight) * claudePrediction.predictedAwayGoals +
+        poissonGoalWeight * poissonOutput!.expectedAwayGoals;
     }
 
+    // ── Confidence adjustment ─────────────────────────────────────────
+    // Confidence should correlate with actual prediction difficulty.
+    // Previous logic used hard caps by ensembleMaxProb that collapsed ~80%
+    // of predictions to confidence=4 — confidence became a useless signal.
+    // New logic: softer nudges (±1 each) so the final distribution has
+    // actual dynamic range while still punishing genuinely uncertain
+    // predictions.
+    let adjustedConfidence = claudePrediction.confidence;
+
+    // Decisiveness nudge: tight matches get a single point off, not a hard
+    // cap. Very competitive matches get two points off. Clear favourites get
+    // a small boost.
+    const ensembleMaxProb = Math.max(homeWinProb, drawProb, awayWinProb);
+    if (ensembleMaxProb < 0.4) {
+      adjustedConfidence = adjustedConfidence - 2;
+    } else if (ensembleMaxProb < 0.48) {
+      adjustedConfidence = adjustedConfidence - 1;
+    } else if (ensembleMaxProb >= 0.6) {
+      adjustedConfidence = adjustedConfidence + 1;
+    }
+
+    if (hasBookmakerData) {
+      // Check if Claude and bookmakers agree on the likely outcome
+      const claudePredResult = this.getArgmax(
+        claudePrediction.homeWinProb,
+        claudePrediction.drawProb,
+        claudePrediction.awayWinProb,
+      );
+      const bookPredResult = this.getArgmax(
+        bookmakerProbs!.home,
+        bookmakerProbs!.draw,
+        bookmakerProbs!.away,
+      );
+
+      if (claudePredResult !== bookPredResult) {
+        // Claude and bookmakers disagree on the outcome — reduce (but don't
+        // demolish) confidence. Previous −2 was too aggressive given
+        // bookmaker odds are often absent.
+        adjustedConfidence = adjustedConfidence - 1;
+      } else {
+        // They agree — check probability magnitude alignment
+        const claudeMaxOutcome = Math.max(
+          claudePrediction.homeWinProb,
+          claudePrediction.drawProb,
+          claudePrediction.awayWinProb,
+        );
+        const bookmakerMaxOutcome = Math.max(
+          bookmakerProbs!.home,
+          bookmakerProbs!.draw,
+          bookmakerProbs!.away,
+        );
+        const probDivergence = Math.abs(claudeMaxOutcome - bookmakerMaxOutcome);
+        if (probDivergence > 0.15) {
+          // Large magnitude disagreement
+          adjustedConfidence = adjustedConfidence - 1;
+        } else {
+          // They agree on outcome AND magnitude — bonus
+          adjustedConfidence = adjustedConfidence + 1;
+        }
+      }
+
+      // Poisson agreement bonus: if all three signals converge strongly,
+      // allow confidence to climb higher than the old +1 cap at 8.
+      if (hasPoissonData) {
+        const poissonPredResult = this.getArgmax(
+          poissonOutput!.homeWinProb,
+          poissonOutput!.drawProb,
+          poissonOutput!.awayWinProb,
+        );
+        if (
+          claudePredResult === bookPredResult &&
+          claudePredResult === poissonPredResult &&
+          ensembleMaxProb >= 0.5
+        ) {
+          adjustedConfidence = adjustedConfidence + 1;
+        }
+      }
+    }
+
+    // Final clamp to the 1..9 range. We exclude 10 (per prompt guidance "no
+    // football match warrants 10") but allow the upper band so confidence
+    // is a real signal.
+    adjustedConfidence = Math.max(
+      1,
+      Math.min(9, Math.round(adjustedConfidence)),
+    );
+
     this.logger.log(
-      `Ensemble: Claude(${(claudeWeight * 100).toFixed(0)}%) + ` +
+      `Ensemble: Bookmaker(${(bookmakerWeight * 100).toFixed(0)}%) + ` +
         `Poisson(${(poissonWeight * 100).toFixed(0)}%) + ` +
-        `Bookmaker(${(bookmakerWeight * 100).toFixed(0)}%) → ` +
-        `H=${(homeWinProb * 100).toFixed(1)}% D=${(drawProb * 100).toFixed(1)}% A=${(awayWinProb * 100).toFixed(1)}%`,
+        `Claude(${(claudeWeight * 100).toFixed(0)}%) → ` +
+        `H=${(homeWinProb * 100).toFixed(1)}% D=${(drawProb * 100).toFixed(1)}% A=${(awayWinProb * 100).toFixed(1)}% ` +
+        `(conf: ${claudePrediction.confidence}→${adjustedConfidence})`,
     );
 
     return {
@@ -1879,7 +2669,21 @@ export class AgentsService {
       awayWinProb: Number(awayWinProb.toFixed(4)),
       predictedHomeGoals: Number(predictedHomeGoals.toFixed(1)),
       predictedAwayGoals: Number(predictedAwayGoals.toFixed(1)),
+      confidence: adjustedConfidence,
     };
+  }
+
+  /**
+   * Get the argmax outcome from three probabilities.
+   */
+  private getArgmax(
+    homeProb: number,
+    drawProb: number,
+    awayProb: number,
+  ): string {
+    if (homeProb >= drawProb && homeProb >= awayProb) return 'home_win';
+    if (awayProb >= homeProb && awayProb >= drawProb) return 'away_win';
+    return 'draw';
   }
 
   /**
@@ -1930,7 +2734,11 @@ export class AgentsService {
     prediction: PredictionOutput,
     predictionType: PredictionType,
     modelVersion: string,
+    smartMoneySignal: SmartMoneySignal | null = null,
   ): Promise<any> {
+    // Lock in the predicted result at prediction time — never re-derived later
+    const predictedResult = this.getPredictedResult(prediction);
+
     const values = {
       fixtureId,
       homeTeamId: data.fixture.homeTeamId,
@@ -1940,6 +2748,7 @@ export class AgentsService {
       awayWinProb: String(prediction.awayWinProb),
       predictedHomeGoals: String(prediction.predictedHomeGoals),
       predictedAwayGoals: String(prediction.predictedAwayGoals),
+      predictedResult,
       confidence: prediction.confidence,
       predictionType,
       keyFactors: prediction.keyFactors,
@@ -1951,7 +2760,9 @@ export class AgentsService {
         citations: research.citations,
       },
       detailedAnalysis: prediction.detailedAnalysis,
+      smartMoneySignal: smartMoneySignal as any,
       modelVersion,
+      predictionStatus: 'pending' as const,
       updatedAt: new Date(),
     };
 
@@ -1973,6 +2784,422 @@ export class AgentsService {
     return stored;
   }
 
+  /**
+   * Look up Polymarket markets linked to this fixture and compute the
+   * smart-money signal across them. Returns null when no Polymarket
+   * market exists or the signal can't be formed (insufficient sharps).
+   *
+   * The output is stored on `predictions.smart_money_signal` so we can
+   * analyse the signal's value retrospectively without re-fetching from
+   * Polymarket — and crucially, without any walk-forward leakage.
+   */
+  /**
+   * Fetch all Polymarket markets linked to a fixture, then pick the one we
+   * can actually use for direction-matching: a "Will TEAM win on DATE?"
+   * moneyline where the team name matches either the home or away team of
+   * the fixture. O/U, spreads, draw, BTTS markets are intentionally skipped
+   * — they don't answer the 1X2 question we care about.
+   *
+   * We prefer the HOME-team moneyline (so outcome 0 = home win) so the
+   * direction mapping downstream is consistent across fixtures. If only an
+   * away-team moneyline exists, we use that and flip the interpretation.
+   *
+   * Returns null when no usable market exists.
+   */
+  private async computeSmartMoneySignal(
+    fixtureId: number,
+  ): Promise<(SmartMoneySignal & { marketTeamId?: number | null }) | null> {
+    // Step 0: on-demand linking.
+    // If this fixture isn't in polymarket_markets yet, try to discover it on
+    // Polymarket right now instead of waiting for the 30-min scheduled scan.
+    // Polymarket may have added the market between the last scan and this
+    // prediction, and lower-league fixtures often don't get caught by the
+    // league-specific tag scan. `linkFixtureOnDemand` handles both cases,
+    // caches negative lookups for 2h to avoid hammering Gamma, and persists
+    // any matches so subsequent predictions / scans see the link.
+    const initialCheck = await this.db
+      .select({ id: schema.polymarketMarkets.id })
+      .from(schema.polymarketMarkets)
+      .where(eq(schema.polymarketMarkets.fixtureId, fixtureId))
+      .limit(1);
+    if (initialCheck.length === 0) {
+      const result = await this.polymarketService.linkFixtureOnDemand(
+        fixtureId,
+      );
+      if (result.linked > 0) {
+        this.logger.log(
+          `Smart-money: on-demand linked fixture ${fixtureId} to ${result.linked} Polymarket market(s)`,
+        );
+      } else if (!result.alreadyLinked && !result.cached) {
+        // Fresh miss — Polymarket simply doesn't have this fixture.
+        this.logger.debug(
+          `Smart-money: fixture ${fixtureId} not on Polymarket (no signal available)`,
+        );
+      }
+    }
+
+    const linkedMarkets = await this.db
+      .select({
+        conditionId: schema.polymarketMarkets.conditionId,
+        teamId: schema.polymarketMarkets.teamId,
+        marketQuestion: schema.polymarketMarkets.marketQuestion,
+      })
+      .from(schema.polymarketMarkets)
+      .where(
+        and(
+          eq(schema.polymarketMarkets.fixtureId, fixtureId),
+          isNotNull(schema.polymarketMarkets.conditionId),
+        ),
+      );
+    if (linkedMarkets.length === 0) return null;
+
+    // Look up the fixture's home + away team names so we can match the
+    // market question against them.
+    const [fixture] = await this.db
+      .select({
+        homeTeamId: schema.fixtures.homeTeamId,
+        awayTeamId: schema.fixtures.awayTeamId,
+      })
+      .from(schema.fixtures)
+      .where(eq(schema.fixtures.id, fixtureId))
+      .limit(1);
+    if (!fixture) return null;
+    const teamRows = await this.db
+      .select({ id: schema.teams.id, name: schema.teams.name })
+      .from(schema.teams)
+      .where(
+        sql`${schema.teams.id} IN (${fixture.homeTeamId}, ${fixture.awayTeamId})`,
+      );
+    const homeName =
+      teamRows.find((t: any) => t.id === fixture.homeTeamId)?.name ?? '';
+    const awayName =
+      teamRows.find((t: any) => t.id === fixture.awayTeamId)?.name ?? '';
+    if (!homeName || !awayName) return null;
+
+    // Parse each market's question to find usable moneyline markets.
+    // Expected form: "Will TEAM_NAME win on YYYY-MM-DD?"
+    const candidates: Array<{
+      conditionId: string;
+      storedTeamId: number | null;
+      teamName: string;
+      matchSide: 'home' | 'away';
+      similarity: number;
+    }> = [];
+    const MONEYLINE_RX = /^Will\s+(.+?)\s+win\s+on\s+\d{4}-\d{2}-\d{2}\??$/i;
+    for (const m of linkedMarkets) {
+      const q = String(m.marketQuestion ?? '').trim();
+      const match = q.match(MONEYLINE_RX);
+      if (!match) continue; // skip O/U, spreads, draw, BTTS, season-long
+      const teamInQuestion = match[1].trim();
+      const homeSim = this.nameSimilarity(teamInQuestion, homeName);
+      const awaySim = this.nameSimilarity(teamInQuestion, awayName);
+      if (homeSim < 0.5 && awaySim < 0.5) continue;
+      const matchSide: 'home' | 'away' = homeSim >= awaySim ? 'home' : 'away';
+      candidates.push({
+        conditionId: m.conditionId as string,
+        storedTeamId: m.teamId as number | null,
+        teamName: teamInQuestion,
+        matchSide,
+        similarity: Math.max(homeSim, awaySim),
+      });
+    }
+    if (candidates.length === 0) return null;
+
+    // Prefer home-team moneyline (so outcome 0 = YES = home team wins).
+    candidates.sort((a, b) => {
+      // HOME before AWAY, then higher similarity wins
+      if (a.matchSide !== b.matchSide) return a.matchSide === 'home' ? -1 : 1;
+      return b.similarity - a.similarity;
+    });
+    const chosen = candidates[0];
+    const marketTeamId =
+      chosen.matchSide === 'home'
+        ? fixture.homeTeamId
+        : fixture.awayTeamId;
+
+    this.logger.debug(
+      `Smart-money market selected for fixture ${fixtureId}: ` +
+        `"${chosen.teamName}" (${chosen.matchSide}, sim=${chosen.similarity.toFixed(2)})`,
+    );
+
+    const signal = await this.smartMoneySignalService.computeSignal(
+      chosen.conditionId,
+    );
+    // Direct signal found — return it. If the direct market yielded no
+    // qualifying sharps (leanScore null) we still prefer the direct
+    // source rather than falling back to backdrop for the same fixture —
+    // the direct market is the most relevant evidence and its absence of
+    // sharp conviction is itself informative.
+    if (signal.leanScore != null) {
+      return { ...signal, marketTeamId };
+    }
+
+    // No qualifying sharps on the direct market — fall back to backdrop.
+    const backdrop = await this.computeBackdropSignal(
+      fixture.homeTeamId,
+      fixture.awayTeamId,
+    );
+    if (backdrop && backdrop.leanScore != null) {
+      return backdrop;
+    }
+    // Return the direct signal with null leanScore (informative "no read").
+    return { ...signal, marketTeamId };
+  }
+
+  /**
+   * Backdrop smart-money signal built from season-long outright markets.
+   *
+   * When no per-match Polymarket moneyline exists for a fixture, we can
+   * still learn something about the teams' relative standing by reading
+   * sharp-money positioning on their season-long outrights: league_winner,
+   * qualification (UCL/UEL/UECL), top_4, tournament_winner.
+   *
+   * Logic:
+   *   1. Pull outright markets linked (via polymarket_markets.team_id) to
+   *      either the home or away team of this fixture.
+   *   2. For each market, compute the per-market smart-money signal.
+   *      A positive leanScore means sharps are bullish on the team that
+   *      market is about (since outcome 0 = YES = "Will X happen?"),
+   *      negative means bearish.
+   *   3. Aggregate per team: sum sharp dollars × leanScore across markets.
+   *   4. Compare homeConviction vs awayConviction to get a fixture-level
+   *      lean (home-biased +1 to away-biased -1).
+   *
+   * Returns null when there aren't enough sharps across any of the
+   * involved outright markets to form a signal.
+   *
+   * Intentionally skips any market whose question contains "relegate" —
+   * polarity on that is negative (YES = team loses) and requires inversion
+   * the first cut doesn't attempt.
+   */
+  private async computeBackdropSignal(
+    homeTeamId: number,
+    awayTeamId: number,
+  ): Promise<
+    | (SmartMoneySignal & { marketTeamId?: number | null })
+    | null
+  > {
+    // Outright market types we trust to have YES = positive-for-team polarity.
+    const POSITIVE_OUTRIGHT_TYPES = [
+      'league_winner',
+      'qualification',
+      'top_4',
+      'tournament_winner',
+    ];
+
+    const markets = await this.db
+      .select({
+        conditionId: schema.polymarketMarkets.conditionId,
+        teamId: schema.polymarketMarkets.teamId,
+        marketType: schema.polymarketMarkets.marketType,
+        marketQuestion: schema.polymarketMarkets.marketQuestion,
+      })
+      .from(schema.polymarketMarkets)
+      .where(
+        and(
+          isNotNull(schema.polymarketMarkets.conditionId),
+          isNotNull(schema.polymarketMarkets.teamId),
+          inArray(schema.polymarketMarkets.teamId, [homeTeamId, awayTeamId]),
+          inArray(schema.polymarketMarkets.marketType, POSITIVE_OUTRIGHT_TYPES),
+        ),
+      );
+
+    if (markets.length === 0) return null;
+
+    // Per-team conviction aggregation. conviction = Σ leanScore × dollars
+    //   (higher = more sharp bullishness on that team)
+    let homeConviction = 0;
+    let awayConviction = 0;
+    let homeSharpDollars = 0;
+    let awaySharpDollars = 0;
+    let totalSharps = 0;
+    let contributingMarkets = 0;
+    const allTopSharps: SmartMoneySignal['topSharps'] = [];
+
+    for (const m of markets) {
+      // Skip relegation-style markets (negative polarity) defensively even
+      // if they were accidentally tagged with a positive market_type.
+      const q = String(m.marketQuestion ?? '').toLowerCase();
+      if (q.includes('relegat')) continue;
+
+      const sig = await this.smartMoneySignalService.computeSignal(
+        m.conditionId as string,
+      );
+      if (sig.leanScore == null) continue;
+      contributingMarkets++;
+      // Dollars that were on YES (outcome 0 = "Will this team do the thing?")
+      const teamId = m.teamId as number;
+      const yesDollars = sig.sharpDollarsOutcome0;
+      const noDollars = sig.sharpDollarsOutcome1;
+      // Sharp conviction on this team = leanScore × dollars behind signal.
+      // Positive leanScore → YES = team achieves it → bullish.
+      const conviction = sig.leanScore * (yesDollars + noDollars);
+      if (teamId === homeTeamId) {
+        homeConviction += conviction;
+        homeSharpDollars += yesDollars + noDollars;
+      } else if (teamId === awayTeamId) {
+        awayConviction += conviction;
+        awaySharpDollars += yesDollars + noDollars;
+      }
+      totalSharps += sig.sharpCount;
+      for (const s of sig.topSharps) allTopSharps.push(s);
+    }
+
+    if (contributingMarkets === 0) return null;
+
+    // Normalise conviction to a comparable scale per team then compute
+    // fixture-level lean: +1 = home strongly favoured by sharps, -1 = away.
+    const normHome =
+      homeSharpDollars > 0 ? homeConviction / homeSharpDollars : 0;
+    const normAway =
+      awaySharpDollars > 0 ? awayConviction / awaySharpDollars : 0;
+    const leanScore = Math.max(-1, Math.min(1, (normHome - normAway) / 2));
+
+    // Signal confidence: sample size × magnitude, capped at 1.
+    const sampleConf = Math.min(1, totalSharps / 15);
+    const signalConfidence = sampleConf * Math.abs(leanScore);
+
+    return {
+      signalKind: 'backdrop',
+      leanScore,
+      signalConfidence,
+      sharpCount: totalSharps,
+      sharpDollarsOutcome0: homeSharpDollars,
+      sharpDollarsOutcome1: awaySharpDollars,
+      outcome0Name: 'Home team (season-long conviction)',
+      outcome1Name: 'Away team (season-long conviction)',
+      topSharps: allTopSharps
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 5),
+      contributingMarkets,
+      // Backdrop signal has no single marketTeamId — home wins → leanScore +
+      marketTeamId: homeTeamId,
+    };
+  }
+
+  /**
+   * Lightweight team-name similarity. Lower-cased, FC/AFC/SC/etc. stripped,
+   * punctuation normalised. Returns 0..1; 1 = exact or substring match.
+   * Mirrors (and simplifies) OddsService.teamNameSimilarity — the two live
+   * in different modules and a shared util would force a new dependency.
+   */
+  private nameSimilarity(a: string, b: string): number {
+    const norm = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/\b(fc|cf|sc|afc|ac|as|ss|us|rc|cd|ud|rcd|sd|ca|se)\b/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    if (na.includes(nb) || nb.includes(na)) return 0.85;
+    // Word overlap
+    const wa = new Set(na.split(' '));
+    const wb = new Set(nb.split(' '));
+    const overlap = [...wa].filter((w) => wb.has(w)).length;
+    const denom = Math.min(wa.size, wb.size);
+    if (denom === 0) return 0;
+    return overlap / denom;
+  }
+
+  /**
+   * Smart-money confidence adjustment, calibrated against the Apr-2026
+   * backtest of 583 signaled predictions:
+   *
+   *   - Signal AGREES with ensemble pick: mean Brier 0.560
+   *   - Signal DISAGREES with ensemble pick: mean Brier 0.602
+   *   - Difference: -0.042 in favour of agreement
+   *
+   * That gap is large enough (the autoresearch loop spent months fighting
+   * for 0.001) that we trust the signal as a confidence modifier:
+   *   • agreement → +1 confidence (we're more likely right)
+   *   • disagreement → −1 confidence and demote the prediction's
+   *     "high-conviction" tier (we're more likely wrong)
+   *
+   * We do NOT modify probabilities — the signal's direction-prediction
+   * power is unverified. Probability shifts wait for a separate study
+   * that maps Polymarket outcome 0/1 to football outcomes per market.
+   *
+   * `marketTeamId` enables proper agreement detection: outcome 0 (YES)
+   * usually means "team X wins", so agreement = (sharps lean YES AND
+   * ensemble picks team X to win).
+   */
+  private applySmartMoneyConfidenceAdjustment(
+    prediction: PredictionOutput,
+    signal: SmartMoneySignal & { marketTeamId?: number | null },
+    matchData: CollectedMatchData,
+  ): PredictionOutput {
+    if (
+      signal.leanScore == null ||
+      signal.signalConfidence < 0.2 ||
+      signal.sharpCount < 3
+    ) {
+      return prediction;
+    }
+
+    // Determine which football outcome the ensemble is picking
+    const ensemblePick =
+      prediction.homeWinProb >= prediction.drawProb &&
+      prediction.homeWinProb >= prediction.awayWinProb
+        ? 'home'
+        : prediction.awayWinProb >= prediction.drawProb
+          ? 'away'
+          : 'draw';
+
+    // Determine which side of the Polymarket market the ensemble corresponds to
+    let ensembleAlignsWithYes: boolean | null = null;
+    if (signal.marketTeamId != null) {
+      if (signal.marketTeamId === matchData.fixture.homeTeamId) {
+        ensembleAlignsWithYes = ensemblePick === 'home';
+      } else if (signal.marketTeamId === matchData.fixture.awayTeamId) {
+        ensembleAlignsWithYes = ensemblePick === 'away';
+      }
+    }
+
+    let adjustedConfidence = prediction.confidence;
+    const sharpsLeanYes = signal.leanScore > 0;
+    const sharpsLeanStrong = Math.abs(signal.leanScore) >= 0.3;
+
+    if (ensembleAlignsWithYes === null || !sharpsLeanStrong) {
+      // No clean direction comparison — just log
+      this.logger.log(
+        `Smart-money: ${signal.sharpCount} sharps lean=${signal.leanScore.toFixed(2)} (no direction match available)`,
+      );
+      return prediction;
+    }
+
+    const agree = sharpsLeanYes === ensembleAlignsWithYes;
+    const kind = signal.signalKind ?? 'direct';
+    if (agree) {
+      adjustedConfidence = Math.min(9, adjustedConfidence + 1);
+      this.logger.log(
+        `Smart-money (${kind}): ${signal.sharpCount} sharps AGREE with ensemble ` +
+          `(lean=${signal.leanScore.toFixed(2)}) — confidence +1`,
+      );
+    } else if (kind === 'direct') {
+      // Direct per-match market: the backtest showed a 0.042 Brier gap
+      // favouring agreement, so disagreement is a genuine warning.
+      adjustedConfidence = Math.max(1, adjustedConfidence - 1);
+      this.logger.log(
+        `Smart-money (direct): ${signal.sharpCount} sharps DISAGREE with ensemble ` +
+          `(lean=${signal.leanScore.toFixed(2)}) — confidence −1 (Brier degrades on disagreement)`,
+      );
+    } else {
+      // Backdrop: season-long outrights don't directly predict a single
+      // match outcome, so disagreement is too weak to justify a penalty.
+      // Log it for visibility but leave confidence alone.
+      this.logger.log(
+        `Smart-money (backdrop): ${signal.sharpCount} sharps disagree with ensemble ` +
+          `(lean=${signal.leanScore.toFixed(2)}) — no penalty, season-long signal is only used for agreement`,
+      );
+    }
+
+    return { ...prediction, confidence: adjustedConfidence };
+  }
+
   private buildMatchContext(data: CollectedMatchData): Record<string, any> {
     return {
       fixture: {
@@ -1982,8 +3209,11 @@ export class AgentsService {
         round: data.fixture.round,
         venue: data.fixture.venueName,
       },
+      seasonRematch: data.seasonRematch,
       homeTeam: data.homeTeam?.team?.name ?? null,
       awayTeam: data.awayTeam?.team?.name ?? null,
+      overallFormWindows: data.formWindows,
+      opponentStrength: data.opponentStrength,
       h2hCount: data.h2h.length,
       injuriesCount: data.injuries.length,
       lineupsAvailable: data.lineups.length > 0,
@@ -2003,31 +3233,63 @@ export class AgentsService {
   /**
    * Determine the predicted result from probabilities.
    *
-   * Uses a draw-aware threshold instead of pure argmax, because:
-   * - In football, ~26% of matches end in draws
-   * - Draw probability rarely exceeds BOTH home and away in argmax
-   * - Pure argmax almost never predicts draws, missing ~26% of correct answers
+   * Uses a multi-criteria draw-aware strategy because:
+   * - In football, ~25-28% of matches end in draws
+   * - Draw probability rarely exceeds BOTH home and away in a 3-way split
+   * - Models systematically under-predict draws, missing ~25% of correct answers
    *
-   * Strategy:
-   * - Predict draw when: drawProb >= DRAW_THRESHOLD AND the home/away
-   *   spread is tight (neither team is a clear favourite)
-   * - Otherwise, pick the higher of home or away
+   * Strategy (layered, from most to least aggressive draw prediction):
+   * Match-type aware prediction logic that accounts for football's true draw rate.
+   *
+   * Pure argmax predicts draws <10% of the time, but draws occur ~26% in reality.
+   * This is because draw probability is distributed across ALL matches but rarely
+   * becomes the single highest outcome. We need match-type classification:
+   *
+   * TIGHT MATCH (max win prob < 0.45):
+   *   → Predict draw if drawProb >= 0.26 (matches are genuinely uncertain)
+   *
+   * COMPETITIVE MATCH (max win prob 0.45-0.55):
+   *   → Predict draw if drawProb >= 0.28 AND win spread < 0.10
+   *   → The slight favourite could easily draw
+   *
+   * CLEAR FAVOURITE (max win prob > 0.55):
+   *   → Only predict draw if drawProb is actually highest (argmax)
+   *   → Strong favourites do usually win, draw is less likely
+   *
+   * This produces ~20-28% draw predictions, matching the true ~26% base rate.
    */
   private getPredictedResultFromProbs(
     homeProb: number,
     drawProb: number,
     awayProb: number,
   ): string {
-    const DRAW_THRESHOLD = 0.27; // Slightly above typical base rate
-    const SPREAD_THRESHOLD = 0.1; // If home-away gap is < 10%, it's tight
-
-    // If draw probability is high and the match looks close, predict draw
-    const homeAwaySpread = Math.abs(homeProb - awayProb);
-    if (drawProb >= DRAW_THRESHOLD && homeAwaySpread < SPREAD_THRESHOLD) {
+    // 1. If draw is already the highest probability, always predict draw
+    if (drawProb >= homeProb && drawProb >= awayProb) {
       return 'draw';
     }
 
-    // Otherwise pick the higher of home or away
+    const maxWinProb = Math.max(homeProb, awayProb);
+    const winSpread = Math.abs(homeProb - awayProb);
+
+    // 2. VERY TIGHT MATCH: no clear favourite (max win prob < 0.43)
+    //    AND draw is within 6pp of the leader AND draw is >= 0.27
+    //    These are genuinely uncertain matches — all three outcomes equally viable
+    if (maxWinProb < 0.43 && drawProb >= 0.27 && maxWinProb - drawProb < 0.06) {
+      return 'draw';
+    }
+
+    // 3. COMPETITIVE MATCH: slight favourite (max win prob up to 0.53)
+    //    Predict draw when teams are close and draw is meaningfully high.
+    if (maxWinProb <= 0.53 && winSpread < 0.08 && drawProb >= 0.28) {
+      return 'draw';
+    }
+
+    // 4. MODERATE FAVOURITE: still allow draw when it is very close to the leader.
+    if (maxWinProb <= 0.58 && drawProb >= 0.3 && maxWinProb - drawProb < 0.03) {
+      return 'draw';
+    }
+
+    // 5. Otherwise, pick the higher of home or away
     if (homeProb >= awayProb) return 'home_win';
     return 'away_win';
   }
@@ -2053,5 +3315,201 @@ export class AgentsService {
       Math.pow(drawProb - actual.draw, 2) +
       Math.pow(awayProb - actual.away_win, 2)
     );
+  }
+
+  /**
+   * Blends the main prediction with first-principles re-estimate and applies
+   * critic-derived confidence penalty and risk annotations.
+   */
+  private applyChallengePass(
+    base: PredictionOutput,
+    firstPrinciples: FirstPrinciplesOutput | null,
+    critic: CriticOutput | null,
+  ): PredictionOutput {
+    let home = base.homeWinProb;
+    let draw = base.drawProb;
+    let away = base.awayWinProb;
+
+    if (firstPrinciples) {
+      const wBase = 0.75;
+      const wFp = 0.25;
+      home = home * wBase + firstPrinciples.homeWinProb * wFp;
+      draw = draw * wBase + firstPrinciples.drawProb * wFp;
+      away = away * wBase + firstPrinciples.awayWinProb * wFp;
+    }
+
+    const total = home + draw + away;
+    if (total > 0) {
+      home /= total;
+      draw /= total;
+      away /= total;
+    }
+
+    let confidence = base.confidence;
+    if (firstPrinciples) {
+      confidence =
+        Math.round((confidence * 0.7 + firstPrinciples.confidence * 0.3) * 10) /
+        10;
+    }
+    if (critic) {
+      confidence = confidence - critic.confidencePenalty;
+    }
+    // Clamp to [1, 9] so the critic can't floor confidence below a sensible
+    // minimum, and the full range is preserved for downstream filtering.
+    confidence = Math.max(1, Math.min(9, Math.round(confidence)));
+
+    const keyFactors = [...base.keyFactors];
+    const riskFactors = [...base.riskFactors];
+
+    if (firstPrinciples?.rationale?.length) {
+      for (const r of firstPrinciples.rationale.slice(0, 2)) {
+        keyFactors.push(`First-principles check: ${r}`);
+      }
+    }
+
+    if (critic?.concerns?.length) {
+      for (const c of critic.concerns.slice(0, 3)) {
+        riskFactors.push(`Critic concern: ${c}`);
+      }
+    }
+
+    if (critic?.missedFactors?.length) {
+      for (const m of critic.missedFactors.slice(0, 2)) {
+        riskFactors.push(`Potential missed factor: ${m}`);
+      }
+    }
+
+    const lines: string[] = [base.detailedAnalysis];
+    if (firstPrinciples) {
+      lines.push(
+        `First-principles cross-check blended at 25%: H=${firstPrinciples.homeWinProb.toFixed(2)} D=${firstPrinciples.drawProb.toFixed(2)} A=${firstPrinciples.awayWinProb.toFixed(2)} (conf ${firstPrinciples.confidence}/10).`,
+      );
+    }
+    if (critic) {
+      lines.push(
+        `Critic review verdict=${critic.verdict}, confidence penalty=${critic.confidencePenalty.toFixed(1)}.`,
+      );
+    }
+
+    return {
+      ...base,
+      homeWinProb: Number(home.toFixed(4)),
+      drawProb: Number(draw.toFixed(4)),
+      awayWinProb: Number(away.toFixed(4)),
+      confidence: Math.max(1, Math.min(10, Math.round(confidence))),
+      keyFactors: keyFactors.slice(0, 8),
+      riskFactors: riskFactors.slice(0, 8),
+      detailedAnalysis: lines.join(' '),
+    };
+  }
+
+  private async generateInsightsWithOpenAI(rawMetrics: any): Promise<any> {
+    if (!this.openai) {
+      return {
+        summary:
+          'OpenAI insights unavailable because OPENAI_API_KEY is not configured.',
+        keyPatterns: [],
+        strongestLeagues: [],
+        weakestLeagues: [],
+        confidenceCalibration: [],
+        improvementSignals: [],
+      };
+    }
+
+    const prompt = `You are a football prediction performance analyst.
+
+Analyze the metrics and return ONLY JSON with this shape:
+{
+  "summary": "short executive summary",
+  "keyPatterns": ["..."],
+  "strongestLeagues": ["..."],
+  "weakestLeagues": ["..."],
+  "confidenceCalibration": ["..."],
+  "improvementSignals": ["..."]
+}
+
+Requirements:
+- Be strictly data-driven from the supplied metrics.
+- Mention trend direction (accuracy/brier improving or worsening) with exact numbers when possible.
+- Mention best/worst leagues by accuracy.
+- Mention where confidence appears over/under calibrated.
+- Keep each bullet short and concrete.
+
+Metrics JSON:
+${JSON.stringify(rawMetrics)}`;
+
+    try {
+      const model = this.insightsModel;
+      const lower = model.toLowerCase();
+      const isReasoning =
+        lower.startsWith('o1') ||
+        lower.startsWith('o3') ||
+        lower.startsWith('o4') ||
+        lower.startsWith('gpt-5');
+
+      let content = '';
+      if (isReasoning) {
+        const response = await this.openai.chat.completions.create({
+          model,
+          messages: [{ role: 'developer', content: prompt }],
+          reasoning_effort: 'high',
+          max_completion_tokens: 1400,
+        } as any);
+        content = response.choices[0]?.message?.content ?? '';
+      } else {
+        const response = await this.openai.chat.completions.create({
+          model,
+          messages: [{ role: 'system', content: prompt }],
+          temperature: 0.2,
+          max_tokens: 1400,
+        });
+        content = response.choices[0]?.message?.content ?? '';
+      }
+
+      const parsed = this.parseJsonLoose(content);
+      return {
+        summary: parsed?.summary ?? 'No summary returned by model.',
+        keyPatterns: Array.isArray(parsed?.keyPatterns)
+          ? parsed.keyPatterns.slice(0, 8).map(String)
+          : [],
+        strongestLeagues: Array.isArray(parsed?.strongestLeagues)
+          ? parsed.strongestLeagues.slice(0, 6).map(String)
+          : [],
+        weakestLeagues: Array.isArray(parsed?.weakestLeagues)
+          ? parsed.weakestLeagues.slice(0, 6).map(String)
+          : [],
+        confidenceCalibration: Array.isArray(parsed?.confidenceCalibration)
+          ? parsed.confidenceCalibration.slice(0, 6).map(String)
+          : [],
+        improvementSignals: Array.isArray(parsed?.improvementSignals)
+          ? parsed.improvementSignals.slice(0, 8).map(String)
+          : [],
+      };
+    } catch (error) {
+      this.logger.warn(`OpenAI insights generation failed: ${error.message}`);
+      return {
+        summary: 'OpenAI insights generation failed; raw metrics are returned.',
+        keyPatterns: [],
+        strongestLeagues: [],
+        weakestLeagues: [],
+        confidenceCalibration: [],
+        improvementSignals: [],
+        error: error.message,
+      };
+    }
+  }
+
+  private parseJsonLoose(raw: string): any {
+    const cleaned = String(raw ?? '').trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      const firstBrace = cleaned.indexOf('{');
+      const lastBrace = cleaned.lastIndexOf('}');
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+      }
+      throw new Error('Invalid JSON response from model');
+    }
   }
 }

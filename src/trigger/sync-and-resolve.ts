@@ -44,6 +44,7 @@ export const syncCompletedFixturesAndResolveTask = task({
 
     logger.info('Prediction resolution complete', {
       resolved: resolveResult.resolved,
+      voided: resolveResult.voided,
       errors: resolveResult.errors.length,
     });
 
@@ -70,6 +71,7 @@ export const syncCompletedFixturesAndResolveTask = task({
     return {
       fixturesSynced,
       predictionsResolved: resolveResult.resolved,
+      predictionsVoided: resolveResult.voided,
       resolveErrors: resolveResult.errors,
       polymarketTradesResolved: polymarketResolved.resolved,
       polymarketResolveErrors: polymarketResolved.errors,
@@ -97,6 +99,7 @@ export const resolvePredictionsTask = task({
 
     logger.info('Prediction resolution complete', {
       resolved: result.resolved,
+      voided: result.voided,
       errors: result.errors.length,
     });
 

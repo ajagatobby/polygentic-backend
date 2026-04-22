@@ -3,9 +3,12 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
+  Param,
   Query,
   Body,
   Logger,
+  BadRequestException,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -16,6 +19,7 @@ import {
 } from '@nestjs/swagger';
 import { Roles } from '../auth/roles.decorator';
 import { PolymarketService } from './polymarket.service';
+import { CopyTraderService } from './services/copy-trader.service';
 import {
   polymarketScanTask,
   polymarketTradeTask,
@@ -27,7 +31,10 @@ import {
 export class PolymarketController {
   private readonly logger = new Logger(PolymarketController.name);
 
-  constructor(private readonly polymarketService: PolymarketService) {}
+  constructor(
+    private readonly polymarketService: PolymarketService,
+    private readonly copyTraderService: CopyTraderService,
+  ) {}
 
   @Get('performance')
   @ApiOperation({
@@ -36,6 +43,866 @@ export class PolymarketController {
   })
   async getPerformance() {
     return this.polymarketService.getPerformanceSummary();
+  }
+
+  @Post('smart-money/top-picks/generate')
+  @ApiOperation({
+    summary: 'Batch-generate smart-money predictions across upcoming fixtures',
+    description:
+      'Walks fixtures in a date window and runs the predict-and-persist ' +
+      'flow for each, with bounded concurrency. Skips fixtures that ' +
+      'already have a smart_money_prediction unless forceRefresh is set. ' +
+      'Returns a per-fixture status summary. Use this to populate the ' +
+      '/top-picks endpoint for a whole slate at once instead of calling ' +
+      'POST /predict/:fixtureId one at a time.',
+  })
+  @ApiQuery({
+    name: 'dateFrom',
+    required: false,
+    type: String,
+    description: 'ISO 8601. Default: yesterday.',
+  })
+  @ApiQuery({
+    name: 'dateTo',
+    required: false,
+    type: String,
+    description: 'ISO 8601. Default: today + 7 days.',
+  })
+  @ApiQuery({ name: 'leagueId', required: false, type: Number })
+  @ApiQuery({
+    name: 'upcomingOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only fixtures where kickoff > now. Default false.',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max fixtures to process (1-200, default 50).',
+  })
+  @ApiQuery({
+    name: 'forceRefresh',
+    required: false,
+    type: Boolean,
+    description:
+      'If true, re-compute predictions even when one already exists. Default false.',
+  })
+  @ApiQuery({
+    name: 'concurrency',
+    required: false,
+    type: Number,
+    description:
+      'Parallel predictions (1-8, default 4). Higher = faster but more Polymarket load.',
+  })
+  async generateTopPicks(
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
+    @Query('leagueId') leagueId?: string,
+    @Query('upcomingOnly') upcomingOnly?: string,
+    @Query('limit') limit?: string,
+    @Query('forceRefresh') forceRefresh?: string,
+    @Query('concurrency') concurrency?: string,
+  ) {
+    const num = (v: string | undefined) => {
+      if (v == null || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    return this.polymarketService.generateTopPicksBatch({
+      dateFrom: dateFrom ? new Date(dateFrom) : undefined,
+      dateTo: dateTo ? new Date(dateTo) : undefined,
+      leagueId: num(leagueId),
+      upcomingOnly: upcomingOnly === 'true',
+      limit: num(limit),
+      skipExisting: forceRefresh !== 'true',
+      concurrency: num(concurrency),
+    });
+  }
+
+  @Get('smart-money/top-picks')
+  @ApiOperation({
+    summary:
+      'Top soccer picks ranked by smart-money conviction, with Polymarket bet links',
+    description:
+      'Returns the highest-confidence standalone smart-money predictions ' +
+      'across your fixtures. Every pick carries its Polymarket URL plus a ' +
+      'recommendedBet sub-object with the outcome, implied price, and edge. ' +
+      'Heavy filter set covers prediction quality, fixture metadata, ' +
+      'probability ranges, resolution status, and edge vs market price.',
+  })
+  // Prediction quality
+  @ApiQuery({ name: 'minConfidence', required: false, type: Number })
+  @ApiQuery({ name: 'maxConfidence', required: false, type: Number })
+  @ApiQuery({
+    name: 'source',
+    required: false,
+    description: 'direct | market',
+  })
+  @ApiQuery({
+    name: 'thresholdMode',
+    required: false,
+    description: 'strict | relaxed',
+  })
+  @ApiQuery({
+    name: 'predictedResult',
+    required: false,
+    description: 'home_win | away_win | draw',
+  })
+  @ApiQuery({ name: 'minSharpCount', required: false, type: Number })
+  @ApiQuery({
+    name: 'minLeanMagnitude',
+    required: false,
+    type: Number,
+    description: '0..1 — absolute lean floor',
+  })
+  @ApiQuery({
+    name: 'strength',
+    required: false,
+    description: 'strong (|lean|≥0.5) | moderate (≥0.3) | weak',
+  })
+  @ApiQuery({
+    name: 'minDollarsFor',
+    required: false,
+    type: Number,
+    description: 'Minimum USD backing the leaning side',
+  })
+  @ApiQuery({
+    name: 'leaningTeam',
+    required: false,
+    description: 'home | away — which side sharps back',
+  })
+  // Fixture
+  @ApiQuery({ name: 'leagueId', required: false, type: Number })
+  @ApiQuery({ name: 'leagueName', required: false, type: String })
+  @ApiQuery({ name: 'leagueCountry', required: false, type: String })
+  @ApiQuery({ name: 'teamId', required: false, type: Number })
+  @ApiQuery({ name: 'teamName', required: false, type: String })
+  @ApiQuery({
+    name: 'dateFrom',
+    required: false,
+    type: String,
+    description: 'ISO 8601',
+  })
+  @ApiQuery({ name: 'dateTo', required: false, type: String })
+  @ApiQuery({
+    name: 'upcomingOnly',
+    required: false,
+    type: Boolean,
+    description: 'Only fixtures where kickoff > now',
+  })
+  // Probabilities
+  @ApiQuery({ name: 'minHomeWinProb', required: false, type: Number })
+  @ApiQuery({ name: 'maxHomeWinProb', required: false, type: Number })
+  @ApiQuery({ name: 'minDrawProb', required: false, type: Number })
+  @ApiQuery({ name: 'maxDrawProb', required: false, type: Number })
+  @ApiQuery({ name: 'minAwayWinProb', required: false, type: Number })
+  @ApiQuery({ name: 'maxAwayWinProb', required: false, type: Number })
+  // Edge
+  @ApiQuery({
+    name: 'minEdge',
+    required: false,
+    type: Number,
+    description: 'Minimum edge (our probability − market implied price)',
+  })
+  // Resolution
+  @ApiQuery({ name: 'resolved', required: false, type: Boolean })
+  @ApiQuery({ name: 'wasCorrect', required: false, type: Boolean })
+  // Sort + pagination
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    description:
+      'confidence (default) | leanMagnitude | sharpCount | kickoff | createdAt | dollarsFor',
+  })
+  @ApiQuery({ name: 'sortOrder', required: false, description: 'asc | desc' })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max picks returned (default 20, max 100)',
+  })
+  @ApiQuery({ name: 'offset', required: false, type: Number })
+  async getTopSmartMoneyPicks(
+    // Prediction quality
+    @Query('minConfidence') minConfidence?: string,
+    @Query('maxConfidence') maxConfidence?: string,
+    @Query('source') source?: string,
+    @Query('thresholdMode') thresholdMode?: string,
+    @Query('predictedResult') predictedResult?: string,
+    @Query('minSharpCount') minSharpCount?: string,
+    @Query('minLeanMagnitude') minLeanMagnitude?: string,
+    @Query('strength') strength?: string,
+    @Query('minDollarsFor') minDollarsFor?: string,
+    @Query('leaningTeam') leaningTeam?: string,
+    // Fixture
+    @Query('leagueId') leagueId?: string,
+    @Query('leagueName') leagueName?: string,
+    @Query('leagueCountry') leagueCountry?: string,
+    @Query('teamId') teamId?: string,
+    @Query('teamName') teamName?: string,
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
+    @Query('upcomingOnly') upcomingOnly?: string,
+    // Probs
+    @Query('minHomeWinProb') minHomeWinProb?: string,
+    @Query('maxHomeWinProb') maxHomeWinProb?: string,
+    @Query('minDrawProb') minDrawProb?: string,
+    @Query('maxDrawProb') maxDrawProb?: string,
+    @Query('minAwayWinProb') minAwayWinProb?: string,
+    @Query('maxAwayWinProb') maxAwayWinProb?: string,
+    // Edge
+    @Query('minEdge') minEdge?: string,
+    // Resolution
+    @Query('resolved') resolved?: string,
+    @Query('wasCorrect') wasCorrect?: string,
+    // Sort + page
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    const num = (v: string | undefined) => {
+      if (v == null || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const bool = (v: string | undefined) => {
+      if (v === 'true') return true;
+      if (v === 'false') return false;
+      return undefined;
+    };
+    const allowedSorts = [
+      'confidence',
+      'leanMagnitude',
+      'sharpCount',
+      'kickoff',
+      'createdAt',
+      'dollarsFor',
+      'edge',
+    ] as const;
+    const sortByNorm = allowedSorts.includes(sortBy as any)
+      ? (sortBy as (typeof allowedSorts)[number])
+      : undefined;
+
+    return this.polymarketService.getTopSmartMoneyPicks({
+      minConfidence: num(minConfidence),
+      maxConfidence: num(maxConfidence),
+      source: source === 'direct' || source === 'market' ? source : undefined,
+      thresholdMode:
+        thresholdMode === 'strict' || thresholdMode === 'relaxed'
+          ? thresholdMode
+          : undefined,
+      predictedResult:
+        predictedResult === 'home_win' ||
+        predictedResult === 'away_win' ||
+        predictedResult === 'draw'
+          ? predictedResult
+          : undefined,
+      minSharpCount: num(minSharpCount),
+      minLeanMagnitude: num(minLeanMagnitude),
+      strength:
+        strength === 'strong' ||
+        strength === 'moderate' ||
+        strength === 'weak'
+          ? strength
+          : undefined,
+      minDollarsFor: num(minDollarsFor),
+      leaningTeam:
+        leaningTeam === 'home' || leaningTeam === 'away'
+          ? leaningTeam
+          : undefined,
+      leagueId: num(leagueId),
+      leagueName: leagueName || undefined,
+      leagueCountry: leagueCountry || undefined,
+      teamId: num(teamId),
+      teamName: teamName || undefined,
+      dateFrom: dateFrom || undefined,
+      dateTo: dateTo || undefined,
+      upcomingOnly: bool(upcomingOnly),
+      minHomeWinProb: num(minHomeWinProb),
+      maxHomeWinProb: num(maxHomeWinProb),
+      minDrawProb: num(minDrawProb),
+      maxDrawProb: num(maxDrawProb),
+      minAwayWinProb: num(minAwayWinProb),
+      maxAwayWinProb: num(maxAwayWinProb),
+      minEdge: num(minEdge),
+      resolved: bool(resolved),
+      wasCorrect: bool(wasCorrect),
+      sortBy: sortByNorm,
+      sortOrder: sortOrder === 'asc' ? 'asc' : undefined,
+      limit: num(limit),
+      offset: num(offset),
+    });
+  }
+
+  // ─── Copy traders ──────────────────────────────────────────────────
+
+  @Get('copy-traders/config')
+  @ApiOperation({
+    summary: 'Get global copy-trader settings',
+    description:
+      'Returns the runtime-tunable config row (enabled, sync interval, ' +
+      'default sizing, daily caps, slippage tolerance, circuit breaker).',
+  })
+  async getCopyTraderConfig() {
+    return this.copyTraderService.getConfig();
+  }
+
+  @Roles('admin')
+  @Patch('copy-traders/config')
+  @ApiOperation({
+    summary: '[Admin] Update global copy-trader settings',
+    description:
+      'Partial update — any field can be changed at runtime. enabled=false ' +
+      'is the kill switch; the sync task no-ops regardless of per-trader ' +
+      'flags. sync_interval_minutes controls cadence (cron fires every 5 min ' +
+      'but task bails if within window). Daily caps and slippage tolerance ' +
+      'apply across all followed wallets.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        enabled: {
+          type: 'boolean',
+          description: 'Master kill switch. Default true.',
+        },
+        syncIntervalMinutes: {
+          type: 'integer',
+          description:
+            'Minimum minutes between syncs. Default 10. Cron fires every 5 min; task checks this.',
+          example: 10,
+        },
+        defaultSizingMode: {
+          type: 'string',
+          enum: ['fixed', 'fraction', 'kelly'],
+          description: 'Fallback when per-trader mode is not set.',
+        },
+        defaultSizingValue: {
+          type: 'number',
+          description:
+            'Fallback sizing value. fraction 0.005 = 0.5% of followed size.',
+          example: 0.005,
+        },
+        defaultMaxPositionUsd: {
+          type: 'number',
+          description: 'Fallback per-trade cap. Default 50.',
+          example: 50,
+        },
+        maxDailyTrades: {
+          type: 'integer',
+          description:
+            'Cross-wallet trade count cap per UTC day. Default 50.',
+          example: 50,
+        },
+        maxDailySpendUsd: {
+          type: 'number',
+          description: 'Cross-wallet USD cap per UTC day. Default 500.',
+          example: 500,
+        },
+        priceSlippageTolerance: {
+          type: 'number',
+          description:
+            'Skip if market price drifted more than this fraction from followed avg. 0.05 = 5%.',
+          example: 0.05,
+        },
+        maxConsecutiveLosses: {
+          type: 'integer',
+          description:
+            'Auto-pause (flip enabled=false) after this many failed executions in a row. Default 5.',
+          example: 5,
+        },
+      },
+    },
+  })
+  async updateCopyTraderConfig(
+    @Body()
+    body: Partial<{
+      enabled: boolean;
+      syncIntervalMinutes: number;
+      defaultSizingMode: 'fixed' | 'fraction' | 'kelly';
+      defaultSizingValue: number;
+      defaultMaxPositionUsd: number;
+      maxDailyTrades: number;
+      maxDailySpendUsd: number;
+      priceSlippageTolerance: number;
+      maxConsecutiveLosses: number;
+    }>,
+  ) {
+    return this.copyTraderService.updateConfig(body);
+  }
+
+  @Get('copy-traders')
+  @ApiOperation({
+    summary: 'List followed Polymarket wallets with per-trader copy config',
+  })
+  async listCopyTraders(@Query('activeOnly') activeOnly?: string) {
+    return this.copyTraderService.list({ activeOnly: activeOnly !== 'false' });
+  }
+
+  @Roles('admin')
+  @Post('copy-traders')
+  @ApiOperation({
+    summary: '[Admin] Follow a Polymarket wallet (detection only by default)',
+    description:
+      'Adds the wallet to the copy-trader follow list. copy_enabled defaults ' +
+      'to false — only detection + logging, no CLOB orders. Flip copy_enabled=true ' +
+      'once you trust the detection. Sizing defaults to 0.5% of followed size, ' +
+      'capped at $50 per trade.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['proxyWallet'],
+      properties: {
+        proxyWallet: { type: 'string', example: '0x...' },
+        nickname: { type: 'string' },
+        copyEnabled: { type: 'boolean', default: false },
+        sizingMode: {
+          type: 'string',
+          enum: ['fixed', 'fraction', 'kelly'],
+          default: 'fraction',
+        },
+        sizingValue: {
+          type: 'number',
+          description:
+            'fixed: USD per trade | fraction: X of followed size (0.005 = 0.5%) | kelly: edge-based',
+          default: 0.005,
+        },
+        maxPositionUsd: { type: 'number', default: 50 },
+        minLast10Wins: {
+          type: 'integer',
+          description: 'Skip copy if wallet has <N wins in last 10',
+        },
+        minLifetimePnl: { type: 'number' },
+        minLifetimeRoi: { type: 'number' },
+        notes: { type: 'string' },
+      },
+    },
+  })
+  async followCopyTrader(
+    @Body()
+    body: {
+      proxyWallet: string;
+      nickname?: string;
+      copyEnabled?: boolean;
+      sizingMode?: 'fixed' | 'fraction' | 'kelly';
+      sizingValue?: number;
+      maxPositionUsd?: number;
+      minLast10Wins?: number;
+      minLifetimePnl?: number;
+      minLifetimeRoi?: number;
+      notes?: string;
+    },
+  ) {
+    if (!body?.proxyWallet || !body.proxyWallet.startsWith('0x')) {
+      throw new BadRequestException(
+        'proxyWallet must be a 0x-prefixed address',
+      );
+    }
+    return this.copyTraderService.follow(body);
+  }
+
+  @Roles('admin')
+  @Patch('copy-traders/:wallet')
+  @ApiOperation({
+    summary: '[Admin] Update per-trader copy config',
+    description:
+      'Partial update — any field can be patched including toggling ' +
+      'copy_enabled on/off to pause execution without removing the wallet.',
+  })
+  async updateCopyTrader(
+    @Param('wallet') wallet: string,
+    @Body()
+    body: Partial<{
+      nickname: string | null;
+      copyEnabled: boolean;
+      sizingMode: 'fixed' | 'fraction' | 'kelly';
+      sizingValue: number;
+      maxPositionUsd: number;
+      minLast10Wins: number | null;
+      minLifetimePnl: number | null;
+      minLifetimeRoi: number | null;
+      notes: string | null;
+      active: boolean;
+    }>,
+  ) {
+    const row = await this.copyTraderService.update(wallet, body);
+    if (!row) {
+      throw new BadRequestException(`Wallet ${wallet} is not followed`);
+    }
+    return row;
+  }
+
+  @Roles('admin')
+  @Delete('copy-traders/:wallet')
+  @ApiOperation({
+    summary: '[Admin] Unfollow a wallet (sets active=false, keeps history)',
+  })
+  async unfollowCopyTrader(@Param('wallet') wallet: string) {
+    const row = await this.copyTraderService.unfollow(wallet);
+    if (!row) {
+      throw new BadRequestException(`Wallet ${wallet} is not followed`);
+    }
+    return { message: `Unfollowed ${wallet}`, wallet: row };
+  }
+
+  @Get('copy-traders/trades')
+  @ApiOperation({
+    summary: 'Get detected copy-trades with execution status',
+    description:
+      'Every position we detected on any followed wallet, whether we ' +
+      'executed it, paper-logged it, skipped, or failed.',
+  })
+  @ApiQuery({
+    name: 'since',
+    required: false,
+    type: String,
+    description: 'ISO 8601',
+  })
+  @ApiQuery({ name: 'wallet', required: false, type: String })
+  @ApiQuery({
+    name: 'executionStatus',
+    required: false,
+    description: 'executed | paper | skipped | failed',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Default 100, max 500',
+  })
+  async getCopyTraderTrades(
+    @Query('since') since?: string,
+    @Query('wallet') wallet?: string,
+    @Query('executionStatus') executionStatus?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.copyTraderService.getDetectedTrades({
+      since: since ? new Date(since) : undefined,
+      wallet: wallet || undefined,
+      executionStatus: executionStatus || undefined,
+      limit: limit ? Number(limit) : undefined,
+    });
+  }
+
+  @Roles('admin')
+  @Post('copy-traders/sync')
+  @ApiOperation({
+    summary:
+      '[Admin] Manually trigger a copy-trader sync (polls every followed wallet now)',
+  })
+  async syncCopyTraders() {
+    this.logger.log('Triggering copy-trader sync via API');
+    return this.copyTraderService.sync();
+  }
+
+  @Get('smart-money/config')
+  @ApiOperation({
+    summary: 'Get the current sharp-qualification thresholds',
+    description:
+      'Returns the DB-stored overrides for the smart-money gates. ' +
+      'Any field returned as null means the service default is in effect.',
+  })
+  async getSmartMoneyConfig() {
+    return this.polymarketService.getSmartMoneyConfig();
+  }
+
+  @Roles('admin')
+  @Patch('smart-money/config')
+  @ApiOperation({
+    summary: '[Admin] Update sharp-qualification thresholds',
+    description:
+      'Partial update — only provided fields change. Pass null to clear ' +
+      'a field and revert that specific gate to the service default. ' +
+      'Changes take effect within 30s (config is cached). Affects every ' +
+      'endpoint and task that runs the smart-money signal.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        minLifetimePnl: {
+          type: 'number',
+          description: 'Base lifetime PnL floor (USD). Default 50000.',
+          example: 75000,
+        },
+        minLifetimePnlWithStreak: {
+          type: 'number',
+          description:
+            'Lower PnL floor when the wallet has a hot streak. Default 20000.',
+          example: 25000,
+        },
+        minLifetimeRoi: {
+          type: 'number',
+          description: 'Min lifetime ROI fraction (0.10 = 10%). Default 0.10.',
+          example: 0.15,
+        },
+        minResolvedBets: {
+          type: 'integer',
+          description: 'Min resolved bets. Default 50.',
+          example: 30,
+        },
+        minSharpCount: {
+          type: 'integer',
+          description:
+            'Signal-level floor: min qualifying sharps before leanScore is non-null. Default 3.',
+          example: 5,
+        },
+        minPositionMultiple: {
+          type: 'number',
+          description:
+            'Position must be >= this multiple of trader typical bet. Default 0.5.',
+          example: 0.7,
+        },
+        correlationThreshold: {
+          type: 'number',
+          description:
+            'Dedup correlation threshold (fraction). Default 0.15.',
+          example: 0.2,
+        },
+        minLast10WinRate: {
+          type: 'number',
+          description: 'Hot-streak path: min last-10 win rate. Default 0.80.',
+          example: 0.85,
+        },
+        minCurrentStreak: {
+          type: 'integer',
+          description:
+            'Hot-streak path: min consecutive-wins streak. Default 7.',
+          example: 8,
+        },
+      },
+    },
+  })
+  async updateSmartMoneyConfig(
+    @Body()
+    body: Partial<{
+      minLifetimePnl: number | null;
+      minLifetimePnlWithStreak: number | null;
+      minLifetimeRoi: number | null;
+      minResolvedBets: number | null;
+      minSharpCount: number | null;
+      minPositionMultiple: number | null;
+      correlationThreshold: number | null;
+      minLast10WinRate: number | null;
+      minCurrentStreak: number | null;
+    }>,
+  ) {
+    return this.polymarketService.updateSmartMoneyConfig(body);
+  }
+
+  @Get('holders/:conditionId')
+  @ApiOperation({
+    summary: 'Get every top holder for a Polymarket market (by conditionId)',
+    description:
+      'Unions /holders (top-20 per outcome) with /trades aggregation (up to ' +
+      '1000 trades → net position per wallet) and a top-100 leaderboard ' +
+      'cross-check. Returns all holders per outcome with no cap. ' +
+      'Pass ?enrich=true to augment each wallet with lifetime PnL, ROI, ' +
+      'streak, and last-10/20 record. Any filter that needs lifetime stats ' +
+      '(minPnl, minRoi, minLast10Wins, minLast20Wins, minStreak, ' +
+      'minResolved) auto-enables enrichment.',
+  })
+  @ApiQuery({ name: 'enrich', required: false, type: Boolean })
+  @ApiQuery({
+    name: 'outcome',
+    required: false,
+    type: Number,
+    description: '0 or 1 — scope to a single outcome (Yes/No)',
+  })
+  @ApiQuery({
+    name: 'minAmount',
+    required: false,
+    type: Number,
+    description: 'Minimum position size (USD / shares).',
+  })
+  @ApiQuery({ name: 'maxAmount', required: false, type: Number })
+  @ApiQuery({
+    name: 'minPnl',
+    required: false,
+    type: Number,
+    description: 'Minimum lifetime realized PnL (USD).',
+  })
+  @ApiQuery({ name: 'maxPnl', required: false, type: Number })
+  @ApiQuery({
+    name: 'minRoi',
+    required: false,
+    type: Number,
+    description: 'Minimum lifetime ROI as a fraction (0.10 = 10%).',
+  })
+  @ApiQuery({ name: 'maxRoi', required: false, type: Number })
+  @ApiQuery({
+    name: 'minLast10Wins',
+    required: false,
+    type: Number,
+    description: 'Minimum wins out of last 10 resolved positions (0-10).',
+  })
+  @ApiQuery({
+    name: 'minLast20Wins',
+    required: false,
+    type: Number,
+    description: 'Minimum wins out of last 20 resolved positions (0-20).',
+  })
+  @ApiQuery({
+    name: 'minStreak',
+    required: false,
+    type: Number,
+    description: 'Minimum current consecutive-wins streak.',
+  })
+  @ApiQuery({
+    name: 'minResolved',
+    required: false,
+    type: Number,
+    description:
+      'Minimum resolved bets (skill-sample floor). Drops unknown / new wallets.',
+  })
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    description:
+      'amount (default) | pnl | roi | last10Wins | last20Wins | streak',
+  })
+  @ApiQuery({
+    name: 'sortOrder',
+    required: false,
+    description: 'asc | desc (default)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max holders per outcome after filtering.',
+  })
+  async getAllHolders(
+    @Param('conditionId') conditionId: string,
+    @Query('enrich') enrich?: string,
+    @Query('outcome') outcome?: string,
+    @Query('minAmount') minAmount?: string,
+    @Query('maxAmount') maxAmount?: string,
+    @Query('minPnl') minPnl?: string,
+    @Query('maxPnl') maxPnl?: string,
+    @Query('minRoi') minRoi?: string,
+    @Query('maxRoi') maxRoi?: string,
+    @Query('minLast10Wins') minLast10Wins?: string,
+    @Query('minLast20Wins') minLast20Wins?: string,
+    @Query('minStreak') minStreak?: string,
+    @Query('minResolved') minResolved?: string,
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: string,
+    @Query('limit') limit?: string,
+  ) {
+    if (!conditionId || !conditionId.startsWith('0x')) {
+      throw new BadRequestException(
+        'conditionId must be a 0x-prefixed Polymarket condition ID',
+      );
+    }
+    const num = (v: string | undefined) => {
+      if (v == null || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const outcomeNum = num(outcome);
+    const outcomeFiltered =
+      outcomeNum === 0 || outcomeNum === 1
+        ? (outcomeNum as 0 | 1)
+        : undefined;
+    const allowedSorts = [
+      'amount',
+      'pnl',
+      'roi',
+      'last10Wins',
+      'last20Wins',
+      'streak',
+    ] as const;
+    const sortByNorm = allowedSorts.includes(sortBy as any)
+      ? (sortBy as (typeof allowedSorts)[number])
+      : undefined;
+    const sortOrderNorm =
+      sortOrder === 'asc' || sortOrder === 'desc' ? sortOrder : undefined;
+
+    return this.polymarketService.getAllMarketHolders(conditionId, {
+      enrich: enrich === 'true',
+      outcome: outcomeFiltered,
+      minAmount: num(minAmount),
+      maxAmount: num(maxAmount),
+      minPnl: num(minPnl),
+      maxPnl: num(maxPnl),
+      minRoi: num(minRoi),
+      maxRoi: num(maxRoi),
+      minLast10Wins: num(minLast10Wins),
+      minLast20Wins: num(minLast20Wins),
+      minStreak: num(minStreak),
+      minResolved: num(minResolved),
+      sortBy: sortByNorm,
+      sortOrder: sortOrderNorm,
+      limit: num(limit),
+    });
+  }
+
+  @Get('smart-money/predict/:fixtureId')
+  @ApiOperation({
+    summary:
+      'Dry-run: predict a fixture using ONLY the smart-money signal (no LLM, no Poisson, no persistence)',
+    description:
+      'Translates Polymarket sharp-wallet positioning into home/draw/away probabilities. ' +
+      'Triggers an on-demand Polymarket link if the fixture has no market yet. ' +
+      'Returns `prediction: null` with a reason when no coverage or no qualifying sharps exist. ' +
+      'Does NOT write to the predictions table — use POST to persist. ' +
+      'Pass ?fresh=true to force-refetch from Polymarket instead of using cache.',
+  })
+  @ApiQuery({
+    name: 'fresh',
+    required: false,
+    type: Boolean,
+    description:
+      'If true, bypass all in-memory caches and re-fetch from Polymarket (slower but guaranteed live). Default: false (uses cache).',
+  })
+  async predictFromSmartMoney(
+    @Param('fixtureId') fixtureId: string,
+    @Query('fresh') fresh?: string,
+  ) {
+    const id = Number(fixtureId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new BadRequestException('fixtureId must be a positive integer');
+    }
+    return this.polymarketService.predictFromSmartMoney(id, {
+      fresh: fresh === 'true' ? true : fresh === 'false' ? false : undefined,
+    });
+  }
+
+  @Post('smart-money/predict/:fixtureId')
+  @ApiOperation({
+    summary:
+      'Generate + persist a prediction for a fixture using ONLY the smart-money signal',
+    description:
+      'Same computation as the GET endpoint, but upserts a row into the predictions ' +
+      'table with predictionType = "smart_money". Overwrites any previous smart_money ' +
+      'prediction for this fixture (one-per-fixture-per-type by unique constraint). ' +
+      'Default behaviour: always re-fetch from Polymarket (fresh=true). ' +
+      'Pass ?fresh=false to use cached data instead (faster).',
+  })
+  @ApiQuery({
+    name: 'fresh',
+    required: false,
+    type: Boolean,
+    description:
+      'If true (default on POST), bypass all in-memory caches and re-fetch from Polymarket. ' +
+      'If false, use cached data where available (faster).',
+  })
+  async generateSmartMoneyPrediction(
+    @Param('fixtureId') fixtureId: string,
+    @Query('fresh') fresh?: string,
+  ) {
+    const id = Number(fixtureId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new BadRequestException('fixtureId must be a positive integer');
+    }
+    return this.polymarketService.predictFromSmartMoney(id, {
+      persist: true,
+      fresh: fresh === 'true' ? true : fresh === 'false' ? false : undefined,
+    });
   }
 
   @Get('config')

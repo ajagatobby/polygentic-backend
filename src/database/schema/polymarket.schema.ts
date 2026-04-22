@@ -301,6 +301,315 @@ export const polymarketConfig = pgTable(
   (table) => [uniqueIndex('uq_polymarket_config_mode').on(table.mode)],
 );
 
+// ─── smart_money_config ────────────────────────────────────────────────
+// Runtime-tunable thresholds for the sharp-qualification pipeline in
+// smart-money-signal.service.ts. DB values override the hard-coded
+// defaults on every call. Single-row table (profile = 'default') with
+// the profile column reserved for future alternates (e.g. 'whales-only').
+
+export const smartMoneyConfig = pgTable(
+  'smart_money_config',
+  {
+    id: serial('id').primaryKey(),
+    profile: varchar('profile', { length: 50 }).notNull().default('default'),
+
+    minLifetimePnl: numeric('min_lifetime_pnl', { precision: 14, scale: 2 }),
+    minLifetimePnlWithStreak: numeric('min_lifetime_pnl_with_streak', {
+      precision: 14,
+      scale: 2,
+    }),
+    minLifetimeRoi: numeric('min_lifetime_roi', { precision: 5, scale: 4 }),
+    minResolvedBets: integer('min_resolved_bets'),
+    minSharpCount: integer('min_sharp_count'),
+    minPositionMultiple: numeric('min_position_multiple', {
+      precision: 5,
+      scale: 4,
+    }),
+    correlationThreshold: numeric('correlation_threshold', {
+      precision: 5,
+      scale: 4,
+    }),
+    minLast10WinRate: numeric('min_last_10_win_rate', {
+      precision: 5,
+      scale: 4,
+    }),
+    minCurrentStreak: integer('min_current_streak'),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [uniqueIndex('uq_smart_money_config_profile').on(table.profile)],
+);
+
+// ─── smart_money_predictions ───────────────────────────────────────────
+// Standalone predictions derived only from the Polymarket smart-money
+// signal (no LLM, no Poisson). Kept in a separate table from the main
+// `predictions` so the two sources don't mix in aggregate queries /
+// fixture response payloads. One row per fixture.
+
+export const smartMoneyPredictions = pgTable(
+  'smart_money_predictions',
+  {
+    id: serial('id').primaryKey(),
+    fixtureId: integer('fixture_id')
+      .notNull()
+      .references(() => fixtures.id),
+    homeTeamId: integer('home_team_id').references(() => teams.id),
+    awayTeamId: integer('away_team_id').references(() => teams.id),
+
+    homeWinProb: numeric('home_win_prob', { precision: 5, scale: 4 }).notNull(),
+    drawProb: numeric('draw_prob', { precision: 5, scale: 4 }).notNull(),
+    awayWinProb: numeric('away_win_prob', { precision: 5, scale: 4 }).notNull(),
+
+    predictedResult: varchar('predicted_result', { length: 20 }),
+    confidence: integer('confidence'),
+
+    source: varchar('source', { length: 20 }),
+    thresholdMode: varchar('threshold_mode', { length: 20 }),
+    modelVersion: varchar('model_version', { length: 50 }),
+
+    smartMoneySignal: jsonb('smart_money_signal'),
+    marketSignal: jsonb('market_signal'),
+
+    predictionStatus: varchar('prediction_status', { length: 20 })
+      .default('pending')
+      .notNull(),
+    actualHomeGoals: integer('actual_home_goals'),
+    actualAwayGoals: integer('actual_away_goals'),
+    actualResult: varchar('actual_result', { length: 20 }),
+    wasCorrect: boolean('was_correct'),
+    probabilityAccuracy: numeric('probability_accuracy', {
+      precision: 8,
+      scale: 6,
+    }),
+    resolvedAt: timestamp('resolved_at'),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('uq_smart_money_predictions_fixture').on(table.fixtureId),
+    index('idx_smart_money_predictions_created').on(table.createdAt),
+    index('idx_smart_money_predictions_status').on(table.predictionStatus),
+    index('idx_smart_money_predictions_confidence').on(table.confidence),
+  ],
+);
+
+// ─── copy_trader_config ────────────────────────────────────────────────
+// Runtime-tunable knobs for the copy-trader system. Single-row
+// (profile='default'). Per-wallet overrides live on copied_traders.
+
+export const copyTraderConfig = pgTable(
+  'copy_trader_config',
+  {
+    id: serial('id').primaryKey(),
+    profile: varchar('profile', { length: 50 }).notNull().default('default'),
+
+    enabled: boolean('enabled').default(true).notNull(),
+    syncIntervalMinutes: integer('sync_interval_minutes')
+      .default(10)
+      .notNull(),
+
+    defaultSizingMode: varchar('default_sizing_mode', { length: 20 })
+      .default('fraction')
+      .notNull(),
+    defaultSizingValue: numeric('default_sizing_value', {
+      precision: 10,
+      scale: 6,
+    })
+      .default('0.005')
+      .notNull(),
+    defaultMaxPositionUsd: numeric('default_max_position_usd', {
+      precision: 14,
+      scale: 2,
+    })
+      .default('50')
+      .notNull(),
+
+    maxDailyTrades: integer('max_daily_trades').default(50).notNull(),
+    maxDailySpendUsd: numeric('max_daily_spend_usd', {
+      precision: 14,
+      scale: 2,
+    })
+      .default('500')
+      .notNull(),
+
+    priceSlippageTolerance: numeric('price_slippage_tolerance', {
+      precision: 5,
+      scale: 4,
+    })
+      .default('0.05')
+      .notNull(),
+
+    maxConsecutiveLosses: integer('max_consecutive_losses')
+      .default(5)
+      .notNull(),
+
+    lastSyncAt: timestamp('last_sync_at'),
+    lastSyncRunId: varchar('last_sync_run_id', { length: 255 }),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [uniqueIndex('uq_copy_trader_config_profile').on(table.profile)],
+);
+
+// ─── copied_traders ────────────────────────────────────────────────────
+// Copy-trader system: follow Polymarket wallets and (optionally)
+// auto-mirror their trades onto our CLOB account. copy_enabled is
+// default-false so adding a wallet is a safe action; admin toggles
+// on once they trust the detection.
+
+export const copiedTraders = pgTable(
+  'copied_traders',
+  {
+    id: serial('id').primaryKey(),
+    proxyWallet: varchar('proxy_wallet', { length: 255 }).notNull(),
+    nickname: varchar('nickname', { length: 255 }),
+    active: boolean('active').default(true).notNull(),
+
+    copyEnabled: boolean('copy_enabled').default(false).notNull(),
+    sizingMode: varchar('sizing_mode', { length: 20 })
+      .default('fraction')
+      .notNull(),
+    sizingValue: numeric('sizing_value', { precision: 10, scale: 6 })
+      .default('0.005')
+      .notNull(),
+    maxPositionUsd: numeric('max_position_usd', { precision: 14, scale: 2 })
+      .default('50')
+      .notNull(),
+
+    minLast10Wins: integer('min_last_10_wins'),
+    minLifetimePnl: numeric('min_lifetime_pnl', { precision: 14, scale: 2 }),
+    minLifetimeRoi: numeric('min_lifetime_roi', { precision: 5, scale: 4 }),
+
+    notes: text('notes'),
+    addedAt: timestamp('added_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('uq_copied_traders_wallet').on(table.proxyWallet),
+    index('idx_copied_traders_active').on(table.active),
+  ],
+);
+
+// ─── copied_trader_positions ───────────────────────────────────────────
+// Snapshot of current positions per followed wallet, updated every
+// sync. Diffing against the previous snapshot is how we detect new
+// trades (trade_type='new') vs position increases ('increased').
+
+export const copiedTraderPositions = pgTable(
+  'copied_trader_positions',
+  {
+    id: serial('id').primaryKey(),
+    proxyWallet: varchar('proxy_wallet', { length: 255 }).notNull(),
+    conditionId: varchar('condition_id', { length: 255 }).notNull(),
+    outcomeIndex: integer('outcome_index').notNull(),
+    asset: varchar('asset', { length: 255 }),
+    marketQuestion: text('market_question'),
+    slug: varchar('slug', { length: 500 }),
+    eventSlug: varchar('event_slug', { length: 500 }),
+
+    size: numeric('size', { precision: 18, scale: 4 }),
+    avgPrice: numeric('avg_price', { precision: 10, scale: 6 }),
+    totalBought: numeric('total_bought', { precision: 14, scale: 2 }),
+    currentValue: numeric('current_value', { precision: 14, scale: 2 }),
+    lastSize: numeric('last_size', { precision: 18, scale: 4 }),
+
+    firstSeenAt: timestamp('first_seen_at').defaultNow().notNull(),
+    lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
+    status: varchar('status', { length: 20 }).default('open').notNull(),
+  },
+  (table) => [
+    uniqueIndex('uq_copied_trader_positions_wallet_market_outcome').on(
+      table.proxyWallet,
+      table.conditionId,
+      table.outcomeIndex,
+    ),
+    index('idx_copied_trader_positions_wallet').on(table.proxyWallet),
+  ],
+);
+
+// ─── copied_trader_trades ──────────────────────────────────────────────
+// Every detected trade, logged regardless of whether we executed it.
+// execution_status tells you what happened:
+//   'executed' — real CLOB order placed
+//   'paper'    — liveTradingEnabled=false, logged only
+//   'skipped'  — failed a gate (wallet cooled off, bankroll, etc.)
+//   'failed'   — exception during execution
+//   'pending'  — not yet evaluated
+
+export const copiedTraderTrades = pgTable(
+  'copied_trader_trades',
+  {
+    id: serial('id').primaryKey(),
+    proxyWallet: varchar('proxy_wallet', { length: 255 }).notNull(),
+    nickname: varchar('nickname', { length: 255 }),
+    conditionId: varchar('condition_id', { length: 255 }).notNull(),
+    outcomeIndex: integer('outcome_index').notNull(),
+    outcomeName: varchar('outcome_name', { length: 100 }),
+    marketQuestion: text('market_question'),
+    slug: varchar('slug', { length: 500 }),
+    eventSlug: varchar('event_slug', { length: 500 }),
+
+    followedSize: numeric('followed_size', { precision: 18, scale: 4 }),
+    followedAvgPrice: numeric('followed_avg_price', {
+      precision: 10,
+      scale: 6,
+    }),
+    sizeDelta: numeric('size_delta', { precision: 18, scale: 4 }),
+    tradeType: varchar('trade_type', { length: 20 }),
+
+    executionStatus: varchar('execution_status', { length: 20 }),
+    executionReason: text('execution_reason'),
+    ourPositionSizeUsd: numeric('our_position_size_usd', {
+      precision: 14,
+      scale: 2,
+    }),
+    ourTradeId: integer('our_trade_id'),
+    ourClobOrderId: varchar('our_clob_order_id', { length: 255 }),
+
+    detectedAt: timestamp('detected_at').defaultNow().notNull(),
+    executedAt: timestamp('executed_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_copied_trader_trades_wallet').on(
+      table.proxyWallet,
+      table.detectedAt,
+    ),
+    index('idx_copied_trader_trades_status').on(table.executionStatus),
+    index('idx_copied_trader_trades_detected').on(table.detectedAt),
+  ],
+);
+
+// ─── polymarket_holder_snapshots ───────────────────────────────────────
+// Daily snapshot of /holders for tracked Polymarket markets. Required for
+// walk-forward backtesting of the smart-money signal — without these,
+// historical holder distribution is unrecoverable from the public API.
+
+export const polymarketHolderSnapshots = pgTable(
+  'polymarket_holder_snapshots',
+  {
+    id: serial('id').primaryKey(),
+    conditionId: varchar('condition_id', { length: 255 }).notNull(),
+    snapshotAt: timestamp('snapshot_at').defaultNow().notNull(),
+    payload: jsonb('payload').notNull(),
+    totalHolders: integer('total_holders').default(0).notNull(),
+    totalDollars: numeric('total_dollars', { precision: 18, scale: 2 })
+      .default('0')
+      .notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_pm_holder_snapshots_condition').on(
+      table.conditionId,
+      table.snapshotAt,
+    ),
+    index('idx_pm_holder_snapshots_taken').on(table.snapshotAt),
+  ],
+);
+
 // ─── RELATIONS ─────────────────────────────────────────────────────────
 
 export const polymarketMarketsRelations = relations(

@@ -19,12 +19,16 @@ import { Roles } from '../auth/roles.decorator';
 import { AgentsService, PredictionType } from './agents.service';
 import { PredictionQueryDto } from './dto/prediction-query.dto';
 import { generatePredictionTask } from '../trigger/generate-prediction';
-import { generateDailyPredictionsTask } from '../trigger/generate-daily-predictions';
+import {
+  generateDailyPredictionsTask,
+  generateTodayPredictionsTask,
+} from '../trigger/generate-daily-predictions';
 import {
   resolvePredictionsTask,
   syncCompletedFixturesAndResolveTask,
 } from '../trigger/sync-and-resolve';
 import { rerunPredictionsTask } from '../trigger/rerun-predictions';
+import { testFailedPredictionsTask } from '../trigger/test-failed-predictions';
 
 @ApiTags('Predictions')
 @ApiBearerAuth('firebase-auth')
@@ -52,6 +56,47 @@ export class AgentsController {
   @ApiOperation({ summary: 'Get prediction accuracy statistics' })
   async getAccuracy() {
     return this.agentsService.getAccuracyStats();
+  }
+
+  @Get('insights')
+  @ApiOperation({
+    summary:
+      'Get data-driven prediction pattern insights (OpenAI-powered analytics)',
+    description:
+      'Analyzes resolved predictions to surface trend shifts, strongest/weakest leagues, ' +
+      'confidence calibration patterns, and retest improvement signals.',
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['daily', 'pre_match', 'on_demand'],
+    description: 'Optional prediction type filter',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description:
+      'How many most-recent resolved predictions to analyze (50-2000)',
+  })
+  @ApiQuery({
+    name: 'minLeagueSample',
+    required: false,
+    type: Number,
+    description:
+      'Minimum resolved predictions required for a league to be included in best/worst league ranking',
+  })
+  async getInsights(
+    @Query('type') type?: string,
+    @Query('limit') limit?: string,
+    @Query('minLeagueSample') minLeagueSample?: string,
+  ) {
+    const predictionType = type as PredictionType | undefined;
+    return this.agentsService.getPredictionInsights({
+      predictionType,
+      limit: limit ? Number(limit) : undefined,
+      minLeagueSample: minLeagueSample ? Number(minLeagueSample) : undefined,
+    });
   }
 
   @Get('bullish')
@@ -425,10 +470,43 @@ export class AgentsController {
   }
 
   @Roles('admin')
+  @Post('generate-today')
+  @ApiOperation({
+    summary:
+      "[Admin] Generate predictions for today's fixtures only (runs as background task)",
+    description:
+      "Finds all fixtures scheduled for today (UTC) that don't have predictions yet " +
+      'and generates them. Use ?force=true to regenerate predictions even if they already exist.',
+  })
+  @ApiQuery({
+    name: 'force',
+    required: false,
+    type: String,
+    description:
+      'Force regenerate predictions even if they already exist (true/false, default: false)',
+  })
+  async generateTodayPredictions(@Query('force') force?: string) {
+    const forceFlag = force === 'true';
+    this.logger.log(
+      `Triggering today's prediction generation via API (force: ${forceFlag})`,
+    );
+
+    const handle = await generateTodayPredictionsTask.trigger({
+      force: forceFlag,
+    });
+
+    return {
+      message: "Today's prediction generation task triggered",
+      taskRunId: handle.id,
+      force: forceFlag,
+    };
+  }
+
+  @Roles('admin')
   @Post('generate-daily')
   @ApiOperation({
     summary:
-      '[Admin] Trigger daily predictions for all upcoming fixtures (runs as background task)',
+      '[Admin] Trigger daily predictions for all upcoming fixtures in the next 48h (runs as background task)',
   })
   async generateDailyPredictions() {
     this.logger.log('Triggering daily prediction generation via API');
@@ -440,6 +518,65 @@ export class AgentsController {
     return {
       message: 'Daily prediction generation task triggered',
       taskRunId: handle.id,
+    };
+  }
+
+  @Roles('admin')
+  @Post('test-failed')
+  @ApiOperation({
+    summary:
+      '[Admin] Trigger failed-prediction retest run (writes to prediction_tests table)',
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: ['daily', 'pre_match', 'on_demand'],
+    description: 'Prediction type slot to retest (default: daily)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max failed predictions to retest (default: 20, max: 200)',
+  })
+  @ApiQuery({
+    name: 'fixtureIds',
+    required: false,
+    type: String,
+    description:
+      'Optional comma-separated fixture IDs to scope retest (e.g. 101,102,103)',
+  })
+  async testFailedPredictions(
+    @Query('type') type?: string,
+    @Query('limit') limit?: string,
+    @Query('fixtureIds') fixtureIds?: string,
+  ) {
+    const predictionType = (type as PredictionType) || 'daily';
+    const parsedLimit = limit ? Math.min(Math.max(Number(limit), 1), 200) : 20;
+
+    const parsedFixtureIds = fixtureIds
+      ? fixtureIds
+          .split(',')
+          .map((v) => Number(v.trim()))
+          .filter((n) => Number.isFinite(n) && n > 0)
+      : undefined;
+
+    this.logger.log(
+      `Triggering failed-prediction test task (type=${predictionType}, limit=${parsedLimit}, fixtureIds=${parsedFixtureIds?.join(',') ?? 'all'})`,
+    );
+
+    const handle = await testFailedPredictionsTask.trigger({
+      predictionType,
+      limit: parsedLimit,
+      fixtureIds: parsedFixtureIds,
+    });
+
+    return {
+      message: 'Failed-prediction test task triggered',
+      taskRunId: handle.id,
+      predictionType,
+      limit: parsedLimit,
+      fixtureIds: parsedFixtureIds ?? 'all',
     };
   }
 

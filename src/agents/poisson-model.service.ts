@@ -2,6 +2,7 @@ import { Injectable, Inject, Logger } from '@nestjs/common';
 import { eq, and, desc, sql } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { PoissonModelOutput } from './types';
+import { TeamAbsenceImpact } from './player-impact.service';
 
 /**
  * Poisson-based statistical prediction model.
@@ -12,6 +13,7 @@ import { PoissonModelOutput } from './types';
  * 2. Compute expected goals for each team using home/away factors
  * 3. Use Poisson distribution to calculate match outcome probabilities
  * 4. Apply low-scoring correction for 0-0, 1-0, 0-1 scorelines (Dixon-Coles adjustment)
+ * 5. (NEW) Apply player absence impact adjustments to expected goals
  */
 @Injectable()
 export class PoissonModelService {
@@ -21,12 +23,16 @@ export class PoissonModelService {
 
   /**
    * Generate Poisson-based probabilities for a fixture.
+   *
+   * @param playerImpact Optional player absence impact scores.
+   *   When provided, adjusts expected goals based on quantified injury impact.
    */
   async predict(
     homeTeamId: number,
     awayTeamId: number,
     leagueId: number,
     fixtureId: number,
+    playerImpact?: { home: TeamAbsenceImpact; away: TeamAbsenceImpact },
   ): Promise<PoissonModelOutput> {
     try {
       // Get recent completed fixtures with stats for both teams
@@ -39,14 +45,16 @@ export class PoissonModelService {
       const dataPoints = homeStats.matchCount + awayStats.matchCount;
 
       if (dataPoints < 6) {
-        // Not enough data for reliable Poisson model
+        // Not enough data for reliable Poisson model.
+        // Use league base rates (major European leagues average):
+        //   Home Win: ~45%, Draw: ~26%, Away Win: ~29%
         return {
-          homeWinProb: 0.4,
-          drawProb: 0.27,
-          awayWinProb: 0.33,
-          expectedHomeGoals: 1.3,
+          homeWinProb: 0.45,
+          drawProb: 0.26,
+          awayWinProb: 0.29,
+          expectedHomeGoals: 1.4,
           expectedAwayGoals: 1.1,
-          confidence: 0.1,
+          confidence: 0.15,
           dataPoints,
         };
       }
@@ -66,13 +74,63 @@ export class PoissonModelService {
       const awayDefense =
         awayStats.avgXGA > 0 ? awayStats.avgXGA / leagueAvgGoals : 1.0;
 
+      // Shrink strengths toward league average when sample quality is low.
+      const homeReliability = this.calculateReliability(
+        homeStats.matchCount,
+        homeStats.xgCoverage,
+      );
+      const awayReliability = this.calculateReliability(
+        awayStats.matchCount,
+        awayStats.xgCoverage,
+      );
+
+      const adjustedHomeAttack = 1 + (homeAttack - 1) * homeReliability;
+      const adjustedHomeDefense = 1 + (homeDefense - 1) * homeReliability;
+      const adjustedAwayAttack = 1 + (awayAttack - 1) * awayReliability;
+      const adjustedAwayDefense = 1 + (awayDefense - 1) * awayReliability;
+
       // Expected goals
       // Home xG = league_avg * home_attack * away_defense * home_advantage
       // Away xG = league_avg * away_attack * home_defense * (1/home_advantage)
-      const expectedHomeGoals =
-        leagueAvgGoals * homeAttack * awayDefense * homeAdvantage;
-      const expectedAwayGoals =
-        leagueAvgGoals * awayAttack * homeDefense * (1 / homeAdvantage);
+      let expectedHomeGoals =
+        leagueAvgGoals *
+        adjustedHomeAttack *
+        adjustedAwayDefense *
+        homeAdvantage;
+      let expectedAwayGoals =
+        leagueAvgGoals *
+        adjustedAwayAttack *
+        adjustedHomeDefense *
+        (1 / homeAdvantage);
+
+      // ── Player absence adjustments ──────────────────────────────────
+      // When key players are injured/suspended, adjust expected goals:
+      // - Home team missing attackers → reduce home xG (multiply by xgMultiplier)
+      // - Home team missing defenders → increase away xG (multiply by xgaMultiplier)
+      // - And vice versa for away team
+      if (playerImpact) {
+        const homeXgMult = playerImpact.home.xgMultiplier;
+        const homeXgaMult = playerImpact.home.xgaMultiplier;
+        const awayXgMult = playerImpact.away.xgMultiplier;
+        const awayXgaMult = playerImpact.away.xgaMultiplier;
+
+        // Home team's offensive output reduced by their absences
+        expectedHomeGoals *= homeXgMult;
+        // Away team benefits from home's defensive absences
+        expectedAwayGoals *= homeXgaMult;
+        // Away team's offensive output reduced by their absences
+        expectedAwayGoals *= awayXgMult;
+        // Home team benefits from away's defensive absences
+        expectedHomeGoals *= awayXgaMult;
+
+        if (homeXgMult < 0.95 || awayXgMult < 0.95) {
+          this.logger.debug(
+            `Poisson player impact: homeXG ×${homeXgMult} ×${awayXgaMult}, ` +
+              `awayXG ×${awayXgMult} ×${homeXgaMult} → ` +
+              `home=${expectedHomeGoals.toFixed(2)}, away=${expectedAwayGoals.toFixed(2)}`,
+          );
+        }
+      }
 
       // Cap expected goals at reasonable range
       const cappedHome = Math.max(0.3, Math.min(4.0, expectedHomeGoals));
@@ -117,15 +175,27 @@ export class PoissonModelService {
       awayWinProb = awayWinProb / total;
 
       // Confidence based on data quality
-      // More matches + xG data available = higher confidence
-      const xgAvailable = homeStats.hasXG && awayStats.hasXG ? 0.3 : 0.0;
-      const matchCountFactor = Math.min(0.5, (dataPoints / 30) * 0.5);
-      const confidence = Math.min(0.9, xgAvailable + matchCountFactor + 0.1);
+      // Previous formula produced max ~0.45 for typical data, making Poisson
+      // nearly irrelevant in the ensemble. New formula is more generous
+      // because even limited xG data is more reliable than LLM guessing.
+      //
+      // Components (each 0-1 scale):
+      // - xG availability: 0.35 if both teams have xG, 0.15 if one does, 0 otherwise
+      // - Match count: scales from 0 to 0.45 (saturates at 20 matches)
+      // - Base: 0.2 (even basic Poisson is better than random)
+      const bothHaveXG = homeStats.hasXG && awayStats.hasXG;
+      const oneHasXG = (homeStats.hasXG || awayStats.hasXG) && !bothHaveXG;
+      const avgCoverage = (homeStats.xgCoverage + awayStats.xgCoverage) / 2;
+      const xgAvailableBase = bothHaveXG ? 0.35 : oneHasXG ? 0.15 : 0.0;
+      const xgAvailable = xgAvailableBase * (0.6 + 0.4 * avgCoverage);
+      const matchCountFactor = Math.min(0.45, (dataPoints / 20) * 0.45);
+      const confidence = Math.min(0.95, xgAvailable + matchCountFactor + 0.2);
 
       this.logger.debug(
         `Poisson model: home=${homeTeamId} xG=${cappedHome.toFixed(2)}, ` +
           `away=${awayTeamId} xG=${cappedAway.toFixed(2)} → ` +
-          `H=${(homeWinProb * 100).toFixed(1)}% D=${(drawProb * 100).toFixed(1)}% A=${(awayWinProb * 100).toFixed(1)}%`,
+          `H=${(homeWinProb * 100).toFixed(1)}% D=${(drawProb * 100).toFixed(1)}% A=${(awayWinProb * 100).toFixed(1)}% ` +
+          `(xG coverage: home=${homeStats.xgCoverage}, away=${awayStats.xgCoverage}; reliability: home=${homeReliability.toFixed(2)}, away=${awayReliability.toFixed(2)})`,
       );
 
       return {
@@ -139,12 +209,12 @@ export class PoissonModelService {
       };
     } catch (error) {
       this.logger.warn(`Poisson model failed: ${error.message}`);
-      // Return uniform-ish default
+      // Return league base rate defaults
       return {
-        homeWinProb: 0.4,
-        drawProb: 0.27,
-        awayWinProb: 0.33,
-        expectedHomeGoals: 1.3,
+        homeWinProb: 0.45,
+        drawProb: 0.26,
+        awayWinProb: 0.29,
+        expectedHomeGoals: 1.4,
         expectedAwayGoals: 1.1,
         confidence: 0,
         dataPoints: 0,
@@ -174,6 +244,7 @@ export class PoissonModelService {
     avgXGA: number;
     matchCount: number;
     hasXG: boolean;
+    xgCoverage: number;
   }> {
     // Get team's recent stats — filtered by league and home/away context
     const teamStats = await this.db
@@ -201,7 +272,8 @@ export class PoissonModelService {
       .orderBy(desc(schema.fixtures.date))
       .limit(matchCount);
 
-    // If we have very few context-specific matches, supplement with all league matches
+    // If context-specific sample is thin, supplement with broader league matches
+    // instead of replacing the sample entirely. This preserves venue context.
     if (teamStats.length < 4) {
       const allLeagueStats = await this.db
         .select({
@@ -224,15 +296,27 @@ export class PoissonModelService {
         .orderBy(desc(schema.fixtures.date))
         .limit(matchCount);
 
-      // Use all league matches if context-specific were too few
-      if (allLeagueStats.length > teamStats.length) {
-        teamStats.length = 0;
-        teamStats.push(...allLeagueStats);
+      // Add only fixtures not already present, keep context matches first.
+      const existingFixtureIds = new Set(
+        teamStats.map((r: any) => r.stat.fixtureId),
+      );
+
+      for (const row of allLeagueStats) {
+        if (teamStats.length >= matchCount) break;
+        if (existingFixtureIds.has(row.stat.fixtureId)) continue;
+        teamStats.push(row);
+        existingFixtureIds.add(row.stat.fixtureId);
       }
     }
 
     if (teamStats.length === 0) {
-      return { avgXG: 0, avgXGA: 0, matchCount: 0, hasXG: false };
+      return {
+        avgXG: 0,
+        avgXGA: 0,
+        matchCount: 0,
+        hasXG: false,
+        xgCoverage: 0,
+      };
     }
 
     // Get opponent stats in the same fixtures
@@ -262,11 +346,14 @@ export class PoissonModelService {
 
     let weightedXG = 0;
     let weightedXGA = 0;
-    let xgWeightSum = 0;
+    let xgForWeightSum = 0;
+    let xgAgainstWeightSum = 0;
     let weightedGoalsFor = 0;
     let weightedGoalsAgainst = 0;
-    let goalsWeightSum = 0;
-    let xgCount = 0;
+    let goalsForWeightSum = 0;
+    let goalsAgainstWeightSum = 0;
+    let xgForCount = 0;
+    let xgAgainstCount = 0;
 
     for (let i = 0; i < teamStats.length; i++) {
       const { stat, fixture } = teamStats[i];
@@ -275,14 +362,16 @@ export class PoissonModelService {
       // Team's xG (attack)
       if (stat.expectedGoals && Number(stat.expectedGoals) > 0) {
         weightedXG += Number(stat.expectedGoals) * weight;
-        xgWeightSum += weight;
-        xgCount++;
+        xgForWeightSum += weight;
+        xgForCount++;
       }
 
       // Opponent's xG (defense = what was created against us)
       const opp = opponentMap.get(stat.fixtureId);
       if (opp?.expectedGoals && Number(opp.expectedGoals) > 0) {
         weightedXGA += Number(opp.expectedGoals) * weight;
+        xgAgainstWeightSum += weight;
+        xgAgainstCount++;
       }
 
       // Actual goals as fallback
@@ -291,31 +380,46 @@ export class PoissonModelService {
       const goalsAgainst = teamIsHome ? fixture.goalsAway : fixture.goalsHome;
       if (goalsFor != null) {
         weightedGoalsFor += goalsFor * weight;
-        goalsWeightSum += weight;
+        goalsForWeightSum += weight;
       }
       if (goalsAgainst != null) {
         weightedGoalsAgainst += goalsAgainst * weight;
+        goalsAgainstWeightSum += weight;
       }
     }
 
-    const hasXG = xgCount >= teamStats.length * 0.5; // At least half have xG
+    const xgForCoverage = xgForCount / teamStats.length;
+    const xgAgainstCoverage = xgAgainstCount / teamStats.length;
+    const baseXgCoverage = Math.min(xgForCoverage, xgAgainstCoverage);
+    const contextMatchCount = teamStats.filter((r: any) =>
+      isHome
+        ? r.fixture.homeTeamId === teamId
+        : r.fixture.awayTeamId === teamId,
+    ).length;
+    const contextRatio = contextMatchCount / teamStats.length;
+
+    // Slightly discount coverage/confidence when context sample is thin.
+    const xgCoverage = baseXgCoverage * (0.7 + 0.3 * contextRatio);
+    const hasXG = xgCoverage >= 0.5; // At least half have reliable xG signal
     const n = teamStats.length;
+    const effectiveMatchCount = n * (0.5 + 0.5 * contextRatio);
 
     return {
       avgXG:
-        hasXG && xgWeightSum > 0
-          ? weightedXG / xgWeightSum
-          : goalsWeightSum > 0
-            ? weightedGoalsFor / goalsWeightSum
+        hasXG && xgForWeightSum > 0
+          ? weightedXG / xgForWeightSum
+          : goalsForWeightSum > 0
+            ? weightedGoalsFor / goalsForWeightSum
             : 0,
       avgXGA:
-        hasXG && xgWeightSum > 0
-          ? weightedXGA / xgWeightSum
-          : goalsWeightSum > 0
-            ? weightedGoalsAgainst / goalsWeightSum
+        hasXG && xgAgainstWeightSum > 0
+          ? weightedXGA / xgAgainstWeightSum
+          : goalsAgainstWeightSum > 0
+            ? weightedGoalsAgainst / goalsAgainstWeightSum
             : 0,
-      matchCount: n,
+      matchCount: Number(effectiveMatchCount.toFixed(1)),
       hasXG,
+      xgCoverage: Number(xgCoverage.toFixed(2)),
     };
   }
 
@@ -397,14 +501,19 @@ export class PoissonModelService {
    * Calculate the Dixon-Coles correlation parameter (rho).
    * Rho captures the dependency between low-scoring events.
    * Negative rho = more 0-0 and 1-1 than independent Poisson predicts.
+   *
+   * Research (Dixon & Coles 1997, Koopman & Lit 2015) shows rho
+   * typically ranges from -0.03 to -0.13 across European leagues.
+   * Using more precise estimates based on total expected goals.
    */
   private calculateRho(lambdaHome: number, lambdaAway: number): number {
-    // Empirical estimate: rho is typically between -0.1 and -0.2
-    // for most football leagues. More defensive leagues = more negative.
     const totalXG = lambdaHome + lambdaAway;
-    if (totalXG < 2.0) return -0.15; // Defensive game
-    if (totalXG > 3.5) return -0.05; // Attacking game
-    return -0.1; // Average
+    // Continuous rho estimation instead of discrete buckets
+    // At low xG (defensive), rho is more negative (stronger correction)
+    // At high xG (attacking), rho is less negative (Poisson fits better)
+    // Clamped to [-0.13, -0.03] based on empirical research
+    const rho = -0.13 + (totalXG - 1.5) * 0.025;
+    return Math.max(-0.13, Math.min(-0.03, rho));
   }
 
   /**
@@ -432,5 +541,11 @@ export class PoissonModelService {
       return baseProbability * (1 - rho);
     }
     return baseProbability;
+  }
+
+  private calculateReliability(matchCount: number, xgCoverage: number): number {
+    const sampleReliability = Math.min(1, matchCount / 12);
+    const xgReliability = 0.4 + 0.6 * Math.max(0, Math.min(1, xgCoverage));
+    return Number((sampleReliability * xgReliability).toFixed(2));
   }
 }

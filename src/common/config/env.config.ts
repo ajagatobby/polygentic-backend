@@ -174,12 +174,16 @@ export class EnvConfig {
   ANTHROPIC_API_KEY: string;
 
   @IsString()
+  @IsOptional()
+  OPENAI_API_KEY?: string;
+
+  @IsString()
   @IsNotEmpty()
   PERPLEXITY_API_KEY: string;
 
   @IsString()
   @IsOptional()
-  PREDICTION_MODEL: string = 'claude-sonnet-4-20250514';
+  PREDICTION_MODEL: string = 'claude-opus-4-6';
 
   // ─── SYNC INTERVALS ─────────────────────────────────────────────────
 

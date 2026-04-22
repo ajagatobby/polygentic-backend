@@ -1,10 +1,9 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { eq, and, gte, lte, sql, desc, asc } from 'drizzle-orm';
+import { eq, and, gte, lte, sql, desc, asc, inArray } from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { FixtureQueryDto, MATCH_STATE_STATUSES } from './dto/fixture-query.dto';
-import { inArray } from 'drizzle-orm';
 
 /** League IDs we actively track across all sync operations. */
 export const TRACKED_LEAGUES = [
@@ -73,6 +72,15 @@ interface ApiFootballResponse<T = any> {
   paging: { current: number; total: number };
   response: T[];
 }
+
+export type FixtureByIdResult = {
+  fixture: any;
+  statistics: any[];
+  events: any[];
+  injuries: any[];
+  lineups: any[];
+  prediction: any;
+};
 
 @Injectable()
 export class FootballService {
@@ -686,6 +694,45 @@ export class FootballService {
     return totalUpserted;
   }
 
+  /**
+   * Sync every fixture API-Football has for a specific (league, season).
+   * Unlike syncFixtures (upcoming only) and syncFixturesByDateRange (bounded
+   * to current season), this fetches the full season regardless of date, so
+   * it's the right call for historical backfills.
+   *
+   * @returns Number of fixtures upserted.
+   */
+  async syncFixturesBySeason(
+    leagueId: number,
+    season: number,
+  ): Promise<number> {
+    this.logger.log(
+      `Backfill: syncing all fixtures for league ${leagueId}, season ${season}`,
+    );
+
+    const data = await this.apiRequest<any>('/fixtures', {
+      league: String(leagueId),
+      season: String(season),
+    });
+
+    if (!data.response?.length) {
+      this.logger.debug(
+        `No fixtures for league ${leagueId} season ${season}`,
+      );
+      return 0;
+    }
+
+    let upserted = 0;
+    for (const item of data.response) {
+      await this.upsertFixture(item);
+      upserted++;
+    }
+    this.logger.debug(
+      `Backfill: synced ${upserted} fixtures for league ${leagueId} season ${season}`,
+    );
+    return upserted;
+  }
+
   // ─── FETCH METHODS (Read-only from API, optionally persist) ──────────
 
   /**
@@ -833,6 +880,118 @@ export class FootballService {
       .where(eq(schema.fixtureLineups.fixtureId, fixtureId));
 
     return lineups;
+  }
+
+  /**
+   * Batch fetch Polymarket market links for multiple fixtures.
+   *
+   * Returns a Map<fixtureId, PolymarketFixtureInfo> where each info carries:
+   *   - eventUrl: a direct link to the Polymarket event page
+   *   - markets: the list of linked markets (moneyline, O/U, spread, BTTS,
+   *     draw, etc.) with condition IDs, current prices, and per-market URLs
+   *
+   * Used by list endpoints (getFixtures, getTodayFixturesWithPredictions) so
+   * every fixture response carries its Polymarket context inline — no N+1
+   * round-trips for the caller.
+   *
+   * Fixtures with no linked Polymarket markets return no Map entry, which
+   * the callers surface as `polymarket: null`.
+   */
+  async getPolymarketInfoForFixtures(
+    fixtureIds: number[],
+  ): Promise<
+    Map<
+      number,
+      {
+        eventUrl: string | null;
+        marketCount: number;
+        markets: Array<{
+          conditionId: string | null;
+          marketId: string;
+          question: string;
+          marketType: string;
+          marketSlug: string | null;
+          eventSlug: string | null;
+          url: string | null;
+          outcomes: string[];
+          outcomePrices: string[] | null;
+          liquidity: string | null;
+          volume: string | null;
+          volume24hr: string | null;
+          lastSyncedAt: Date | null;
+          endDate: Date | null;
+        }>;
+      }
+    >
+  > {
+    const out = new Map<number, any>();
+    if (fixtureIds.length === 0) return out;
+
+    const rows = await this.db
+      .select({
+        fixtureId: schema.polymarketMarkets.fixtureId,
+        conditionId: schema.polymarketMarkets.conditionId,
+        marketId: schema.polymarketMarkets.marketId,
+        marketQuestion: schema.polymarketMarkets.marketQuestion,
+        marketType: schema.polymarketMarkets.marketType,
+        slug: schema.polymarketMarkets.slug,
+        eventSlug: schema.polymarketMarkets.eventSlug,
+        outcomes: schema.polymarketMarkets.outcomes,
+        outcomePrices: schema.polymarketMarkets.outcomePrices,
+        liquidity: schema.polymarketMarkets.liquidity,
+        volume: schema.polymarketMarkets.volume,
+        volume24hr: schema.polymarketMarkets.volume24hr,
+        lastSyncedAt: schema.polymarketMarkets.lastSyncedAt,
+        endDate: schema.polymarketMarkets.endDate,
+        closed: schema.polymarketMarkets.closed,
+      })
+      .from(schema.polymarketMarkets)
+      .where(
+        and(
+          inArray(schema.polymarketMarkets.fixtureId, fixtureIds),
+          eq(schema.polymarketMarkets.closed, false),
+        ),
+      );
+
+    for (const r of rows as any[]) {
+      if (!r.fixtureId) continue;
+      const marketUrl = r.slug
+        ? `https://polymarket.com/market/${r.slug}`
+        : null;
+      const eventUrl = r.eventSlug
+        ? `https://polymarket.com/event/${r.eventSlug}`
+        : null;
+      const market = {
+        conditionId: r.conditionId as string | null,
+        marketId: r.marketId as string,
+        question: r.marketQuestion as string,
+        marketType: r.marketType as string,
+        marketSlug: r.slug as string | null,
+        eventSlug: r.eventSlug as string | null,
+        url: marketUrl ?? eventUrl,
+        outcomes: (r.outcomes ?? []) as string[],
+        outcomePrices: (r.outcomePrices ?? null) as string[] | null,
+        liquidity: r.liquidity as string | null,
+        volume: r.volume as string | null,
+        volume24hr: r.volume24hr as string | null,
+        lastSyncedAt: r.lastSyncedAt as Date | null,
+        endDate: r.endDate as Date | null,
+      };
+      const existing = out.get(r.fixtureId);
+      if (existing) {
+        existing.markets.push(market);
+        existing.marketCount++;
+        // Prefer any non-null eventUrl once set
+        if (!existing.eventUrl && eventUrl) existing.eventUrl = eventUrl;
+      } else {
+        out.set(r.fixtureId, {
+          eventUrl,
+          marketCount: 1,
+          markets: [market],
+        });
+      }
+    }
+    return out;
   }
 
   /**
@@ -1206,61 +1365,72 @@ export class FootballService {
       if (f.awayTeamId) teamIds.add(f.awayTeamId);
     }
 
-    const [teamRows, allLineups, allInjuries] = await Promise.all([
-      teamIds.size > 0
-        ? this.db
-            .select({
-              id: schema.teams.id,
-              name: schema.teams.name,
-              logo: schema.teams.logo,
-            })
-            .from(schema.teams)
-            .where(
-              sql`${schema.teams.id} IN (${sql.join(
-                [...teamIds].map((id) => sql`${id}`),
-                sql`, `,
-              )})`,
-            )
-        : [],
-      this.db
-        .select({
-          id: schema.fixtureLineups.id,
-          fixtureId: schema.fixtureLineups.fixtureId,
-          teamId: schema.fixtureLineups.teamId,
-          teamName: schema.teams.name,
-          formation: schema.fixtureLineups.formation,
-          coachName: schema.fixtureLineups.coachName,
-          startXI: schema.fixtureLineups.startXI,
-          substitutes: schema.fixtureLineups.substitutes,
-        })
-        .from(schema.fixtureLineups)
-        .leftJoin(
-          schema.teams,
-          eq(schema.fixtureLineups.teamId, schema.teams.id),
-        )
-        .where(
-          sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
-            fixtureIds.map((id: number) => sql`${id}`),
-            sql`, `,
-          )})`,
-        ),
-      teamIds.size > 0
-        ? this.db
-            .select()
-            .from(schema.injuries)
-            .where(
-              sql`${schema.injuries.teamId} IN (${sql.join(
-                [...teamIds].map((id) => sql`${id}`),
-                sql`, `,
-              )})`,
-            )
-            .orderBy(desc(schema.injuries.updatedAt))
-        : [],
-    ]);
+    const [teamRows, allLineups, allInjuries, polymarketByFixture] =
+      await Promise.all([
+        teamIds.size > 0
+          ? this.db
+              .select({
+                id: schema.teams.id,
+                name: schema.teams.name,
+                shortName: schema.teams.shortName,
+                logo: schema.teams.logo,
+              })
+              .from(schema.teams)
+              .where(
+                sql`${schema.teams.id} IN (${sql.join(
+                  [...teamIds].map((id) => sql`${id}`),
+                  sql`, `,
+                )})`,
+              )
+          : [],
+        this.db
+          .select({
+            id: schema.fixtureLineups.id,
+            fixtureId: schema.fixtureLineups.fixtureId,
+            teamId: schema.fixtureLineups.teamId,
+            teamName: schema.teams.name,
+            formation: schema.fixtureLineups.formation,
+            coachName: schema.fixtureLineups.coachName,
+            startXI: schema.fixtureLineups.startXI,
+            substitutes: schema.fixtureLineups.substitutes,
+            teamColors: schema.fixtureLineups.teamColors,
+          })
+          .from(schema.fixtureLineups)
+          .leftJoin(
+            schema.teams,
+            eq(schema.fixtureLineups.teamId, schema.teams.id),
+          )
+          .where(
+            sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+              fixtureIds.map((id: number) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+        teamIds.size > 0
+          ? this.db
+              .select()
+              .from(schema.injuries)
+              .where(
+                sql`${schema.injuries.teamId} IN (${sql.join(
+                  [...teamIds].map((id) => sql`${id}`),
+                  sql`, `,
+                )})`,
+              )
+              .orderBy(desc(schema.injuries.updatedAt))
+          : [],
+        this.getPolymarketInfoForFixtures(fixtureIds),
+      ]);
 
-    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    const teamMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamRows) {
-      teamMap.set(t.id, { name: t.name, logo: t.logo });
+      teamMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     const lineupsByFixture = new Map<number, any[]>();
@@ -1284,12 +1454,22 @@ export class FootballService {
       const homeInjuries = injuriesByTeam.get(fixture.homeTeamId) ?? [];
       const awayInjuries = injuriesByTeam.get(fixture.awayTeamId) ?? [];
 
+      // Extract team colors from lineups if available
+      const homeLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.homeTeamId,
+      );
+      const awayLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.awayTeamId,
+      );
+
       return {
         ...fixture,
         homeTeam: {
           id: fixture.homeTeamId,
           name: homeTeam?.name ?? null,
+          shortName: homeTeam?.shortName ?? null,
           logo: homeTeam?.logo ?? null,
+          teamColors: homeLineup?.teamColors ?? null,
           injuries: homeInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1300,7 +1480,9 @@ export class FootballService {
         awayTeam: {
           id: fixture.awayTeamId,
           name: awayTeam?.name ?? null,
+          shortName: awayTeam?.shortName ?? null,
           logo: awayTeam?.logo ?? null,
+          teamColors: awayLineup?.teamColors ?? null,
           injuries: awayInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1319,6 +1501,7 @@ export class FootballService {
                 substitutes: l.substitutes,
               }))
             : null,
+        polymarket: polymarketByFixture.get(fixture.id) ?? null,
       };
     });
 
@@ -1350,6 +1533,21 @@ export class FootballService {
     to?: string;
     hasPrediction?: boolean;
     minConfidence?: number;
+    /**
+     * When true, skip all the expensive joins (team history, lineups,
+     * injuries, predictions, smart-money, polymarket). List views on
+     * the frontend only need fixture core + basic team info.
+     */
+    light?: boolean;
+    /**
+     * Opt-in additions to the light payload. Each flag adds one cheap
+     * query (no per-team fan-out). Values:
+     *   - "prediction" → latest pre-match / on-demand prediction row
+     *     (confidence, win-prob triple, edge, predicted goals) per fixture
+     *   - "market"     → polymarket market summary per fixture: volume,
+     *     liquidity, outcomePrices, marketType, conditionId
+     */
+    include?: Array<'prediction' | 'market'>;
   }): Promise<any[]> {
     const conditions: any[] = [];
 
@@ -1458,8 +1656,175 @@ export class FootballService {
       if (f.awayTeamId) teamIds.add(f.awayTeamId);
     }
 
-    // Batch fetch predictions, team names, lineups, and injuries for all fixtures
-    const [predictions, teamRows, allLineups, allInjuries] = await Promise.all([
+    // Fast path for list views — single team-lookup query, no
+    // predictions / lineups / injuries / smart-money / polymarket /
+    // game-history enrichment. Drops response time from ~30s → <1s at
+    // 14-day windows since getTeamRecentGameHistory alone fans out to
+    // 3 queries per team.
+    if (filters?.light) {
+      const includeSet = new Set(filters.include ?? []);
+      const includePred = includeSet.has('prediction');
+      const includeMarket = includeSet.has('market');
+
+      const teamRowsPromise =
+        teamIds.size > 0
+          ? this.db
+              .select({
+                id: schema.teams.id,
+                name: schema.teams.name,
+                shortName: schema.teams.shortName,
+                logo: schema.teams.logo,
+              })
+              .from(schema.teams)
+              .where(
+                sql`${schema.teams.id} IN (${sql.join(
+                  [...teamIds].map((id) => sql`${id}`),
+                  sql`, `,
+                )})`,
+              )
+          : Promise.resolve([] as Array<{
+              id: number;
+              name: string;
+              shortName: string | null;
+              logo: string | null;
+            }>);
+
+      const predictionsPromise = includePred
+        ? this.db
+            .select({
+              id: schema.predictions.id,
+              fixtureId: schema.predictions.fixtureId,
+              homeWinProb: schema.predictions.homeWinProb,
+              drawProb: schema.predictions.drawProb,
+              awayWinProb: schema.predictions.awayWinProb,
+              predictedResult: schema.predictions.predictedResult,
+              confidence: schema.predictions.confidence,
+              predictedHomeGoals: schema.predictions.predictedHomeGoals,
+              predictedAwayGoals: schema.predictions.predictedAwayGoals,
+              valueBets: schema.predictions.valueBets,
+              createdAt: schema.predictions.createdAt,
+            })
+            .from(schema.predictions)
+            .where(
+              sql`${schema.predictions.fixtureId} IN (${sql.join(
+                fixtureIds.map((id: number) => sql`${id}`),
+                sql`, `,
+              )})`,
+            )
+            .orderBy(desc(schema.predictions.createdAt))
+        : Promise.resolve([] as any[]);
+
+      const marketsPromise = includeMarket
+        ? this.getPolymarketInfoForFixtures(fixtureIds)
+        : Promise.resolve(
+            new Map<number, { eventUrl: string | null; marketCount: number; markets: any[] }>(),
+          );
+
+      const [teamRows, predictionRows, marketsByFixture] = await Promise.all([
+        teamRowsPromise,
+        predictionsPromise,
+        marketsPromise,
+      ]);
+
+      const teamMap = new Map<
+        number,
+        { name: string; shortName: string | null; logo: string | null }
+      >();
+      for (const t of teamRows) {
+        teamMap.set(t.id, {
+          name: t.name,
+          shortName: t.shortName,
+          logo: t.logo,
+        });
+      }
+
+      // Keep the newest prediction per fixture (query is ordered by
+      // createdAt desc so we take the first one we see).
+      const predictionByFixture = new Map<number, any>();
+      for (const p of predictionRows) {
+        if (!predictionByFixture.has(p.fixtureId)) {
+          predictionByFixture.set(p.fixtureId, p);
+        }
+      }
+
+      return fixtures.map((fixture: any) => {
+        const home = teamMap.get(fixture.homeTeamId);
+        const away = teamMap.get(fixture.awayTeamId);
+        const row: any = {
+          fixture: {
+            id: fixture.id,
+            date: fixture.date,
+            status: fixture.status,
+            statusLong: fixture.statusLong,
+            elapsed: fixture.elapsed,
+            round: fixture.round,
+            venueName: fixture.venueName,
+            venueCity: fixture.venueCity,
+            leagueId: fixture.leagueId,
+            leagueName: fixture.leagueName,
+            leagueCountry: fixture.leagueCountry,
+            season: fixture.season,
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+            goalsHome: fixture.goalsHome,
+            goalsAway: fixture.goalsAway,
+          },
+          homeTeam: {
+            id: fixture.homeTeamId,
+            name: home?.name ?? null,
+            shortName: home?.shortName ?? null,
+            logo: home?.logo ?? null,
+          },
+          awayTeam: {
+            id: fixture.awayTeamId,
+            name: away?.name ?? null,
+            shortName: away?.shortName ?? null,
+            logo: away?.logo ?? null,
+          },
+        };
+
+        if (includePred) {
+          const p = predictionByFixture.get(fixture.id);
+          row.prediction = p
+            ? {
+                id: p.id,
+                homeWinProb: p.homeWinProb,
+                drawProb: p.drawProb,
+                awayWinProb: p.awayWinProb,
+                predictedResult: p.predictedResult,
+                confidence: p.confidence,
+                predictedHomeGoals: p.predictedHomeGoals,
+                predictedAwayGoals: p.predictedAwayGoals,
+                valueBets: p.valueBets,
+              }
+            : null;
+        }
+
+        if (includeMarket) {
+          const m = marketsByFixture.get(fixture.id);
+          row.polymarket = m
+            ? {
+                eventUrl: m.eventUrl,
+                marketCount: m.marketCount,
+                markets: m.markets,
+              }
+            : null;
+        }
+
+        return row;
+      });
+    }
+
+    // Batch fetch predictions, team names, lineups, injuries, and Polymarket
+    // market links for all fixtures
+    const [
+      predictions,
+      smartMoneyRows,
+      teamRows,
+      allLineups,
+      allInjuries,
+      polymarketByFixture,
+    ] = await Promise.all([
       this.db
         .select()
         .from(schema.predictions)
@@ -1470,11 +1835,21 @@ export class FootballService {
           )})`,
         )
         .orderBy(desc(schema.predictions.createdAt)),
+      this.db
+        .select()
+        .from(schema.smartMoneyPredictions)
+        .where(
+          sql`${schema.smartMoneyPredictions.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
       teamIds.size > 0
         ? this.db
             .select({
               id: schema.teams.id,
               name: schema.teams.name,
+              shortName: schema.teams.shortName,
               logo: schema.teams.logo,
             })
             .from(schema.teams)
@@ -1526,11 +1901,19 @@ export class FootballService {
             )
             .orderBy(desc(schema.injuries.updatedAt))
         : [],
+      this.getPolymarketInfoForFixtures(fixtureIds),
     ]);
 
-    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    const teamMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamRows) {
-      teamMap.set(t.id, { name: t.name, logo: t.logo });
+      teamMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     // Group lineups by fixture ID
@@ -1557,6 +1940,19 @@ export class FootballService {
       predictionsByFixture.set(p.fixtureId, existing);
     }
 
+    // Build smart-money prediction lookup (1-per-fixture by unique index).
+    const smartMoneyByFixture = new Map<number, any>();
+    for (const r of smartMoneyRows) smartMoneyByFixture.set(r.fixtureId, r);
+
+    // Preload recent game history for all teams in the fixture set
+    const teamHistoryMap = new Map<number, any[]>();
+    await Promise.all(
+      [...teamIds].map(async (teamId) => {
+        const history = await this.getTeamRecentGameHistory(teamId, 5);
+        teamHistoryMap.set(teamId, history);
+      }),
+    );
+
     // Assemble response
     return fixtures.map((fixture: any) => {
       const homeTeam = teamMap.get(fixture.homeTeamId);
@@ -1566,12 +1962,19 @@ export class FootballService {
       const homeInjuries = injuriesByTeam.get(fixture.homeTeamId) ?? [];
       const awayInjuries = injuriesByTeam.get(fixture.awayTeamId) ?? [];
 
-      // Pick the best prediction: prefer pre_match, then daily, then on_demand
-      const bestPrediction =
-        fixturePredictions.find((p: any) => p.predictionType === 'pre_match') ??
-        fixturePredictions.find((p: any) => p.predictionType === 'daily') ??
-        fixturePredictions.find((p: any) => p.predictionType === 'on_demand') ??
-        null;
+      // Extract team colors from lineups if available
+      const homeLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.homeTeamId,
+      );
+      const awayLineup = fixtureLineups.find(
+        (l: any) => l.teamId === fixture.awayTeamId,
+      );
+
+      // Pick the best prediction: the most recent run wins, regardless of
+      // type. An `on_demand` rerun is an explicit user-triggered refresh
+      // (often with newer Polymarket / smart-money data), so it should
+      // supersede an older `pre_match` or `daily` prediction.
+      const bestPrediction = fixturePredictions[0] ?? null;
 
       return {
         fixture: {
@@ -1594,7 +1997,10 @@ export class FootballService {
         homeTeam: {
           id: fixture.homeTeamId,
           name: homeTeam?.name ?? null,
+          shortName: homeTeam?.shortName ?? null,
           logo: homeTeam?.logo ?? null,
+          teamColors: homeLineup?.teamColors ?? null,
+          recentGameHistory: teamHistoryMap.get(fixture.homeTeamId) ?? [],
           injuries: homeInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1605,7 +2011,10 @@ export class FootballService {
         awayTeam: {
           id: fixture.awayTeamId,
           name: awayTeam?.name ?? null,
+          shortName: awayTeam?.shortName ?? null,
           logo: awayTeam?.logo ?? null,
+          teamColors: awayLineup?.teamColors ?? null,
+          recentGameHistory: teamHistoryMap.get(fixture.awayTeamId) ?? [],
           injuries: awayInjuries.map((inj: any) => ({
             playerId: inj.playerId,
             playerName: inj.playerName,
@@ -1638,6 +2047,27 @@ export class FootballService {
               riskFactors: bestPrediction.riskFactors,
               valueBets: bestPrediction.valueBets,
               detailedAnalysis: bestPrediction.detailedAnalysis,
+              opponentStrengthProfile: this.formatOpponentStrengthProfile(
+                bestPrediction.matchContext?.opponentStrength,
+                {
+                  homeName: homeTeam?.name ?? null,
+                  awayName: awayTeam?.name ?? null,
+                },
+              ),
+              opponentStrengthProfileRaw:
+                bestPrediction.matchContext?.opponentStrength ?? null,
+              smartMoneySignal: this.formatSmartMoneySignal(
+                bestPrediction.smartMoneySignal,
+                {
+                  homeTeamId: fixture.homeTeamId,
+                  awayTeamId: fixture.awayTeamId,
+                  homeName: homeTeam?.name ?? null,
+                  awayName: awayTeam?.name ?? null,
+                  homeWinProb: bestPrediction.homeWinProb,
+                  drawProb: bestPrediction.drawProb,
+                  awayWinProb: bestPrediction.awayWinProb,
+                },
+              ),
               actualResult: bestPrediction.actualResult,
               wasCorrect: bestPrediction.wasCorrect,
               probabilityAccuracy: bestPrediction.probabilityAccuracy,
@@ -1648,12 +2078,19 @@ export class FootballService {
         allPredictions: fixturePredictions.map((p: any) => ({
           id: p.id,
           predictionType: p.predictionType,
-          homeWinProb: p.homeWinProb,
-          drawProb: p.drawProb,
-          awayWinProb: p.awayWinProb,
           confidence: p.confidence,
           createdAt: p.createdAt,
         })),
+        smartMoneyPrediction: this.formatSmartMoneyPrediction(
+          smartMoneyByFixture.get(fixture.id) ?? null,
+          {
+            homeTeamId: fixture.homeTeamId,
+            awayTeamId: fixture.awayTeamId,
+            homeName: homeTeam?.name ?? null,
+            awayName: awayTeam?.name ?? null,
+          },
+        ),
+        polymarket: polymarketByFixture.get(fixture.id) ?? null,
       };
     });
   }
@@ -1661,14 +2098,7 @@ export class FootballService {
   /**
    * Get a single fixture by its API-Football ID with all related data.
    */
-  async getFixtureById(id: number): Promise<{
-    fixture: any;
-    statistics: any[];
-    events: any[];
-    injuries: any[];
-    lineups: any[];
-    prediction: any;
-  } | null> {
+  async getFixtureById(id: number): Promise<FixtureByIdResult | null> {
     const fixtureRows = await this.db
       .select()
       .from(schema.fixtures)
@@ -1724,17 +2154,32 @@ export class FootballService {
     // Fetch predictions, team names, lineups, and injuries in parallel
     const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(Boolean);
 
-    const [predictions, teamRows, lineups, injuries] = await Promise.all([
+    const [
+      predictions,
+      smartMoneyRow,
+      teamRows,
+      lineups,
+      injuries,
+      homeRecentHistory,
+      awayRecentHistory,
+    ] = await Promise.all([
       this.db
         .select()
         .from(schema.predictions)
         .where(eq(schema.predictions.fixtureId, fixtureId))
         .orderBy(desc(schema.predictions.createdAt)),
+      this.db
+        .select()
+        .from(schema.smartMoneyPredictions)
+        .where(eq(schema.smartMoneyPredictions.fixtureId, fixtureId))
+        .limit(1)
+        .then((rows: any[]) => rows[0] ?? null),
       teamIds.length > 0
         ? this.db
             .select({
               id: schema.teams.id,
               name: schema.teams.name,
+              shortName: schema.teams.shortName,
               logo: schema.teams.logo,
             })
             .from(schema.teams)
@@ -1758,15 +2203,32 @@ export class FootballService {
             )
             .orderBy(desc(schema.injuries.updatedAt))
         : [],
+      this.getTeamRecentGameHistory(fixture.homeTeamId, 5),
+      this.getTeamRecentGameHistory(fixture.awayTeamId, 5),
     ]);
 
-    const teamMap = new Map<number, { name: string; logo: string | null }>();
+    const teamMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamRows) {
-      teamMap.set(t.id, { name: t.name, logo: t.logo });
+      teamMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     const homeTeam = teamMap.get(fixture.homeTeamId);
     const awayTeam = teamMap.get(fixture.awayTeamId);
+
+    // Extract team colors from lineups if available
+    const homeLineup = lineups.find(
+      (l: any) => l.teamId === fixture.homeTeamId,
+    );
+    const awayLineup = lineups.find(
+      (l: any) => l.teamId === fixture.awayTeamId,
+    );
 
     // Split injuries by team
     const homeInjuries = injuries.filter(
@@ -1776,12 +2238,10 @@ export class FootballService {
       (inj: any) => inj.teamId === fixture.awayTeamId,
     );
 
-    // Best prediction: pre_match > daily > on_demand
-    const bestPrediction =
-      predictions.find((p: any) => p.predictionType === 'pre_match') ??
-      predictions.find((p: any) => p.predictionType === 'daily') ??
-      predictions.find((p: any) => p.predictionType === 'on_demand') ??
-      null;
+    // Best prediction: the most recent run wins (predictions already come
+    // back ordered by createdAt DESC). An `on_demand` rerun is explicitly
+    // triggered with fresher data, so it supersedes older runs.
+    const bestPrediction = predictions[0] ?? null;
 
     return {
       fixture: {
@@ -1808,7 +2268,10 @@ export class FootballService {
       homeTeam: {
         id: fixture.homeTeamId,
         name: homeTeam?.name ?? null,
+        shortName: homeTeam?.shortName ?? null,
         logo: homeTeam?.logo ?? null,
+        teamColors: homeLineup?.teamColors ?? null,
+        recentGameHistory: homeRecentHistory,
         injuries: homeInjuries.map((inj: any) => ({
           playerId: inj.playerId,
           playerName: inj.playerName,
@@ -1819,7 +2282,10 @@ export class FootballService {
       awayTeam: {
         id: fixture.awayTeamId,
         name: awayTeam?.name ?? null,
+        shortName: awayTeam?.shortName ?? null,
         logo: awayTeam?.logo ?? null,
+        teamColors: awayLineup?.teamColors ?? null,
+        recentGameHistory: awayRecentHistory,
         injuries: awayInjuries.map((inj: any) => ({
           playerId: inj.playerId,
           playerName: inj.playerName,
@@ -1853,6 +2319,27 @@ export class FootballService {
             valueBets: bestPrediction.valueBets,
             detailedAnalysis: bestPrediction.detailedAnalysis,
             matchContext: bestPrediction.matchContext,
+            opponentStrengthProfile: this.formatOpponentStrengthProfile(
+              bestPrediction.matchContext?.opponentStrength,
+              {
+                homeName: homeTeam?.name ?? null,
+                awayName: awayTeam?.name ?? null,
+              },
+            ),
+            opponentStrengthProfileRaw:
+              bestPrediction.matchContext?.opponentStrength ?? null,
+            smartMoneySignal: this.formatSmartMoneySignal(
+              bestPrediction.smartMoneySignal,
+              {
+                homeTeamId: fixture.homeTeamId,
+                awayTeamId: fixture.awayTeamId,
+                homeName: homeTeam?.name ?? null,
+                awayName: awayTeam?.name ?? null,
+                homeWinProb: bestPrediction.homeWinProb,
+                drawProb: bestPrediction.drawProb,
+                awayWinProb: bestPrediction.awayWinProb,
+              },
+            ),
             researchContext: bestPrediction.researchContext,
             modelVersion: bestPrediction.modelVersion,
             actualResult: bestPrediction.actualResult,
@@ -1866,18 +2353,15 @@ export class FootballService {
       allPredictions: predictions.map((p: any) => ({
         id: p.id,
         predictionType: p.predictionType,
-        homeWinProb: p.homeWinProb,
-        drawProb: p.drawProb,
-        awayWinProb: p.awayWinProb,
-        predictedHomeGoals: p.predictedHomeGoals,
-        predictedAwayGoals: p.predictedAwayGoals,
         confidence: p.confidence,
-        keyFactors: p.keyFactors,
-        actualResult: p.actualResult,
-        wasCorrect: p.wasCorrect,
-        resolvedAt: p.resolvedAt,
         createdAt: p.createdAt,
       })),
+      smartMoneyPrediction: this.formatSmartMoneyPrediction(smartMoneyRow, {
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        homeName: homeTeam?.name ?? null,
+        awayName: awayTeam?.name ?? null,
+      }),
     };
   }
 
@@ -2013,6 +2497,7 @@ export class FootballService {
       .select({
         id: schema.teams.id,
         name: schema.teams.name,
+        shortName: schema.teams.shortName,
         logo: schema.teams.logo,
       })
       .from(schema.teams)
@@ -2023,9 +2508,16 @@ export class FootballService {
         )})`,
       );
 
-    const nameMap = new Map<number, { name: string; logo: string | null }>();
+    const nameMap = new Map<
+      number,
+      { name: string; shortName: string | null; logo: string | null }
+    >();
     for (const t of teamNames) {
-      nameMap.set(t.id, { name: t.name, logo: t.logo });
+      nameMap.set(t.id, {
+        name: t.name,
+        shortName: t.shortName,
+        logo: t.logo,
+      });
     }
 
     // Assemble match history
@@ -2355,6 +2847,459 @@ export class FootballService {
     }
 
     return [europeanSeason];
+  }
+
+  /**
+   * Returns a club's recent completed matches with compact outcome + stat context.
+   * Used in fixture responses to provide quick history reasoning context.
+   */
+  private async getTeamRecentGameHistory(
+    teamId: number,
+    limit = 5,
+  ): Promise<any[]> {
+    const completed = ['FT', 'AET', 'PEN'];
+
+    const fixtures = await this.db
+      .select()
+      .from(schema.fixtures)
+      .where(
+        and(
+          inArray(schema.fixtures.status, completed),
+          sql`(${schema.fixtures.homeTeamId} = ${teamId} OR ${schema.fixtures.awayTeamId} = ${teamId})`,
+        ),
+      )
+      .orderBy(desc(schema.fixtures.date))
+      .limit(limit);
+
+    if (fixtures.length === 0) return [];
+
+    const fixtureIds = fixtures.map((f: any) => f.id);
+
+    const teamsInFixtures = new Set<number>();
+    for (const f of fixtures) {
+      teamsInFixtures.add(f.homeTeamId);
+      teamsInFixtures.add(f.awayTeamId);
+    }
+
+    const [teamRows, statsRows, lineupRows] = await Promise.all([
+      this.db
+        .select({ id: schema.teams.id, name: schema.teams.name })
+        .from(schema.teams)
+        .where(
+          sql`${schema.teams.id} IN (${sql.join(
+            [...teamsInFixtures].map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      this.db
+        .select()
+        .from(schema.fixtureStatistics)
+        .where(
+          sql`${schema.fixtureStatistics.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+      this.db
+        .select({
+          fixtureId: schema.fixtureLineups.fixtureId,
+          teamId: schema.fixtureLineups.teamId,
+          formation: schema.fixtureLineups.formation,
+        })
+        .from(schema.fixtureLineups)
+        .where(
+          sql`${schema.fixtureLineups.fixtureId} IN (${sql.join(
+            fixtureIds.map((id: number) => sql`${id}`),
+            sql`, `,
+          )})`,
+        ),
+    ]);
+
+    const teamNameById = new Map<number, string>();
+    for (const t of teamRows) teamNameById.set(t.id, t.name);
+
+    const statsByFixtureTeam = new Map<string, any>();
+    for (const s of statsRows) {
+      statsByFixtureTeam.set(`${s.fixtureId}:${s.teamId}`, s);
+    }
+
+    const lineupByFixtureTeam = new Map<string, string | null>();
+    for (const l of lineupRows) {
+      lineupByFixtureTeam.set(
+        `${l.fixtureId}:${l.teamId}`,
+        l.formation ?? null,
+      );
+    }
+
+    return fixtures.map((f: any) => {
+      const isHome = f.homeTeamId === teamId;
+      const opponentTeamId = isHome ? f.awayTeamId : f.homeTeamId;
+      const goalsFor = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+      const goalsAgainst = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+
+      let result: 'win' | 'draw' | 'loss' = 'draw';
+      let winnerTeamId: number | null = null;
+      if (goalsFor > goalsAgainst) {
+        result = 'win';
+        winnerTeamId = teamId;
+      } else if (goalsFor < goalsAgainst) {
+        result = 'loss';
+        winnerTeamId = opponentTeamId;
+      }
+
+      const teamStats = statsByFixtureTeam.get(`${f.id}:${teamId}`);
+      const oppStats = statsByFixtureTeam.get(`${f.id}:${opponentTeamId}`);
+
+      return {
+        fixtureId: f.id,
+        date: f.date,
+        leagueId: f.leagueId,
+        leagueName: f.leagueName,
+        round: f.round,
+        venue: isHome ? 'home' : 'away',
+        opponent: {
+          teamId: opponentTeamId,
+          name: teamNameById.get(opponentTeamId) ?? null,
+        },
+        score: {
+          goalsFor,
+          goalsAgainst,
+          homeGoals: f.goalsHome,
+          awayGoals: f.goalsAway,
+        },
+        result,
+        winnerTeamId,
+        formation: lineupByFixtureTeam.get(`${f.id}:${teamId}`) ?? null,
+        opponentFormation:
+          lineupByFixtureTeam.get(`${f.id}:${opponentTeamId}`) ?? null,
+        stats: {
+          shotsOnTarget: teamStats?.shotsOnGoal ?? null,
+          totalShots: teamStats?.totalShots ?? null,
+          possession:
+            teamStats?.possession != null ? Number(teamStats.possession) : null,
+          expectedGoals:
+            teamStats?.expectedGoals != null
+              ? Number(teamStats.expectedGoals)
+              : null,
+        },
+        opponentStats: {
+          shotsOnTarget: oppStats?.shotsOnGoal ?? null,
+          totalShots: oppStats?.totalShots ?? null,
+          possession:
+            oppStats?.possession != null ? Number(oppStats.possession) : null,
+          expectedGoals:
+            oppStats?.expectedGoals != null
+              ? Number(oppStats.expectedGoals)
+              : null,
+        },
+      };
+    });
+  }
+
+  /**
+   * Transform a stored smart_money_predictions row into the fixture
+   * response shape. Carries the prediction values, lifecycle status,
+   * and a cleaned smart-money signal view. Returns null when no
+   * smart-money prediction exists for the fixture.
+   */
+  private formatSmartMoneyPrediction(
+    row: any,
+    ctx: {
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+    },
+  ): any {
+    if (!row) return null;
+    const homeWinProb = Number(row.homeWinProb ?? 0);
+    const drawProb = Number(row.drawProb ?? 0);
+    const awayWinProb = Number(row.awayWinProb ?? 0);
+    return {
+      id: row.id,
+      homeWinProb,
+      drawProb,
+      awayWinProb,
+      predictedResult: row.predictedResult,
+      confidence: row.confidence,
+      source: row.source,
+      thresholdMode: row.thresholdMode,
+      modelVersion: row.modelVersion,
+      predictionStatus: row.predictionStatus,
+      actualResult: row.actualResult,
+      wasCorrect: row.wasCorrect,
+      probabilityAccuracy:
+        row.probabilityAccuracy != null
+          ? Number(row.probabilityAccuracy)
+          : null,
+      resolvedAt: row.resolvedAt,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      smartMoneySignal: this.formatSmartMoneySignal(row.smartMoneySignal, {
+        homeTeamId: ctx.homeTeamId,
+        awayTeamId: ctx.awayTeamId,
+        homeName: ctx.homeName,
+        awayName: ctx.awayName,
+        homeWinProb,
+        drawProb,
+        awayWinProb,
+      }),
+      marketSignal: row.marketSignal ?? null,
+    };
+  }
+
+  /**
+   * Transform the stored SmartMoneySignal DB row into a clean public shape.
+   *
+   * The raw signal uses numeric fields (leanScore, outcome0/1Name,
+   * marketTeamId) that are hard to read from the client. This view maps
+   * them into: which team sharps back, how strongly, and what effect the
+   * signal had on the prediction's confidence.
+   */
+  private formatSmartMoneySignal(
+    raw: any,
+    ctx: {
+      homeTeamId: number;
+      awayTeamId: number;
+      homeName: string | null;
+      awayName: string | null;
+      homeWinProb?: number | string | null;
+      drawProb?: number | string | null;
+      awayWinProb?: number | string | null;
+    },
+  ): any {
+    if (!raw || raw.leanScore == null) return null;
+
+    const leanScore = Number(raw.leanScore);
+    const absLean = Math.abs(leanScore);
+    const source: 'direct' | 'backdrop' =
+      raw.signalKind === 'backdrop' ? 'backdrop' : 'direct';
+    const sharpsLeanYes = leanScore > 0;
+
+    let leaningTeam: string | null = null;
+    let leaningSide: 'home' | 'away' | null = null;
+    if (raw.marketTeamId != null) {
+      const marketIsHome = raw.marketTeamId === ctx.homeTeamId;
+      const leaningIsHome = sharpsLeanYes ? marketIsHome : !marketIsHome;
+      leaningSide = leaningIsHome ? 'home' : 'away';
+      leaningTeam = leaningIsHome ? ctx.homeName : ctx.awayName;
+    } else {
+      const outcomeName = sharpsLeanYes ? raw.outcome0Name : raw.outcome1Name;
+      leaningTeam = outcomeName ?? null;
+    }
+
+    const strength: 'strong' | 'moderate' | 'weak' =
+      absLean >= 0.5 ? 'strong' : absLean >= 0.3 ? 'moderate' : 'weak';
+
+    const dollarsOutcome0 = Number(raw.sharpDollarsOutcome0 ?? 0);
+    const dollarsOutcome1 = Number(raw.sharpDollarsOutcome1 ?? 0);
+    const dollarsFor = sharpsLeanYes ? dollarsOutcome0 : dollarsOutcome1;
+    const dollarsAgainst = sharpsLeanYes ? dollarsOutcome1 : dollarsOutcome0;
+
+    const hProb = Number(ctx.homeWinProb ?? 0);
+    const dProb = Number(ctx.drawProb ?? 0);
+    const aProb = Number(ctx.awayWinProb ?? 0);
+    let ensemblePick: 'home' | 'draw' | 'away' | null = null;
+    if (hProb || dProb || aProb) {
+      ensemblePick =
+        hProb >= dProb && hProb >= aProb
+          ? 'home'
+          : aProb >= dProb
+            ? 'away'
+            : 'draw';
+    }
+
+    const sharpCount = Number(raw.sharpCount ?? 0);
+    const signalConfidence = Number(raw.signalConfidence ?? 0);
+    const gatesPass =
+      sharpCount >= 3 && signalConfidence >= 0.2 && absLean >= 0.3;
+
+    let modelAgreement: 'agree' | 'disagree' | 'no-read' = 'no-read';
+    let confidenceDelta: -1 | 0 | 1 = 0;
+    if (gatesPass && ensemblePick && leaningSide) {
+      if (ensemblePick === leaningSide) {
+        modelAgreement = 'agree';
+        confidenceDelta = 1;
+      } else {
+        modelAgreement = 'disagree';
+        confidenceDelta = source === 'direct' ? -1 : 0;
+      }
+    }
+
+    // Per-sharp bet translation. For a direct moneyline ("Will TEAM win?"):
+    //   outcomeIndex 0 (YES) → backs the market team
+    //   outcomeIndex 1 (NO)  → backs the other team or a draw
+    const marketIsHome = raw.marketTeamId === ctx.homeTeamId;
+    const marketTeamName = marketIsHome ? ctx.homeName : ctx.awayName;
+    const otherTeamName = marketIsHome ? ctx.awayName : ctx.homeName;
+    const yesBacksLabel = marketTeamName;
+    const noBacksLabel =
+      otherTeamName != null ? `${otherTeamName} or Draw` : 'No';
+
+    const topSharps = Array.isArray(raw.topSharps)
+      ? raw.topSharps.map((s: any) => {
+          const betYes = s.outcomeIndex === 0;
+          return {
+            wallet: s.proxyWallet ?? null,
+            name: s.name ?? null,
+            lifetimePnl: Number(s.lifetimePnl ?? 0),
+            lifetimeRoi: Number(s.lifetimeRoi ?? 0),
+            last10Wins: s.last10Wins ?? null,
+            last20Wins: s.last20Wins ?? null,
+            currentWinStreak: Number(s.currentWinStreak ?? 0),
+            bet: {
+              outcome: betYes
+                ? raw.outcome0Name ?? 'Yes'
+                : raw.outcome1Name ?? 'No',
+              backs: betYes ? yesBacksLabel : noBacksLabel,
+              amount: Math.round(Number(s.amount ?? 0)),
+              alignsWithSharps: sharpsLeanYes === betYes,
+            },
+          };
+        })
+      : [];
+
+    return {
+      source,
+      sharps: {
+        leaningTeam,
+        count: sharpCount,
+        strength,
+        dollarsFor: Math.round(dollarsFor),
+        dollarsAgainst: Math.round(dollarsAgainst),
+      },
+      modelAgreement,
+      confidenceDelta,
+      topSharps,
+    };
+  }
+
+  private formatOpponentStrengthProfile(
+    raw: any,
+    teamNames?: { homeName?: string | null; awayName?: string | null },
+  ): any {
+    if (!raw) return null;
+
+    const formatWindow = (window: any) => {
+      const sampleSize = Number(window?.sampleSize ?? 0);
+      const avgPos =
+        window?.avgOpponentLeaguePosition != null
+          ? Number(window.avgOpponentLeaguePosition)
+          : null;
+      const top6Share =
+        window?.top6OpponentShare != null
+          ? Number(window.top6OpponentShare)
+          : null;
+      const top10Share =
+        window?.top10OpponentShare != null
+          ? Number(window.top10OpponentShare)
+          : null;
+
+      let dataQuality: 'very_low' | 'low' | 'medium' | 'high' = 'very_low';
+      if (sampleSize >= 8) dataQuality = 'high';
+      else if (sampleSize >= 5) dataQuality = 'medium';
+      else if (sampleSize >= 3) dataQuality = 'low';
+
+      let difficulty:
+        | 'strong'
+        | 'above_average'
+        | 'average'
+        | 'weak'
+        | 'unknown' = 'unknown';
+      if (avgPos != null) {
+        if (avgPos <= 6) difficulty = 'strong';
+        else if (avgPos <= 10) difficulty = 'above_average';
+        else if (avgPos <= 14) difficulty = 'average';
+        else difficulty = 'weak';
+      }
+
+      return {
+        sampleSize,
+        dataQuality,
+        avgOpponentLeaguePosition: avgPos,
+        avgOpponentPoints:
+          window?.avgOpponentPoints != null
+            ? Number(window.avgOpponentPoints)
+            : null,
+        avgOpponentGoalsForAvg:
+          window?.avgOpponentGoalsForAvg != null
+            ? Number(window.avgOpponentGoalsForAvg)
+            : null,
+        avgOpponentGoalsAgainstAvg:
+          window?.avgOpponentGoalsAgainstAvg != null
+            ? Number(window.avgOpponentGoalsAgainstAvg)
+            : null,
+        top6OpponentShare: top6Share,
+        top10OpponentShare: top10Share,
+        top6OpponentPct:
+          top6Share != null ? Number((top6Share * 100).toFixed(0)) : null,
+        top10OpponentPct:
+          top10Share != null ? Number((top10Share * 100).toFixed(0)) : null,
+        scheduleDifficulty: difficulty,
+      };
+    };
+
+    const homeCurrent = raw.home?.currentOpponent;
+    const awayCurrent = raw.away?.currentOpponent;
+
+    return {
+      home: {
+        currentOpponent: homeCurrent
+          ? {
+              teamId: homeCurrent.teamId,
+              teamName: teamNames?.awayName ?? null,
+              leaguePosition:
+                homeCurrent.leaguePosition != null
+                  ? Number(homeCurrent.leaguePosition)
+                  : null,
+              points:
+                homeCurrent.points != null ? Number(homeCurrent.points) : null,
+              goalsForAvg:
+                homeCurrent.goalsForAvg != null
+                  ? Number(homeCurrent.goalsForAvg)
+                  : null,
+              goalsAgainstAvg:
+                homeCurrent.goalsAgainstAvg != null
+                  ? Number(homeCurrent.goalsAgainstAvg)
+                  : null,
+              attackRating: homeCurrent.attackRating ?? null,
+              defenseRating: homeCurrent.defenseRating ?? null,
+            }
+          : null,
+        opponentsFaced: {
+          last5: formatWindow(raw.home?.last5),
+          last10: formatWindow(raw.home?.last10),
+        },
+      },
+      away: {
+        currentOpponent: awayCurrent
+          ? {
+              teamId: awayCurrent.teamId,
+              teamName: teamNames?.homeName ?? null,
+              leaguePosition:
+                awayCurrent.leaguePosition != null
+                  ? Number(awayCurrent.leaguePosition)
+                  : null,
+              points:
+                awayCurrent.points != null ? Number(awayCurrent.points) : null,
+              goalsForAvg:
+                awayCurrent.goalsForAvg != null
+                  ? Number(awayCurrent.goalsForAvg)
+                  : null,
+              goalsAgainstAvg:
+                awayCurrent.goalsAgainstAvg != null
+                  ? Number(awayCurrent.goalsAgainstAvg)
+                  : null,
+              attackRating: awayCurrent.attackRating ?? null,
+              defenseRating: awayCurrent.defenseRating ?? null,
+            }
+          : null,
+        opponentsFaced: {
+          last5: formatWindow(raw.away?.last5),
+          last10: formatWindow(raw.away?.last10),
+        },
+      },
+    };
   }
 
   private parseStatInt(value: any): number | null {

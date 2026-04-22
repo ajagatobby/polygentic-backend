@@ -96,7 +96,7 @@ export class FootballController {
   @ApiResponse({
     status: 200,
     description:
-      "Today's fixtures with best prediction (pre_match > daily > on_demand) and all available predictions",
+      "Today's fixtures with the most recent prediction per fixture and all available predictions",
   })
   async getTodayFixtures(
     @Query('leagueId') leagueId?: string,
@@ -188,6 +188,8 @@ export class FootballController {
     @Query('round') round?: string,
     @Query('hasPrediction') hasPrediction?: string,
     @Query('minConfidence') minConfidence?: string,
+    @Query('light') light?: string,
+    @Query('include') include?: string,
   ) {
     try {
       // Default: from today, to 7 days out
@@ -201,6 +203,12 @@ export class FootballController {
               .toISOString()
               .split('T')[0]);
 
+      const includeArr = (include ?? '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter((s): s is 'prediction' | 'market' =>
+          s === 'prediction' || s === 'market',
+        );
       let data = await this.footballService.getTodayFixturesWithPredictions({
         from: defaultFrom,
         to: defaultTo,
@@ -212,6 +220,8 @@ export class FootballController {
         teamId: teamId ? Number(teamId) : undefined,
         club,
         round,
+        light: light === '1' || light === 'true',
+        include: includeArr.length > 0 ? includeArr : undefined,
       });
 
       if (hasPrediction === 'true') {

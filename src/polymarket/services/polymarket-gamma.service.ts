@@ -330,14 +330,25 @@ export class PolymarketGammaService {
 
   /**
    * Fetch all active events for a specific tag_slug, paginating through results.
+   *
+   * The generic `soccer` tag is the only tag that returns match-level
+   * moneyline events for smaller leagues (e.g. Romania Liga I, Peru, Egypt) —
+   * those leagues' league-specific tags only return season-long outrights,
+   * not per-match fixtures. Since the universal soccer feed carries 3000+
+   * active events globally, we use a larger page size + higher page cap for
+   * it to guarantee full coverage. League-specific tags rarely exceed 50
+   * events so they still finish in 1-2 pages.
    */
   private async fetchEventsForTag(
     tag: PolymarketLeagueTag,
   ): Promise<ParsedPolymarketEvent[]> {
     const events: ParsedPolymarketEvent[] = [];
     let offset = 0;
-    const limit = 100;
-    const maxPages = 10; // Safety cap: 1000 events per tag
+    // Soccer super-tag: use big pages + high cap. League-specific tags:
+    // keep page size small to minimise wasted bytes on single-digit results.
+    const isUniversalSoccerTag = tag.tagSlug === 'soccer';
+    const limit = isUniversalSoccerTag ? 500 : 100;
+    const maxPages = isUniversalSoccerTag ? 20 : 10;
     let page = 0;
 
     while (page < maxPages) {
@@ -375,6 +386,173 @@ export class PolymarketGammaService {
     }
 
     return events;
+  }
+
+  /**
+   * Fetch a bounded set of active soccer events ordered by most-recent
+   * startDate first, for use in on-demand linking.
+   *
+   * Unlike `fetchSoccerEvents`, which paginates the full 3000+ event space
+   * and is intended for the scheduled bulk scan, this method takes a hard
+   * cap on total events and a short page size — it's the fast path used
+   * when a single prediction runs and we want to try to match its fixture
+   * to a Polymarket market right now rather than wait for the next scan.
+   *
+   * Ordering by `startDate` DESC puts the most recently-created events
+   * first — this matches fixtures in the near-future window (next 2-3
+   * weeks) where predictions are active.
+   */
+  async fetchRecentSoccerEvents(
+    opts: { maxEvents?: number } = {},
+  ): Promise<ParsedPolymarketEvent[]> {
+    const max = opts.maxEvents ?? 1000;
+    const events: ParsedPolymarketEvent[] = [];
+    const seen = new Set<string>();
+    let offset = 0;
+    const pageSize = 500;
+
+    while (events.length < max) {
+      const response = await this.client.get('/events', {
+        params: {
+          tag_slug: 'soccer',
+          active: 'true',
+          closed: 'false',
+          order: 'startDate',
+          ascending: 'false',
+          limit: pageSize,
+          offset,
+        },
+      });
+      const raw = Array.isArray(response.data) ? response.data : [];
+      if (raw.length === 0) break;
+      for (const e of raw) {
+        if (!e.markets?.length) continue;
+        const parsed = this.parseEvent(e, 'soccer');
+        if (!parsed.markets.length) continue;
+        if (seen.has(parsed.eventId)) continue;
+        seen.add(parsed.eventId);
+        events.push(parsed);
+        if (events.length >= max) break;
+      }
+      offset += pageSize;
+      if (raw.length < pageSize) break;
+      // Rate-limit between pages
+      await this.delay(100);
+    }
+    return events;
+  }
+
+  /**
+   * Tier-2 fixture lookup — scope `/events` to a single league tag +
+   * narrow kickoff-time window. Uses the `end_date_min` / `end_date_max`
+   * params (undocumented in Gamma docs but live as of 2026-04) which
+   * filter on the event's kickoff time (not publish time).
+   *
+   * Typical response size: 1–10 events for a league's single-day slate.
+   * Replaces the ~20-page soccer-super-tag scan for on-demand lookups.
+   *
+   * @param tagSlug       Polymarket league tag (e.g. "primeira-liga")
+   * @param kickoff       Fixture kickoff date/time
+   * @param windowHours   ± window around kickoff (default 6h — catches
+   *                      timezone drift and late-published markets)
+   */
+  async fetchEventsByLeagueAndDate(
+    tagSlug: string,
+    kickoff: Date,
+    windowHours: number = 6,
+  ): Promise<ParsedPolymarketEvent[]> {
+    const windowMs = windowHours * 60 * 60 * 1000;
+    const endMin = new Date(kickoff.getTime() - windowMs).toISOString();
+    const endMax = new Date(kickoff.getTime() + windowMs).toISOString();
+
+    try {
+      const response = await this.client.get('/events', {
+        params: {
+          tag_slug: tagSlug,
+          end_date_min: endMin,
+          end_date_max: endMax,
+          closed: 'false',
+          limit: 50,
+        },
+      });
+      const raw: GammaEvent[] = Array.isArray(response.data)
+        ? response.data
+        : [];
+      return raw
+        .filter((e) => e.markets && e.markets.length > 0)
+        .map((e) => this.parseEvent(e, tagSlug))
+        .filter((e) => e.markets.length > 0);
+    } catch (err) {
+      this.logger.warn(
+        `fetchEventsByLeagueAndDate(${tagSlug}, ${kickoff.toISOString()}) failed: ${
+          (err as Error).message
+        }`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Look up the Polymarket tag_slug for a given API-Football league ID.
+   * Returns null when no mapping exists — caller should fall back to the
+   * generic soccer-tag scan.
+   */
+  static tagSlugForLeagueId(leagueId: number): string | null {
+    const match = POLYMARKET_SOCCER_TAGS.find(
+      (t) => t.apiFootballLeagueId === leagueId,
+    );
+    return match?.tagSlug ?? null;
+  }
+
+  /**
+   * Tier-3 fallback: keyword search across all Polymarket events using
+   * the undocumented `/public-search` endpoint. Accepts team names as `q`
+   * and returns a scored, sorted list — first result is usually the
+   * exact fixture match.
+   *
+   * Use this when Tier 2 (league-scoped window) misses — typically
+   * because the fixture's league isn't in our tag map or the event was
+   * tagged only with the generic `soccer` tag.
+   *
+   * Note: `/public-search` returns a wrapped object `{ events, pagination }`
+   * rather than a raw array. We extract `events` and parse them through
+   * the standard pipeline.
+   */
+  async searchEvents(
+    query: string,
+    opts: {
+      tagSlugs?: string[];
+      includeClosedMarkets?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<ParsedPolymarketEvent[]> {
+    const params: Record<string, any> = {
+      q: query,
+      events_status: 'active',
+      limit_per_type: Math.min(20, opts.limit ?? 10),
+    };
+    if (opts.tagSlugs && opts.tagSlugs.length > 0) {
+      params.events_tag = opts.tagSlugs;
+    }
+    if (opts.includeClosedMarkets) {
+      params.keep_closed_markets = 1;
+    }
+
+    try {
+      const response = await this.client.get('/public-search', { params });
+      const raw: GammaEvent[] = Array.isArray(response.data?.events)
+        ? response.data.events
+        : [];
+      return raw
+        .filter((e) => e.markets && e.markets.length > 0)
+        .map((e) => this.parseEvent(e))
+        .filter((e) => e.markets.length > 0);
+    } catch (err) {
+      this.logger.warn(
+        `searchEvents("${query}") failed: ${(err as Error).message}`,
+      );
+      return [];
+    }
   }
 
   /**
@@ -441,6 +619,106 @@ export class PolymarketGammaService {
       );
       return null;
     }
+  }
+
+  /**
+   * Batch-fetch market price / volume / liquidity for a list of condition IDs.
+   *
+   * Used by the 5-minute Trigger.dev snapshot task to refresh every tracked
+   * market in one request (Gamma supports `condition_ids=` as a repeated
+   * query parameter — pass the list and it returns the matching markets).
+   *
+   * We chunk the request at 80 ids per call to keep the URL length below
+   * the Gamma proxy's ~8 KB cap; each id is ~66 chars so 80 stays safe.
+   */
+  async fetchMarketsByConditionIds(
+    conditionIds: string[],
+  ): Promise<
+    Array<{
+      conditionId: string;
+      marketId: string;
+      outcomePrices: string[];
+      volume: number | null;
+      volume24hr: number | null;
+      liquidity: number | null;
+      active: boolean;
+      closed: boolean;
+      acceptingOrders: boolean;
+    }>
+  > {
+    const unique = Array.from(
+      new Set(conditionIds.filter((id) => !!id && id.length > 0)),
+    );
+    if (unique.length === 0) return [];
+
+    const CHUNK = 80;
+    const out: Array<{
+      conditionId: string;
+      marketId: string;
+      outcomePrices: string[];
+      volume: number | null;
+      volume24hr: number | null;
+      liquidity: number | null;
+      active: boolean;
+      closed: boolean;
+      acceptingOrders: boolean;
+    }> = []
+
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      try {
+        const response = await this.client.get('/markets', {
+          params: {
+            condition_ids: slice,
+            limit: slice.length,
+          },
+          // Axios encodes repeated params as `?condition_ids=a&condition_ids=b`
+          paramsSerializer: {
+            indexes: null,
+          },
+        });
+        const rows: GammaMarket[] = Array.isArray(response.data)
+          ? response.data
+          : (response.data?.data ?? []);
+        for (const raw of rows) {
+          let prices: string[] = [];
+          try {
+            prices =
+              typeof raw.outcomePrices === 'string'
+                ? (JSON.parse(raw.outcomePrices || '[]') as string[])
+                : (raw.outcomePrices as unknown as string[]) ?? [];
+          } catch {
+            prices = [];
+          }
+          out.push({
+            conditionId: raw.conditionId,
+            marketId: String(raw.id),
+            outcomePrices: prices.map((p) => String(p)),
+            volume: Number.isFinite(raw.volume) ? Number(raw.volume) : null,
+            volume24hr: Number.isFinite(raw.volume24hr)
+              ? Number(raw.volume24hr)
+              : null,
+            liquidity: Number.isFinite(raw.liquidity)
+              ? Number(raw.liquidity)
+              : null,
+            active: raw.active ?? true,
+            closed: raw.closed ?? false,
+            acceptingOrders: raw.acceptingOrders ?? true,
+          });
+        }
+      } catch (error) {
+        this.logger.warn(
+          `fetchMarketsByConditionIds chunk ${i / CHUNK} (${slice.length} ids) failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      if (i + CHUNK < unique.length) {
+        await this.delay(PolymarketGammaService.REQUEST_DELAY_MS);
+      }
+    }
+
+    return out;
   }
 
   // ─── Parsing helpers ────────────────────────────────────────────────

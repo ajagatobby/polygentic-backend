@@ -19,14 +19,21 @@ import { PerplexityService } from '../agents/perplexity.service';
 import { DataCollectorAgent } from '../agents/data-collector.agent';
 import { ResearchAgent } from '../agents/research.agent';
 import { AnalysisAgent } from '../agents/analysis.agent';
+import { CriticAgent } from '../agents/critic.agent';
+import { FirstPrinciplesAgent } from '../agents/first-principles.agent';
 import { PoissonModelService } from '../agents/poisson-model.service';
+import { PlayerImpactService } from '../agents/player-impact.service';
 import { AgentsService } from '../agents/agents.service';
 import { SyncService } from '../sync/sync.service';
 import { PolymarketGammaService } from '../polymarket/services/polymarket-gamma.service';
 import { PolymarketClobService } from '../polymarket/services/polymarket-clob.service';
 import { PolymarketMatcherService } from '../polymarket/services/polymarket-matcher.service';
 import { PolymarketTradingAgent } from '../polymarket/services/polymarket-trading.agent';
+import { PolymarketDataService } from '../polymarket/services/polymarket-data.service';
+import { SmartMoneySignalService } from '../polymarket/services/smart-money-signal.service';
+import { CopyTraderService } from '../polymarket/services/copy-trader.service';
 import { PredictionMemoryService } from '../agents/prediction-memory.service';
+import { LeaguePriorsService } from '../agents/league-priors.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
@@ -42,14 +49,43 @@ function createDb() {
   }
 
   const ssl = process.env.DATABASE_SSL === 'true' ? 'require' : false;
-  const client = (postgres as any)(connectionString, {
+  const rawClient = (postgres as any)(connectionString, {
     ssl,
     max: 5,
     idle_timeout: 20,
     connect_timeout: 10,
   });
 
-  return drizzle(client, { schema });
+  // Drizzle calls client.unsafe(query, params) for every query. With prepare
+  // disabled (which postgres-js's unsafe always sets), Date parameters reach
+  // an internal Buffer.byteLength path that throws ERR_INVALID_ARG_TYPE
+  // because the value isn't pre-serialized. Coerce Dates → ISO strings here
+  // before postgres-js sees them. Also tee a .catch onto the query so the
+  // underlying PG error is logged before Drizzle wraps it as the generic
+  // "Failed query" error with no cause attached.
+  const unsafeFn = rawClient.unsafe.bind(rawClient);
+  rawClient.unsafe = (queryString: string, params?: unknown[], opts?: any) => {
+    const safeParams = Array.isArray(params)
+      ? params.map((p) => (p instanceof Date ? p.toISOString() : p))
+      : params;
+    const query = unsafeFn(queryString, safeParams, opts);
+    query.catch((err: any) => {
+      // eslint-disable-next-line no-console
+      console.error('[postgres-js] query failed', {
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        hint: err?.hint,
+        where: err?.where,
+        severity: err?.severity_local ?? err?.severity,
+        routine: err?.routine,
+        query: String(queryString ?? '').slice(0, 300),
+      });
+    });
+    return query;
+  };
+
+  return drizzle(rawClient, { schema });
 }
 
 function createConfigService(): ConfigService {
@@ -68,10 +104,15 @@ export interface Services {
   dataCollector: DataCollectorAgent;
   researchAgent: ResearchAgent;
   analysisAgent: AnalysisAgent;
+  criticAgent: CriticAgent;
+  firstPrinciplesAgent: FirstPrinciplesAgent;
   poissonModel: PoissonModelService;
   agentsService: AgentsService;
   syncService: SyncService;
   polymarketService: PolymarketService;
+  polymarketDataService: PolymarketDataService;
+  smartMoneySignalService: SmartMoneySignalService;
+  copyTraderService: CopyTraderService;
 }
 
 /**
@@ -95,31 +136,21 @@ export function initServices(): Services {
   );
   const researchAgent = new ResearchAgent(perplexityService);
   const analysisAgent = new AnalysisAgent(config);
+  const criticAgent = new CriticAgent(config);
+  const firstPrinciplesAgent = new FirstPrinciplesAgent(config);
   const poissonModel = new PoissonModelService(db as any);
+  const playerImpactService = new PlayerImpactService(db as any);
 
   const predictionMemory = new PredictionMemoryService(config);
+  const leaguePriorsService = new LeaguePriorsService(db as any);
 
-  const agentsService = new AgentsService(
-    db as any,
-    config,
-    dataCollector,
-    researchAgent,
-    analysisAgent,
-    poissonModel,
-    footballService,
-    oddsService,
-    alertsService,
-    predictionMemory,
+  // Build Polymarket services up front so AgentsService can take
+  // PolymarketService as a dependency (used for on-demand fixture linking
+  // during prediction generation).
+  const polymarketDataService = new PolymarketDataService();
+  const smartMoneySignalService = new SmartMoneySignalService(
+    polymarketDataService,
   );
-
-  const syncService = new SyncService(
-    db as any,
-    config,
-    footballService,
-    oddsService,
-  );
-
-  // Polymarket trading agent services
   const polymarketGamma = new PolymarketGammaService(config);
   const polymarketClob = new PolymarketClobService(config);
   const polymarketMatcher = new PolymarketMatcherService(db as any);
@@ -131,6 +162,40 @@ export function initServices(): Services {
     polymarketClob,
     polymarketMatcher,
     polymarketTradingAgent,
+    smartMoneySignalService,
+    polymarketDataService,
+  );
+  const copyTraderService = new CopyTraderService(
+    db as any,
+    polymarketDataService,
+    polymarketClob,
+    smartMoneySignalService,
+  );
+
+  const agentsService = new AgentsService(
+    db as any,
+    config,
+    dataCollector,
+    researchAgent,
+    analysisAgent,
+    criticAgent,
+    firstPrinciplesAgent,
+    poissonModel,
+    playerImpactService,
+    footballService,
+    oddsService,
+    alertsService,
+    predictionMemory,
+    leaguePriorsService,
+    smartMoneySignalService,
+    polymarketService,
+  );
+
+  const syncService = new SyncService(
+    db as any,
+    config,
+    footballService,
+    oddsService,
   );
 
   return {
@@ -144,9 +209,14 @@ export function initServices(): Services {
     dataCollector,
     researchAgent,
     analysisAgent,
+    criticAgent,
+    firstPrinciplesAgent,
     poissonModel,
     agentsService,
     syncService,
     polymarketService,
+    polymarketDataService,
+    smartMoneySignalService,
+    copyTraderService,
   };
 }

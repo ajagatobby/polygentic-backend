@@ -14,12 +14,10 @@ import {
   ApiParam,
   ApiBearerAuth,
 } from '@nestjs/swagger';
-import { Roles } from '../auth/roles.decorator';
 import { AlertsService } from './alerts.service';
 
 @ApiTags('Alerts')
 @ApiBearerAuth('firebase-auth')
-@Roles('admin')
 @Controller('api/alerts')
 export class AlertsController {
   constructor(private readonly alertsService: AlertsService) {}

@@ -45,6 +45,8 @@ export class UsersService {
           provider: 'password',
           role: 'user',
           disabled: false,
+          subscriptionTier: 'free',
+          subscriptionStatus: 'none',
           requestCount: 0,
           lastActiveAt: new Date(),
         })
