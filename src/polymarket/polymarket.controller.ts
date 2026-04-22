@@ -693,6 +693,34 @@ export class PolymarketController {
     return this.polymarketService.updateSmartMoneyConfig(body);
   }
 
+  @Get('wallet/analyze')
+  @ApiOperation({
+    summary: 'Deep-dive analysis of any Polymarket wallet',
+    description:
+      'Accepts either a proxy wallet address (0x...) or a Polymarket ' +
+      'handle (@name). Returns lifetime PnL, ROI, streak, last-10 / 20 ' +
+      'win rates, every smart-money qualification gate pass/fail flag, ' +
+      'recent resolved bets, current open positions, and biggest wins/ losses.',
+  })
+  @ApiQuery({
+    name: 'q',
+    required: true,
+    type: String,
+    description: 'Wallet address (0x…) or Polymarket handle (@name).',
+  })
+  async analyzeWallet(@Query('q') q?: string) {
+    if (!q || typeof q !== 'string' || !q.trim()) {
+      throw new BadRequestException('q (address or @handle) is required');
+    }
+    const result = await this.polymarketService.analyzeWallet(q.trim());
+    if (!result) {
+      throw new BadRequestException(
+        'Could not resolve wallet. Try the 0x… address directly.',
+      );
+    }
+    return result;
+  }
+
   @Get('markets/:conditionId/history')
   @ApiOperation({
     summary: 'Price / volume time series for a Polymarket market',

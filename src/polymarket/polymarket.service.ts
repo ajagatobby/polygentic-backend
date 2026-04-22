@@ -6,6 +6,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import axios from 'axios';
 import {
   eq,
   and,
@@ -1658,6 +1659,282 @@ export class PolymarketService implements OnModuleInit {
    * stats (pnl, roi, last10, last20, streak, resolved) auto-enables
    * enrichment so the values exist to filter against.
    */
+
+  /**
+   * Full wallet analysis — resolves a Polymarket handle or address to
+   * its proxy wallet, pulls lifetime stats + current / recent positions,
+   * and checks every qualification gate used by the smart-money signal.
+   * Powers the /wallet analyzer page.
+   */
+  async analyzeWallet(query: string): Promise<{
+    input: string;
+    wallet: string;
+    handle: string | null;
+    displayName: string | null;
+    pseudonym: string | null;
+    bio: string | null;
+    profileImage: string | null;
+    lifetime: {
+      totalPnl: number;
+      totalBought: number;
+      roi: number;
+      resolvedCount: number;
+      typicalBetSize: number;
+      currentWinStreak: number;
+      last10Wins: number | null;
+      last10WinRate: number;
+      last20Wins: number | null;
+      last20WinRate: number;
+    };
+    gates: {
+      minLifetimePnl: { required: number; actual: number; pass: boolean };
+      minLifetimeRoi: { required: number; actual: number; pass: boolean };
+      minResolvedBets: { required: number; actual: number; pass: boolean };
+      minLifetimePnlWithStreak: {
+        required: number;
+        actual: number;
+        pass: boolean;
+      };
+      minCurrentStreak: { required: number; actual: number; pass: boolean };
+      minLast10WinRate: { required: number; actual: number; pass: boolean };
+      baseQualifies: boolean;
+      hotStreakQualifies: boolean;
+      anyQualifies: boolean;
+    };
+    recentResolved: Array<{
+      conditionId: string | null;
+      marketQuestion: string | null;
+      outcomeName: string | null;
+      totalBought: number;
+      realizedPnl: number;
+      win: boolean;
+      endDate: string | null;
+    }>;
+    openPositions: Array<{
+      conditionId: string | null;
+      marketQuestion: string | null;
+      outcomeName: string | null;
+      size: number;
+      avgPrice: number;
+      currentValue: number;
+      cashPnl: number;
+      percentPnl: number;
+    }>;
+    biggestWins: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      endDate: string | null;
+    }>;
+    biggestLosses: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      endDate: string | null;
+    }>;
+  } | null> {
+    const trimmed = query.trim();
+    if (!trimmed) return null;
+
+    // Resolve input:
+    //   0x...           → use as-is (wallet address)
+    //   @handle / handle → scrape polymarket.com/@handle for proxyWallet
+    const isAddress = /^0x[a-fA-F0-9]{40}$/.test(trimmed);
+    let wallet = isAddress ? trimmed.toLowerCase() : '';
+    let handle: string | null = null;
+    let displayName: string | null = null;
+    let pseudonym: string | null = null;
+    let bio: string | null = null;
+    let profileImage: string | null = null;
+
+    if (!isAddress) {
+      const rawHandle = trimmed.startsWith('@')
+        ? trimmed.slice(1)
+        : trimmed;
+      const profileUrl = `https://polymarket.com/@${encodeURIComponent(rawHandle)}`;
+      try {
+        const res = await axios.get<string>(profileUrl, {
+          timeout: 15_000,
+          headers: {
+            'user-agent':
+              'Mozilla/5.0 (Polygee/1.0; +https://polygee.app)',
+          },
+          responseType: 'text',
+        });
+        const html = res.data;
+        const addressMatch = html.match(/"proxyWallet":"(0x[a-fA-F0-9]{40})"/);
+        if (!addressMatch) return null;
+        wallet = addressMatch[1].toLowerCase();
+        handle = rawHandle;
+        displayName =
+          html.match(/"displayUsername":"([^"]+)"/)?.[1] ?? null;
+        pseudonym = html.match(/"pseudonym":"([^"]+)"/)?.[1] ?? null;
+        bio = html.match(/"bio":"([^"]*)"/)?.[1] ?? null;
+        profileImage =
+          html.match(/"profileImage":"([^"]+)"/)?.[1] ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    if (!wallet) return null;
+
+    // Pull positions (open + closed, 200 each) and compute stats reusing
+    // the same lifetime aggregation the smart-money signal runs.
+    const [openPositions, closedPositions] = await Promise.all([
+      this.polymarketDataService.getUserPositions(wallet, { limit: 200 }),
+      this.polymarketDataService.getUserClosedPositions(wallet, {
+        limit: 200,
+      }),
+    ]);
+    const stats = await this.smartMoneySignalService.getWalletLifetimeStats(
+      wallet,
+    );
+
+    // Gate checks — mirrors the defaults in SmartMoneySignalService.
+    const MIN_PNL = 50_000;
+    const MIN_ROI = 0.10;
+    const MIN_RESOLVED = 50;
+    const MIN_PNL_STREAK = 20_000;
+    const MIN_STREAK = 7;
+    const MIN_L10_RATE = 0.8;
+    const roi = stats.totalBought > 0 ? stats.totalPnl / stats.totalBought : 0;
+    const basePnl = stats.totalPnl >= MIN_PNL;
+    const baseRoi = roi >= MIN_ROI;
+    const baseResolved = stats.resolvedCount >= MIN_RESOLVED;
+    const baseQualifies = basePnl && baseRoi && baseResolved;
+    const streakPnl = stats.totalPnl >= MIN_PNL_STREAK;
+    const streakStreak = stats.currentWinStreak >= MIN_STREAK;
+    const streakRate =
+      (stats.last10Wins != null ? stats.last10WinRate : 0) >= MIN_L10_RATE;
+    const hotStreakQualifies =
+      streakPnl &&
+      streakStreak &&
+      streakRate &&
+      baseRoi &&
+      baseResolved;
+
+    // Recent resolved for the win/loss timeline.
+    const resolvedMerged = [...openPositions, ...closedPositions]
+      .filter(
+        (p) =>
+          p.realizedPnl != null && Number(p.totalBought ?? 0) > 0 && p.endDate,
+      )
+      .sort((a: any, b: any) =>
+        String(b.endDate).localeCompare(String(a.endDate)),
+      );
+    const recentResolved = resolvedMerged.slice(0, 20).map((p: any) => ({
+      conditionId: p.conditionId ?? null,
+      marketQuestion: p.title ?? p.slug ?? null,
+      outcomeName: p.outcome ?? null,
+      totalBought: Number(p.totalBought ?? 0),
+      realizedPnl: Number(p.realizedPnl ?? 0),
+      win: Number(p.realizedPnl ?? 0) > 0,
+      endDate: p.endDate ?? null,
+    }));
+
+    const biggestWins = [...resolvedMerged]
+      .filter((p: any) => Number(p.realizedPnl ?? 0) > 0)
+      .sort(
+        (a: any, b: any) =>
+          Number(b.realizedPnl ?? 0) - Number(a.realizedPnl ?? 0),
+      )
+      .slice(0, 5)
+      .map((p: any) => ({
+        marketQuestion: p.title ?? p.slug ?? null,
+        realizedPnl: Number(p.realizedPnl ?? 0),
+        totalBought: Number(p.totalBought ?? 0),
+        endDate: p.endDate ?? null,
+      }));
+    const biggestLosses = [...resolvedMerged]
+      .filter((p: any) => Number(p.realizedPnl ?? 0) < 0)
+      .sort(
+        (a: any, b: any) =>
+          Number(a.realizedPnl ?? 0) - Number(b.realizedPnl ?? 0),
+      )
+      .slice(0, 5)
+      .map((p: any) => ({
+        marketQuestion: p.title ?? p.slug ?? null,
+        realizedPnl: Number(p.realizedPnl ?? 0),
+        totalBought: Number(p.totalBought ?? 0),
+        endDate: p.endDate ?? null,
+      }));
+
+    const openList = openPositions
+      .filter((p: any) => Number(p.size ?? 0) > 0)
+      .sort(
+        (a: any, b: any) =>
+          Number(b.currentValue ?? 0) - Number(a.currentValue ?? 0),
+      )
+      .slice(0, 20)
+      .map((p: any) => ({
+        conditionId: p.conditionId ?? null,
+        marketQuestion: p.title ?? p.slug ?? null,
+        outcomeName: p.outcome ?? null,
+        size: Number(p.size ?? 0),
+        avgPrice: Number(p.avgPrice ?? 0),
+        currentValue: Number(p.currentValue ?? 0),
+        cashPnl: Number(p.cashPnl ?? 0),
+        percentPnl: Number(p.percentPnl ?? 0),
+      }));
+
+    return {
+      input: query,
+      wallet,
+      handle,
+      displayName,
+      pseudonym,
+      bio,
+      profileImage,
+      lifetime: {
+        totalPnl: stats.totalPnl,
+        totalBought: stats.totalBought,
+        roi,
+        resolvedCount: stats.resolvedCount,
+        typicalBetSize: stats.typicalBetSize,
+        currentWinStreak: stats.currentWinStreak,
+        last10Wins: stats.last10Wins,
+        last10WinRate: stats.last10WinRate,
+        last20Wins: stats.last20Wins,
+        last20WinRate: stats.last20WinRate,
+      },
+      gates: {
+        minLifetimePnl: {
+          required: MIN_PNL,
+          actual: stats.totalPnl,
+          pass: basePnl,
+        },
+        minLifetimeRoi: { required: MIN_ROI, actual: roi, pass: baseRoi },
+        minResolvedBets: {
+          required: MIN_RESOLVED,
+          actual: stats.resolvedCount,
+          pass: baseResolved,
+        },
+        minLifetimePnlWithStreak: {
+          required: MIN_PNL_STREAK,
+          actual: stats.totalPnl,
+          pass: streakPnl,
+        },
+        minCurrentStreak: {
+          required: MIN_STREAK,
+          actual: stats.currentWinStreak,
+          pass: streakStreak,
+        },
+        minLast10WinRate: {
+          required: MIN_L10_RATE,
+          actual: stats.last10Wins != null ? stats.last10WinRate : 0,
+          pass: streakRate,
+        },
+        baseQualifies,
+        hotStreakQualifies,
+        anyQualifies: baseQualifies || hotStreakQualifies,
+      },
+      recentResolved,
+      openPositions: openList,
+      biggestWins,
+      biggestLosses,
+    };
+  }
 
   /**
    * Price-history timeline for a single market, sourced from the
