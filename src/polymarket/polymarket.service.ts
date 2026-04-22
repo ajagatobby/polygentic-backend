@@ -1679,6 +1679,7 @@ export class PolymarketService implements OnModuleInit {
     profileImage: string | null;
     lifetime: {
       totalPnl: number;
+      unrealizedPnl: number;
       totalBought: number;
       roi: number;
       resolvedCount: number;
@@ -1822,10 +1823,10 @@ export class PolymarketService implements OnModuleInit {
       openResult.truncated ||
       closedResult.truncated ||
       tradesResult.truncated;
-    const stats = this.smartMoneySignalService.computeLifetimeStats([
-      ...openPositions,
-      ...closedPositions,
-    ]);
+    const stats = this.smartMoneySignalService.computeLifetimeStats(
+      openPositions,
+      closedPositions,
+    );
 
     // Replay the trade log chronologically, per asset, tracking the
     // running cost basis of currently-held shares. `peakExposureUsd` is
@@ -1880,15 +1881,23 @@ export class PolymarketService implements OnModuleInit {
       baseRoi &&
       baseResolved;
 
-    // Recent resolved for the win/loss timeline.
-    const resolvedMerged = [...openPositions, ...closedPositions]
-      .filter(
-        (p) =>
-          p.realizedPnl != null && Number(p.totalBought ?? 0) > 0 && p.endDate,
-      )
-      .sort((a: any, b: any) =>
-        String(b.endDate).localeCompare(String(a.endDate)),
-      );
+    // Recent resolved for the win/loss timeline. Draw only from
+    // /closed-positions — pulling from open positions was treating
+    // every still-live bet with realizedPnl=0 as a settled loss,
+    // which tanked every whale's "recent form" even when they were
+    // deeply profitable overall. Sort by `timestamp` (last activity
+    // on the position — sell/redeem) because market endDate can
+    // post-date the user's exit.
+    const resolvedMerged = [...closedPositions]
+      .filter((p) => Number(p.totalBought ?? 0) > 0)
+      .sort((a: any, b: any) => {
+        const at = Number(a.timestamp ?? 0);
+        const bt = Number(b.timestamp ?? 0);
+        if (at && bt) return bt - at;
+        if (at) return -1;
+        if (bt) return 1;
+        return String(b.endDate ?? '').localeCompare(String(a.endDate ?? ''));
+      });
     const recentResolved = resolvedMerged.slice(0, 20).map((p: any) => ({
       conditionId: p.conditionId ?? null,
       marketQuestion: p.title ?? p.slug ?? null,
@@ -1992,6 +2001,7 @@ export class PolymarketService implements OnModuleInit {
       profileImage,
       lifetime: {
         totalPnl: stats.totalPnl,
+        unrealizedPnl: stats.unrealizedPnl,
         totalBought: stats.totalBought,
         roi,
         resolvedCount: stats.resolvedCount,

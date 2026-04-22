@@ -413,13 +413,29 @@ export class PolymarketDataService {
     });
   }
 
-  /** Paginated sweep of every closed position for a wallet. See getUserPositionsAll. */
+  /**
+   * Paginated sweep of every closed position for a wallet.
+   *
+   * ⚠ `/closed-positions` has a hard server-side cap of 50 rows per
+   * response, regardless of the `limit` you send. Using anything
+   * larger than 50 here makes our short-page termination heuristic
+   * trip on page 0 (we ask for 500, get 50, assume that's the whole
+   * list), which silently dropped every wallet's closed-position
+   * history past the first 50 entries. On a heavy trader this meant
+   * only their most recent 50 resolved bets were considered — and
+   * because /closed-positions is effectively sorted newest-first,
+   * the missing 90% were older bets. See getUserPositionsAll for the
+   * positions counterpart which does honour larger limits.
+   */
   async getUserClosedPositionsAll(
     proxyWallet: string,
     opts: { pageSize?: number; maxPages?: number } = {},
   ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
-    const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
-    const maxPages = Math.max(1, opts.maxPages ?? 20);
+    const pageSize = Math.min(50, Math.max(10, opts.pageSize ?? 50));
+    // With 50 rows per page, 200 pages covers 10,000 closed positions —
+    // a generous ceiling; whales-of-whales might trade more in a lifetime
+    // but that's a truly pathological case.
+    const maxPages = Math.max(1, opts.maxPages ?? 200);
     const cacheKey = `closed-positions-all:${proxyWallet}:${pageSize}:${maxPages}`;
     return this.cached(cacheKey, this.POSITIONS_TTL_MS, async () => {
       return this.paginatedPositions(
