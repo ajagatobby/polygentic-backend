@@ -14,6 +14,7 @@ import {
 } from './sync-data';
 import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
 import { polymarketMarketSnapshotTask } from './polymarket-market-snapshot';
+import { polymarketBackfillHistoryTask } from './polymarket-backfill-history';
 import { copyTraderSyncTask } from './copy-trader-sync';
 import {
   syncBasketballFixturesTask,
@@ -193,6 +194,27 @@ export const polymarketMarketSnapshotSchedule = schedules.task({
       undefined as void,
     );
     logger.info('Triggered polymarket market snapshot task', {
+      runId: handle.id,
+    });
+  },
+});
+
+/**
+ * Once per hour: opportunistically backfill CLOB /prices-history for any
+ * market that was discovered but has no snapshot history yet. Idempotent
+ * — the task's own query filters to markets with zero snapshot rows. So
+ * newly-linked markets get a real 24h curve within an hour of landing in
+ * polymarket_markets, without a dedicated on-demand trigger.
+ */
+export const polymarketBackfillHistorySchedule = schedules.task({
+  id: 'scheduled-polymarket-backfill-history',
+  cron: '0 * * * *',
+  run: async () => {
+    logger.info('Scheduled: polymarket history backfill');
+    const handle = await polymarketBackfillHistoryTask.trigger({
+      limit: 200,
+    });
+    logger.info('Triggered polymarket history backfill task', {
       runId: handle.id,
     });
   },
