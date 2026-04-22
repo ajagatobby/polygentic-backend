@@ -2231,31 +2231,20 @@ export class PolymarketService implements OnModuleInit {
     // /holders + /trades + leaderboard. More candidates in → more
     // qualifying sharps out → more reliable leanScore.
     //
-    // Pool expansion now runs on BOTH read-only GETs and persist POSTs.
-    // The previous split (GET = native /holders, cap 20/outcome) meant
-    // the match detail page only ever saw 40 wallets max, missing the
-    // long tail of qualified sharps. GET uses a slightly narrower trade
-    // sample to keep latency on the live view reasonable; POST still
-    // casts the widest net since it's writing the canonical prediction
-    // row.
-    const poolOptions = options.persist
-      ? {
-          expandPool: true,
-          targetHoldersPerOutcome: 10_000,
-          includeLeaderboardInPool: true,
-          // Deeper trade pagination + wider leaderboard cross-check so
-          // the union catches every active wallet on the market, not
-          // just the top tier.
-          tradeSampleSize: 5_000,
-          leaderboardSize: 200,
-        }
-      : {
-          expandPool: true,
-          targetHoldersPerOutcome: 10_000,
-          includeLeaderboardInPool: true,
-          tradeSampleSize: 2_000,
-          leaderboardSize: 100,
-        };
+    // SAME pool for GET and POST. Every consumer — match detail pages,
+    // admin persists, trigger tasks — sees the full widest-net wallet
+    // union. Previously GET was capped at 40 wallets via native /holders;
+    // now it matches the POST's /holders + /trades + leaderboard union.
+    const poolOptions = {
+      expandPool: true,
+      targetHoldersPerOutcome: 10_000,
+      includeLeaderboardInPool: true,
+      // Deeper trade pagination + wider leaderboard cross-check so the
+      // union catches every active wallet on the market, not just the
+      // top tier.
+      tradeSampleSize: 5_000,
+      leaderboardSize: 200,
+    };
 
     // Merge DB-stored threshold overrides. Admin-facing endpoint lets
     // operators tune gates without shipping code — non-null DB fields
