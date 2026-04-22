@@ -75,11 +75,28 @@ interface ApiFootballResponse<T = any> {
 
 export type FixtureByIdResult = {
   fixture: any;
+  homeTeam: {
+    id: number;
+    name: string | null;
+    shortName: string | null;
+    logo: string | null;
+  } | null;
+  awayTeam: {
+    id: number;
+    name: string | null;
+    shortName: string | null;
+    logo: string | null;
+  } | null;
   statistics: any[];
   events: any[];
   injuries: any[];
   lineups: any[];
   prediction: any;
+  polymarket: {
+    eventUrl: string | null;
+    marketCount: number;
+    markets: any[];
+  } | null;
 };
 
 @Injectable()
@@ -2108,22 +2125,51 @@ export class FootballService {
     const fixture = fixtureRows?.[0];
     if (!fixture) return null;
 
-    const [statistics, events, injuries, lineups] = await Promise.all([
-      this.db
-        .select()
-        .from(schema.fixtureStatistics)
-        .where(eq(schema.fixtureStatistics.fixtureId, id)),
-      this.db
-        .select()
-        .from(schema.fixtureEvents)
-        .where(eq(schema.fixtureEvents.fixtureId, id))
-        .orderBy(asc(schema.fixtureEvents.elapsed)),
-      this.db
-        .select()
-        .from(schema.injuries)
-        .where(eq(schema.injuries.fixtureId, id)),
-      this.getLineupsForFixture(id),
-    ]);
+    const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(
+      (x): x is number => typeof x === 'number',
+    );
+
+    const [statistics, events, injuries, lineups, teamRows, polymarketMap] =
+      await Promise.all([
+        this.db
+          .select()
+          .from(schema.fixtureStatistics)
+          .where(eq(schema.fixtureStatistics.fixtureId, id)),
+        this.db
+          .select()
+          .from(schema.fixtureEvents)
+          .where(eq(schema.fixtureEvents.fixtureId, id))
+          .orderBy(asc(schema.fixtureEvents.elapsed)),
+        this.db
+          .select()
+          .from(schema.injuries)
+          .where(eq(schema.injuries.fixtureId, id)),
+        this.getLineupsForFixture(id),
+        teamIds.length > 0
+          ? this.db
+              .select({
+                id: schema.teams.id,
+                name: schema.teams.name,
+                shortName: schema.teams.shortName,
+                logo: schema.teams.logo,
+              })
+              .from(schema.teams)
+              .where(inArray(schema.teams.id, teamIds))
+          : Promise.resolve(
+              [] as Array<{
+                id: number;
+                name: string;
+                shortName: string | null;
+                logo: string | null;
+              }>,
+            ),
+        this.getPolymarketInfoForFixtures([id]),
+      ]);
+
+    const teamMap = new Map<number, (typeof teamRows)[number]>();
+    for (const t of teamRows) teamMap.set(t.id, t);
+    const home = teamMap.get(fixture.homeTeamId) ?? null;
+    const away = teamMap.get(fixture.awayTeamId) ?? null;
 
     // Fetch live prediction from API if fixture hasn't started yet
     let prediction = null;
@@ -2135,7 +2181,45 @@ export class FootballService {
       }
     }
 
-    return { fixture, statistics, events, injuries, lineups, prediction };
+    return {
+      fixture,
+      homeTeam: home
+        ? {
+            id: home.id,
+            name: home.name ?? null,
+            shortName: home.shortName ?? null,
+            logo: home.logo ?? null,
+          }
+        : fixture.homeTeamId
+          ? {
+              id: fixture.homeTeamId,
+              name: null,
+              shortName: null,
+              logo: null,
+            }
+          : null,
+      awayTeam: away
+        ? {
+            id: away.id,
+            name: away.name ?? null,
+            shortName: away.shortName ?? null,
+            logo: away.logo ?? null,
+          }
+        : fixture.awayTeamId
+          ? {
+              id: fixture.awayTeamId,
+              name: null,
+              shortName: null,
+              logo: null,
+            }
+          : null,
+      statistics,
+      events,
+      injuries,
+      lineups,
+      prediction,
+      polymarket: polymarketMap.get(id) ?? null,
+    };
   }
 
   /**
