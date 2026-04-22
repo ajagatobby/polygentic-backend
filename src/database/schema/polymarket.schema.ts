@@ -610,6 +610,39 @@ export const polymarketHolderSnapshots = pgTable(
   ],
 );
 
+// ─── polymarket_price_snapshots ────────────────────────────────────────
+// Append-only 5-minute snapshots of market pricing + volume. Powers the
+// probability-over-time chart on the match detail page — without this
+// table polymarket_markets only has the latest value so chart lines
+// would be flat. Expected volume: ~100 active markets × 288 ticks/day =
+// ~29k rows/day; retention can be pruned to 30 days later if needed.
+
+export const polymarketPriceSnapshots = pgTable(
+  'polymarket_price_snapshots',
+  {
+    id: serial('id').primaryKey(),
+    marketId: varchar('market_id', { length: 255 }).notNull(),
+    conditionId: varchar('condition_id', { length: 255 }),
+    snapshotAt: timestamp('snapshot_at').defaultNow().notNull(),
+    outcomePrices: jsonb('outcome_prices').$type<string[]>(),
+    volume: numeric('volume', { precision: 14, scale: 2 }),
+    volume24hr: numeric('volume_24hr', { precision: 14, scale: 2 }),
+    liquidity: numeric('liquidity', { precision: 14, scale: 2 }),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_pm_price_snapshots_market').on(
+      table.marketId,
+      table.snapshotAt,
+    ),
+    index('idx_pm_price_snapshots_condition').on(
+      table.conditionId,
+      table.snapshotAt,
+    ),
+    index('idx_pm_price_snapshots_taken').on(table.snapshotAt),
+  ],
+);
+
 // ─── RELATIONS ─────────────────────────────────────────────────────────
 
 export const polymarketMarketsRelations = relations(

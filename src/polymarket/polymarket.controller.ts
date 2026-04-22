@@ -693,6 +693,47 @@ export class PolymarketController {
     return this.polymarketService.updateSmartMoneyConfig(body);
   }
 
+  @Get('markets/:conditionId/history')
+  @ApiOperation({
+    summary: 'Price / volume time series for a Polymarket market',
+    description:
+      'Returns the append-only snapshot trail written every 5 minutes by ' +
+      'the polymarket-market-snapshot trigger task. Powers the match ' +
+      'detail probability chart.',
+  })
+  @ApiQuery({
+    name: 'hours',
+    required: false,
+    type: Number,
+    description: 'Window in hours (1-720, default 24).',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max points returned (1-2000, default 288).',
+  })
+  async getMarketHistory(
+    @Param('conditionId') conditionId: string,
+    @Query('hours') hours?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const h = hours ? Number(hours) : undefined
+    const l = limit ? Number(limit) : undefined
+    const points = await this.polymarketService.getMarketPriceHistory(
+      conditionId,
+      {
+        hours: Number.isFinite(h) ? h : undefined,
+        limit: Number.isFinite(l) ? l : undefined,
+      },
+    )
+    return {
+      conditionId,
+      count: points.length,
+      points,
+    }
+  }
+
   @Get('holders/:conditionId')
   @ApiOperation({
     summary: 'Get every top holder for a Polymarket market (by conditionId)',

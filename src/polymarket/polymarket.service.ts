@@ -1658,6 +1658,56 @@ export class PolymarketService implements OnModuleInit {
    * stats (pnl, roi, last10, last20, streak, resolved) auto-enables
    * enrichment so the values exist to filter against.
    */
+
+  /**
+   * Price-history timeline for a single market, sourced from the
+   * polymarket_price_snapshots table (appended every 5 minutes by the
+   * polymarket-market-snapshot trigger task). Powers the match detail
+   * chart — replaces the single in-place value with a real time series.
+   */
+  async getMarketPriceHistory(
+    conditionId: string,
+    opts: { hours?: number; limit?: number } = {},
+  ): Promise<
+    Array<{
+      snapshotAt: Date;
+      outcomePrices: string[];
+      volume: string | null;
+      volume24hr: string | null;
+      liquidity: string | null;
+    }>
+  > {
+    const hours = Math.max(1, Math.min(720, opts.hours ?? 24));
+    const limit = Math.max(1, Math.min(2000, opts.limit ?? 288));
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+
+    const rows = await this.db
+      .select({
+        snapshotAt: schema.polymarketPriceSnapshots.snapshotAt,
+        outcomePrices: schema.polymarketPriceSnapshots.outcomePrices,
+        volume: schema.polymarketPriceSnapshots.volume,
+        volume24hr: schema.polymarketPriceSnapshots.volume24hr,
+        liquidity: schema.polymarketPriceSnapshots.liquidity,
+      })
+      .from(schema.polymarketPriceSnapshots)
+      .where(
+        and(
+          eq(schema.polymarketPriceSnapshots.conditionId, conditionId),
+          gte(schema.polymarketPriceSnapshots.snapshotAt, since),
+        ),
+      )
+      .orderBy(asc(schema.polymarketPriceSnapshots.snapshotAt))
+      .limit(limit);
+
+    return rows as Array<{
+      snapshotAt: Date;
+      outcomePrices: string[];
+      volume: string | null;
+      volume24hr: string | null;
+      liquidity: string | null;
+    }>;
+  }
+
   async getAllMarketHolders(
     conditionId: string,
     opts: {
