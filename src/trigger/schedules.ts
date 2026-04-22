@@ -15,6 +15,7 @@ import {
 import { polymarketScanTask, polymarketTradeTask } from './polymarket-scan';
 import { polymarketMarketSnapshotTask } from './polymarket-market-snapshot';
 import { polymarketBackfillHistoryTask } from './polymarket-backfill-history';
+import { polymarketTodaySnapshotTask } from './polymarket-today-snapshot';
 import { copyTraderSyncTask } from './copy-trader-sync';
 import {
   syncBasketballFixturesTask,
@@ -215,6 +216,27 @@ export const polymarketBackfillHistorySchedule = schedules.task({
       limit: 200,
     });
     logger.info('Triggered polymarket history backfill task', {
+      runId: handle.id,
+    });
+  },
+});
+
+/**
+ * Every 2 minutes: high-frequency Gamma snapshot for markets linked to
+ * fixtures in the "now - 1h → now + 24h" window. Powers the live
+ * probability-over-time chart on pages users are actually viewing.
+ * Runs on top of the 5-min broader sweep so long-range markets still
+ * get regular coverage without blowing the Gamma API's rate budget.
+ */
+export const polymarketTodaySnapshotSchedule = schedules.task({
+  id: 'scheduled-polymarket-today-snapshot',
+  cron: '*/2 * * * *',
+  run: async () => {
+    logger.info('Scheduled: polymarket today snapshot');
+    const handle = await polymarketTodaySnapshotTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered polymarket today snapshot task', {
       runId: handle.id,
     });
   },
