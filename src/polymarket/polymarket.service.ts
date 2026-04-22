@@ -1966,13 +1966,16 @@ export class PolymarketService implements OnModuleInit {
     const biggestWins = allWins.slice(0, 5);
     const biggestLosses = allLosses.slice(0, 5);
 
+    // Return the FULL open position book sorted by current value. The
+    // frontend defaults to showing the top few and has a "view all"
+    // expand; capping here (we used to slice at 20) would hide whales'
+    // long tails even when the user explicitly asks to see them.
     const openList = openPositions
       .filter((p: any) => Number(p.size ?? 0) > 0)
       .sort(
         (a: any, b: any) =>
           Number(b.currentValue ?? 0) - Number(a.currentValue ?? 0),
       )
-      .slice(0, 20)
       .map((p: any) => ({
         conditionId: p.conditionId ?? null,
         marketQuestion: p.title ?? p.slug ?? null,
