@@ -1732,6 +1732,18 @@ export class PolymarketService implements OnModuleInit {
       totalBought: number;
       endDate: string | null;
     }>;
+    allWins: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      endDate: string | null;
+    }>;
+    allLosses: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      endDate: string | null;
+    }>;
   } | null> {
     const trimmed = query.trim();
     if (!trimmed) return null;
@@ -1833,32 +1845,38 @@ export class PolymarketService implements OnModuleInit {
       endDate: p.endDate ?? null,
     }));
 
-    const biggestWins = [...resolvedMerged]
+    // Full sorted lists — every winning settlement desc by PnL, every
+    // losing settlement asc by PnL. The UI lets the user scroll through
+    // them all; the "biggest" header just reflects the first rows since
+    // the lists are already sorted.
+    const allWins = [...resolvedMerged]
       .filter((p: any) => Number(p.realizedPnl ?? 0) > 0)
       .sort(
         (a: any, b: any) =>
           Number(b.realizedPnl ?? 0) - Number(a.realizedPnl ?? 0),
       )
-      .slice(0, 5)
       .map((p: any) => ({
         marketQuestion: p.title ?? p.slug ?? null,
         realizedPnl: Number(p.realizedPnl ?? 0),
         totalBought: Number(p.totalBought ?? 0),
         endDate: p.endDate ?? null,
       }));
-    const biggestLosses = [...resolvedMerged]
+    const allLosses = [...resolvedMerged]
       .filter((p: any) => Number(p.realizedPnl ?? 0) < 0)
       .sort(
         (a: any, b: any) =>
           Number(a.realizedPnl ?? 0) - Number(b.realizedPnl ?? 0),
       )
-      .slice(0, 5)
       .map((p: any) => ({
         marketQuestion: p.title ?? p.slug ?? null,
         realizedPnl: Number(p.realizedPnl ?? 0),
         totalBought: Number(p.totalBought ?? 0),
         endDate: p.endDate ?? null,
       }));
+    // Keep the top-5 aliases for any consumer that prefers a compact
+    // highlight view; the frontend wallet page now reads the full lists.
+    const biggestWins = allWins.slice(0, 5);
+    const biggestLosses = allLosses.slice(0, 5);
 
     const openList = openPositions
       .filter((p: any) => Number(p.size ?? 0) > 0)
@@ -1933,6 +1951,8 @@ export class PolymarketService implements OnModuleInit {
       openPositions: openList,
       biggestWins,
       biggestLosses,
+      allWins,
+      allLosses,
     };
   }
 
