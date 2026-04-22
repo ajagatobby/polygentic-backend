@@ -288,46 +288,69 @@ export class PolymarketDataService {
     opts: { pageSize?: number; maxPages?: number } = {},
   ): Promise<{ trades: PolymarketTrade[]; truncated: boolean }> {
     const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
-    const maxPages = Math.max(1, opts.maxPages ?? 50);
+    // /activity starts returning HTTP 400 past an undocumented offset
+    // ceiling (~3,500 rows for our test wallets), so we cap maxPages
+    // tighter than the positions fetchers — extra pages past the
+    // ceiling just add round-trip latency for zero data.
+    const maxPages = Math.max(1, opts.maxPages ?? 10);
     const cacheKey = `user-activity-all:${proxyWallet}:${pageSize}:${maxPages}`;
     return this.cached(cacheKey, this.TRADES_TTL_MS, async () => {
       const seen = new Set<string>();
       const out: PolymarketTrade[] = [];
-      for (let page = 0; page < maxPages; page++) {
-        let rows: PolymarketTrade[] = [];
-        try {
-          const r = await this.client.get<PolymarketTrade[]>('/activity', {
-            params: {
-              user: proxyWallet,
-              type: 'TRADE',
-              limit: pageSize,
-              offset: page * pageSize,
-            },
-          });
-          rows = Array.isArray(r.data) ? r.data : [];
-        } catch (err) {
-          this.logger.warn(
-            `getUserTradesAll page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
-          );
-          return { trades: out, truncated: false };
-        }
 
-        // Dedup on (transactionHash, asset, timestamp, size). A single
-        // transactionHash can legitimately map to multiple fills (the
-        // same order consuming many counterparties), but the same
-        // (hash, asset, ts, size) tuple repeating means we got the same
-        // row back — i.e., the API ignored offset.
-        let added = 0;
-        for (const row of rows) {
-          const key = `${row.transactionHash}:${row.asset}:${row.size}:${row.timestamp}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          out.push(row);
-          added++;
+      for (
+        let batchStart = 0;
+        batchStart < maxPages;
+        batchStart += this.PAGINATION_BATCH
+      ) {
+        const batchEnd = Math.min(
+          batchStart + this.PAGINATION_BATCH,
+          maxPages,
+        );
+        const pagePromises: Array<Promise<PolymarketTrade[] | null>> = [];
+        for (let page = batchStart; page < batchEnd; page++) {
+          pagePromises.push(
+            this.client
+              .get<PolymarketTrade[]>('/activity', {
+                params: {
+                  user: proxyWallet,
+                  type: 'TRADE',
+                  limit: pageSize,
+                  offset: page * pageSize,
+                },
+              })
+              .then((r) => (Array.isArray(r.data) ? r.data : []))
+              .catch((err) => {
+                this.logger.warn(
+                  `getUserTradesAll page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
+                );
+                return null;
+              }),
+          );
         }
-        if (added === 0) return { trades: out, truncated: false };
-        if (rows.length < pageSize)
-          return { trades: out, truncated: false };
+        const results = await Promise.all(pagePromises);
+
+        let hitEnd = false;
+        for (const rows of results) {
+          if (rows == null) {
+            hitEnd = true;
+            continue;
+          }
+          // Dedup on (txHash, asset, ts, size) — siblings fills share a
+          // txHash but are otherwise distinct; the full tuple catches
+          // the case where the API ignored offset and handed back a
+          // page we already saw.
+          let added = 0;
+          for (const row of rows) {
+            const key = `${row.transactionHash}:${row.asset}:${row.size}:${row.timestamp}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(row);
+            added++;
+          }
+          if (rows.length < pageSize || added === 0) hitEnd = true;
+        }
+        if (hitEnd) return { trades: out, truncated: false };
       }
       return { trades: out, truncated: true };
     });
@@ -448,6 +471,14 @@ export class PolymarketDataService {
     });
   }
 
+  /**
+   * How many pages to fetch in parallel per batch. Sequential paging
+   * multiplied latency for whale wallets (15 pages × ~200ms each = 3s+
+   * just for closed positions). 5 requests in parallel is well under
+   * typical upstream rate limits and cuts the wall-clock time by ~5×.
+   */
+  private readonly PAGINATION_BATCH = 5;
+
   private async paginatedPositions(
     endpoint: '/positions' | '/closed-positions',
     proxyWallet: string,
@@ -457,50 +488,57 @@ export class PolymarketDataService {
   ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
     const seen = new Set<string>();
     const out: UserPosition[] = [];
-    for (let page = 0; page < maxPages; page++) {
-      let rows: UserPosition[] = [];
-      try {
-        const r = await this.client.get<UserPosition[]>(endpoint, {
-          params: {
-            user: proxyWallet,
-            limit: pageSize,
-            offset: page * pageSize,
-          },
-        });
-        rows = Array.isArray(r.data) ? r.data : [];
-      } catch (err) {
-        this.logger.warn(
-          `${label} page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
-        );
-        // Treat a network blip as end-of-list rather than truncation — we
-        // don't actually know there's more, and flagging truncated would
-        // falsely scare the UI.
-        return { positions: out, truncated: false };
-      }
 
-      // Dedup: if the API ignores `offset`, it'll hand us the same page
-      // again and we'd loop forever. The (proxyWallet, asset) tuple is
-      // unique per user × outcome token.
-      let added = 0;
-      for (const row of rows) {
-        const key = `${row.asset}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push(row);
-        added++;
+    for (let batchStart = 0; batchStart < maxPages; batchStart += this.PAGINATION_BATCH) {
+      const batchEnd = Math.min(batchStart + this.PAGINATION_BATCH, maxPages);
+      const pagePromises: Array<Promise<UserPosition[] | null>> = [];
+      for (let page = batchStart; page < batchEnd; page++) {
+        pagePromises.push(
+          this.client
+            .get<UserPosition[]>(endpoint, {
+              params: {
+                user: proxyWallet,
+                limit: pageSize,
+                offset: page * pageSize,
+              },
+            })
+            .then((r) => (Array.isArray(r.data) ? r.data : []))
+            .catch((err) => {
+              this.logger.warn(
+                `${label} page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
+              );
+              return null;
+            }),
+        );
       }
-      if (added === 0) {
-        // Either we reached the end or the API stopped honoring offset —
-        // either way, further paging is pointless.
-        return { positions: out, truncated: false };
+      const results = await Promise.all(pagePromises);
+
+      let hitEnd = false;
+      for (const rows of results) {
+        // Any page failing (HTTP 400 from Polymarket often fires once
+        // you push past a hidden server-side offset ceiling) signals
+        // end-of-list. We keep whatever we already collected.
+        if (rows == null) {
+          hitEnd = true;
+          continue;
+        }
+        let added = 0;
+        for (const row of rows) {
+          const key = row.asset;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(row);
+          added++;
+        }
+        // Either a short page (explicit end signal from the API) or a
+        // page with zero new rows (API ignoring offset so handing back
+        // a dupe) both mean "no more data past this point."
+        if (rows.length < pageSize || added === 0) hitEnd = true;
       }
-      if (rows.length < pageSize) {
-        // Short page: explicit end-of-list from the API.
-        return { positions: out, truncated: false };
-      }
+      if (hitEnd) return { positions: out, truncated: false };
     }
-    // We filled maxPages × pageSize unique rows and the API never signaled
-    // end-of-list. More probably exist.
+    // Filled maxPages × pageSize worth of unique rows without ever
+    // seeing an end signal — more likely exist upstream.
     return { positions: out, truncated: true };
   }
 
