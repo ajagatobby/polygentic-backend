@@ -2699,6 +2699,32 @@ export class AgentsService {
         .catch(() => ({ type: 'lineups', count: 0 })),
     );
 
+    // Always freshen each team's recent results straight from API-Football
+    // (one cheap /fixtures?team=&last call per team, upserted to the DB). This
+    // keeps form windows + recent-game history current regardless of sync
+    // gaps — the root fix for stale last-5/last-10 data.
+    tasks.push(
+      this.footballService
+        .getTeamRecentFixtures(fixture.homeTeamId)
+        .then((count) => ({ type: 'homeRecent', count }))
+        .catch(() => ({ type: 'homeRecent', count: 0 })),
+    );
+    tasks.push(
+      this.footballService
+        .getTeamRecentFixtures(fixture.awayTeamId)
+        .then((count) => ({ type: 'awayRecent', count }))
+        .catch(() => ({ type: 'awayRecent', count: 0 })),
+    );
+
+    // Always freshen this fixture's injuries (one cheap /injuries?fixture call,
+    // both teams) so absences are current — not gated by the league cooldown.
+    tasks.push(
+      this.footballService
+        .syncInjuriesForFixture(fixtureId)
+        .then((count) => ({ type: 'fixtureInjuries', count }))
+        .catch(() => ({ type: 'fixtureInjuries', count: 0 })),
+    );
+
     // Only sync injuries and standings if not recently done for this league
     if (needsLeagueSync) {
       this.logger.log(

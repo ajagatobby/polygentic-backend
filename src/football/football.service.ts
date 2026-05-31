@@ -690,6 +690,106 @@ export class FootballService {
   ];
 
   /**
+   * Fetch a team's most-recent fixtures FRESH from API-Football and upsert
+   * them. `/fixtures?team=&last=N` returns the last N games across all
+   * competitions with final status + scores — always current, regardless of
+   * our sync state. Upserting into the DB means every downstream query (form
+   * windows, recent-game history, opponent strength — model AND display) reads
+   * fresh results without any query changes.
+   *
+   * One cheap call per team. Per-match stats (xG/possession) are NOT fetched
+   * here (that would be one call per game); they continue to come from the DB.
+   */
+  async getTeamRecentFixtures(teamId: number, last = 40): Promise<number> {
+    try {
+      const data = await this.apiRequest<any>('/fixtures', {
+        team: String(teamId),
+        last: String(Math.min(Math.max(1, last), 99)),
+      });
+      let n = 0;
+      for (const item of data.response ?? []) {
+        await this.upsertFixture(item);
+        n++;
+      }
+      this.logger.debug(`Freshened ${n} recent fixtures for team ${teamId}`);
+      return n;
+    } catch (error: any) {
+      this.logger.warn(
+        `getTeamRecentFixtures(${teamId}) failed: ${error.message}`,
+      );
+      return 0;
+    }
+  }
+
+  /**
+   * Fetch the injuries for a single fixture FRESH and upsert them.
+   * `/injuries?fixture={id}` returns both teams' confirmed absences for that
+   * exact match — current and cheap (one call), unlike the league-wide
+   * syncInjuries which is cooldown-gated.
+   */
+  async syncInjuriesForFixture(fixtureId: number): Promise<number> {
+    try {
+      const data = await this.apiRequest<any>('/injuries', {
+        fixture: String(fixtureId),
+      });
+      const items: any[] = data.response ?? [];
+      let count = 0;
+      for (const item of items) {
+        if (!item.player?.id || !item.team?.id || !item.league?.id) continue;
+        try {
+          if (item.team?.name) {
+            await this.ensureTeam({
+              id: item.team.id,
+              name: item.team.name,
+              logo: item.team.logo,
+            });
+          }
+          await this.db
+            .insert(schema.injuries)
+            .values({
+              playerId: item.player.id,
+              playerName: item.player.name,
+              type: item.player.type,
+              reason: item.player.reason,
+              teamId: item.team.id,
+              fixtureId,
+              leagueId: item.league.id,
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [
+                schema.injuries.playerId,
+                schema.injuries.teamId,
+                schema.injuries.leagueId,
+                schema.injuries.type,
+              ],
+              set: {
+                playerName: item.player.name,
+                reason: item.player.reason,
+                fixtureId,
+                updatedAt: new Date(),
+              },
+            });
+          count++;
+        } catch (error: any) {
+          this.logger.debug(
+            `Fixture injury upsert failed for player ${item.player?.id}: ${error.message}`,
+          );
+        }
+      }
+      this.logger.debug(
+        `Freshened ${count} injuries for fixture ${fixtureId}`,
+      );
+      return count;
+    } catch (error: any) {
+      this.logger.warn(
+        `syncInjuriesForFixture(${fixtureId}) failed: ${error.message}`,
+      );
+      return 0;
+    }
+  }
+
+  /**
    * Fetch specific fixtures by API-Football fixture ID and upsert them.
    * API-Football accepts up to 20 ids per `/fixtures?ids=a-b-c` request.
    */
