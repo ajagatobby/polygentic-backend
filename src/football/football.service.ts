@@ -900,6 +900,362 @@ export class FootballService {
   }
 
   /**
+   * Number of days a cached player_season_stats row stays fresh before we
+   * re-pull from API-Football. Player season aggregates change slowly, so a
+   * 3-day window keeps the player-by-player breakdown current without
+   * hammering the rate-limited /players endpoint on every prediction.
+   */
+  private static readonly PLAYER_STATS_STALE_MS = 3 * 24 * 60 * 60 * 1000;
+
+  /**
+   * Get a team's full squad with per-player season aggregates, GK -> every
+   * outfield player. Reads the cached player_season_stats table; if the cache
+   * is empty or stale for this (team, season) it refreshes from API-Football
+   * `/players?team=&season=` (paginated) and upserts.
+   *
+   * Display-only: this powers the player-by-player section of the prediction
+   * insights and does NOT feed the probability model.
+   *
+   * @param leagueId optional — when the API returns stats across multiple
+   *   competitions we prefer this league's row; otherwise the aggregate.
+   */
+  async getSquadWithSeasonStats(
+    teamId: number,
+    season: number,
+    leagueId?: number,
+  ): Promise<any[]> {
+    const cached = await this.db
+      .select()
+      .from(schema.playerSeasonStats)
+      .where(
+        and(
+          eq(schema.playerSeasonStats.teamId, teamId),
+          eq(schema.playerSeasonStats.season, season),
+        ),
+      );
+
+    const newestFetch = cached.reduce((max: number, r: any) => {
+      const t = r.fetchedAt ? new Date(r.fetchedAt).getTime() : 0;
+      return t > max ? t : max;
+    }, 0);
+    const isFresh =
+      cached.length > 0 &&
+      Date.now() - newestFetch < FootballService.PLAYER_STATS_STALE_MS;
+
+    if (isFresh) return cached;
+
+    try {
+      const refreshed = await this.fetchAndPersistSquadStats(
+        teamId,
+        season,
+        leagueId,
+      );
+      if (refreshed.length > 0) return refreshed;
+    } catch (error: any) {
+      this.logger.warn(
+        `Squad stats fetch failed for team ${teamId} season ${season}: ${error.message}`,
+      );
+    }
+
+    // Fall back to whatever (possibly stale) cache we have rather than nothing.
+    return cached;
+  }
+
+  /**
+   * Pull every page of `/players?team=&season=` and upsert into
+   * player_season_stats. Returns the freshly upserted rows.
+   */
+  private async fetchAndPersistSquadStats(
+    teamId: number,
+    season: number,
+    leagueId?: number,
+  ): Promise<any[]> {
+    const collected: any[] = [];
+    let page = 1;
+    let totalPages = 1;
+
+    do {
+      const data = await this.apiRequest<any>('/players', {
+        team: String(teamId),
+        season: String(season),
+        page: String(page),
+      });
+
+      const response = data.response ?? [];
+      for (const entry of response) collected.push(entry);
+
+      totalPages = data.paging?.total ?? 1;
+      page += 1;
+    } while (page <= totalPages && page <= 20); // hard cap: squads never need 20 pages
+
+    if (collected.length === 0) return [];
+
+    const rows = collected
+      .map((entry) => this.normalizePlayerSeasonEntry(entry, teamId, season, leagueId))
+      .filter((r): r is NonNullable<typeof r> => r != null);
+
+    const now = new Date();
+    for (const row of rows) {
+      await this.db
+        .insert(schema.playerSeasonStats)
+        .values(row)
+        .onConflictDoUpdate({
+          target: [
+            schema.playerSeasonStats.playerId,
+            schema.playerSeasonStats.teamId,
+            schema.playerSeasonStats.season,
+          ],
+          set: { ...row, fetchedAt: now, updatedAt: now },
+        });
+    }
+
+    this.logger.log(
+      `Refreshed ${rows.length} player season stat row(s) for team ${teamId} season ${season}`,
+    );
+
+    return this.db
+      .select()
+      .from(schema.playerSeasonStats)
+      .where(
+        and(
+          eq(schema.playerSeasonStats.teamId, teamId),
+          eq(schema.playerSeasonStats.season, season),
+        ),
+      );
+  }
+
+  /**
+   * Map one API-Football /players entry to a player_season_stats row.
+   * The API returns one `statistics[]` element per competition; we prefer the
+   * requested league, else the element with the most appearances.
+   */
+  private normalizePlayerSeasonEntry(
+    entry: any,
+    teamId: number,
+    season: number,
+    leagueId?: number,
+  ): Record<string, any> | null {
+    const player = entry?.player;
+    if (!player?.id) return null;
+
+    const statsList: any[] = Array.isArray(entry.statistics)
+      ? entry.statistics
+      : [];
+
+    const appearancesOf = (s: any) => Number(s?.games?.appearences ?? 0) || 0;
+
+    let stat =
+      (leagueId != null &&
+        statsList.find((s) => s?.league?.id === leagueId)) ||
+      null;
+    if (!stat) {
+      stat = statsList.reduce(
+        (best, s) => (best == null || appearancesOf(s) > appearancesOf(best) ? s : best),
+        null as any,
+      );
+    }
+    stat = stat ?? {};
+
+    const num = (v: any): number | null =>
+      v === null || v === undefined ? null : Number(v);
+
+    const rating =
+      stat?.games?.rating != null ? Number(stat.games.rating) : null;
+
+    return {
+      playerId: player.id,
+      teamId,
+      season,
+      leagueId: stat?.league?.id ?? leagueId ?? null,
+      name: player.name ?? null,
+      firstname: player.firstname ?? null,
+      lastname: player.lastname ?? null,
+      age: num(player.age),
+      nationality: player.nationality ?? null,
+      height: player.height ?? null,
+      weight: player.weight ?? null,
+      photo: player.photo ?? null,
+      position: stat?.games?.position ?? null,
+      appearances: num(stat?.games?.appearences),
+      lineups: num(stat?.games?.lineups),
+      minutes: num(stat?.games?.minutes),
+      rating: rating != null && !Number.isNaN(rating) ? String(rating.toFixed(2)) : null,
+      captain: stat?.games?.captain ?? null,
+      goals: num(stat?.goals?.total),
+      assists: num(stat?.goals?.assists),
+      goalsConceded: num(stat?.goals?.conceded),
+      saves: num(stat?.goals?.saves),
+      shotsTotal: num(stat?.shots?.total),
+      shotsOn: num(stat?.shots?.on),
+      passesTotal: num(stat?.passes?.total),
+      passesKey: num(stat?.passes?.key),
+      passAccuracy: num(stat?.passes?.accuracy),
+      tacklesTotal: num(stat?.tackles?.total),
+      interceptions: num(stat?.tackles?.interceptions),
+      duelsTotal: num(stat?.duels?.total),
+      duelsWon: num(stat?.duels?.won),
+      dribblesAttempts: num(stat?.dribbles?.attempts),
+      dribblesSuccess: num(stat?.dribbles?.success),
+      yellowCards: num(stat?.cards?.yellow),
+      redCards: num(stat?.cards?.red),
+      penaltyScored: num(stat?.penalty?.scored),
+      penaltyMissed: num(stat?.penalty?.missed),
+      rawData: stat ?? null,
+      updatedAt: new Date(),
+    };
+  }
+
+  /**
+   * Staleness window for the cached team_season_statistics. Season aggregates
+   * shift slowly, so a 2-day window keeps profiles current without re-pulling
+   * the rate-limited endpoint on every prediction.
+   */
+  private static readonly TEAM_STATS_STALE_MS = 2 * 24 * 60 * 60 * 1000;
+
+  /**
+   * Get a team's full season profile from API-Football `/teams/statistics`
+   * (home/away splits, goals & cards by minute, streaks, clean sheets,
+   * failed-to-score, penalties, formations). Reads the cached
+   * team_season_statistics row; refreshes from the API when missing or stale.
+   *
+   * Returns the persisted row, or null when unavailable.
+   */
+  async getTeamSeasonStatistics(
+    teamId: number,
+    leagueId: number,
+    season: number,
+  ): Promise<any | null> {
+    const cached = await this.db
+      .select()
+      .from(schema.teamSeasonStatistics)
+      .where(
+        and(
+          eq(schema.teamSeasonStatistics.teamId, teamId),
+          eq(schema.teamSeasonStatistics.leagueId, leagueId),
+          eq(schema.teamSeasonStatistics.season, season),
+        ),
+      )
+      .limit(1);
+
+    const row = cached[0] ?? null;
+    const fresh =
+      row?.fetchedAt &&
+      Date.now() - new Date(row.fetchedAt).getTime() <
+        FootballService.TEAM_STATS_STALE_MS;
+    if (row && fresh) return row;
+
+    try {
+      const refreshed = await this.fetchAndPersistTeamSeasonStatistics(
+        teamId,
+        leagueId,
+        season,
+      );
+      if (refreshed) return refreshed;
+    } catch (error: any) {
+      this.logger.warn(
+        `Team statistics fetch failed for team ${teamId} league ${leagueId} season ${season}: ${error.message}`,
+      );
+    }
+    return row; // possibly-stale fallback
+  }
+
+  private async fetchAndPersistTeamSeasonStatistics(
+    teamId: number,
+    leagueId: number,
+    season: number,
+  ): Promise<any | null> {
+    const data = await this.apiRequest<any>('/teams/statistics', {
+      team: String(teamId),
+      league: String(leagueId),
+      season: String(season),
+    });
+
+    // /teams/statistics returns a single object (not an array) under `response`.
+    const r: any = data.response;
+    if (!r || !r.team) return null;
+
+    const n = (v: any): number | null =>
+      v === null || v === undefined ? null : Number(v);
+    const dec = (v: any): string | null =>
+      v === null || v === undefined ? null : String(Number(v).toFixed(2));
+
+    const goalsForMin = r.goals?.for?.minute ?? null;
+    const goalsAgainstMin = r.goals?.against?.minute ?? null;
+
+    const now = new Date();
+    const row = {
+      teamId,
+      leagueId,
+      season,
+      formString: r.form ?? null,
+      playedHome: n(r.fixtures?.played?.home),
+      playedAway: n(r.fixtures?.played?.away),
+      playedTotal: n(r.fixtures?.played?.total),
+      winsHome: n(r.fixtures?.wins?.home),
+      winsAway: n(r.fixtures?.wins?.away),
+      winsTotal: n(r.fixtures?.wins?.total),
+      drawsHome: n(r.fixtures?.draws?.home),
+      drawsAway: n(r.fixtures?.draws?.away),
+      drawsTotal: n(r.fixtures?.draws?.total),
+      lossesHome: n(r.fixtures?.loses?.home),
+      lossesAway: n(r.fixtures?.loses?.away),
+      lossesTotal: n(r.fixtures?.loses?.total),
+      goalsForHome: n(r.goals?.for?.total?.home),
+      goalsForAway: n(r.goals?.for?.total?.away),
+      goalsForTotal: n(r.goals?.for?.total?.total),
+      goalsAgainstHome: n(r.goals?.against?.total?.home),
+      goalsAgainstAway: n(r.goals?.against?.total?.away),
+      goalsAgainstTotal: n(r.goals?.against?.total?.total),
+      goalsForAvgHome: dec(r.goals?.for?.average?.home),
+      goalsForAvgAway: dec(r.goals?.for?.average?.away),
+      goalsForAvgTotal: dec(r.goals?.for?.average?.total),
+      goalsAgainstAvgHome: dec(r.goals?.against?.average?.home),
+      goalsAgainstAvgAway: dec(r.goals?.against?.average?.away),
+      goalsAgainstAvgTotal: dec(r.goals?.against?.average?.total),
+      cleanSheetHome: n(r.clean_sheet?.home),
+      cleanSheetAway: n(r.clean_sheet?.away),
+      cleanSheetTotal: n(r.clean_sheet?.total),
+      failedToScoreHome: n(r.failed_to_score?.home),
+      failedToScoreAway: n(r.failed_to_score?.away),
+      failedToScoreTotal: n(r.failed_to_score?.total),
+      streakWins: n(r.biggest?.streak?.wins),
+      streakDraws: n(r.biggest?.streak?.draws),
+      streakLoses: n(r.biggest?.streak?.loses),
+      penaltyScored: n(r.penalty?.scored?.total),
+      penaltyMissed: n(r.penalty?.missed?.total),
+      penaltyTotal: n(r.penalty?.total),
+      goalsForByMinute: goalsForMin,
+      goalsAgainstByMinute: goalsAgainstMin,
+      goalsForUnderOver: r.goals?.for?.under_over ?? null,
+      goalsAgainstUnderOver: r.goals?.against?.under_over ?? null,
+      cardsYellowByMinute: r.cards?.yellow ?? null,
+      cardsRedByMinute: r.cards?.red ?? null,
+      biggest: r.biggest ?? null,
+      lineupsUsed: r.lineups ?? null,
+      rawData: r,
+      updatedAt: now,
+    };
+
+    const [stored] = await this.db
+      .insert(schema.teamSeasonStatistics)
+      .values(row)
+      .onConflictDoUpdate({
+        target: [
+          schema.teamSeasonStatistics.teamId,
+          schema.teamSeasonStatistics.leagueId,
+          schema.teamSeasonStatistics.season,
+        ],
+        set: { ...row, fetchedAt: now, updatedAt: now },
+      })
+      .returning();
+
+    this.logger.log(
+      `Refreshed team season statistics for team ${teamId} league ${leagueId} season ${season}`,
+    );
+    return stored;
+  }
+
+  /**
    * Batch fetch Polymarket market links for multiple fixtures.
    *
    * Returns a Map<fixtureId, PolymarketFixtureInfo> where each info carries:
@@ -2403,6 +2759,10 @@ export class FootballService {
             valueBets: bestPrediction.valueBets,
             detailedAnalysis: bestPrediction.detailedAnalysis,
             matchContext: bestPrediction.matchContext,
+            // Deep-analysis sections: head-to-head, last-20 form, streaks, full
+            // player roster, season profiles, Tier-1 signals, market slate, and
+            // referee/weather/discipline/stakes context.
+            matchInsights: bestPrediction.matchInsights,
             opponentStrengthProfile: this.formatOpponentStrengthProfile(
               bestPrediction.matchContext?.opponentStrength,
               {

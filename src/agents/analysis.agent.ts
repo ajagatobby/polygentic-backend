@@ -251,7 +251,10 @@ Before adjusting probabilities, classify the match:
   - Pay attention to the xG/xGA multipliers — they tell you exactly how much the team's attacking/defensive output is reduced
   - A team with xG ×0.85 (15% offensive reduction) should have their win probability reduced noticeably
 - Match motivation: ±1-2% (relegation 6-pointer, title decider, dead rubber)
-- Head-to-head: ±0-1% (only with 10+ match sample, and only if pattern is extreme)
+- Head-to-head: only injected when n≥10 AND one side has ≥65% of decisive meetings.
+  When present, treat as ±0-1% adjustment max — current-form data already
+  captures most of the underlying skill gap. Do NOT request or assume H2H if
+  it isn't shown — its absence means the historical pattern was insufficient.
 - Weather/travel: ±0-1% (rarely significant)
 - TOTAL contextual adjustment MUST NOT exceed ±5% in any direction.
 
@@ -293,7 +296,7 @@ Respond with ONLY valid JSON matching this exact schema:
   "keyFactors": [<string>, ...],
   "riskFactors": [<string>, ...],
   "valueBets": [{"market": <string>, "selection": <string>, "reasoning": <string>, "edgePercent": <number>}, ...],
-  "detailedAnalysis": <string — MUST start with "Base rates: ${baseRateLine}. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) overall form last 5, (6) overall form last 10, (7) match-by-match recent game history, (8) any extra context>
+  "detailedAnalysis": <string — MUST start with "Base rates: ${baseRateLine}. Match type: [TIGHT/MODERATE/MISMATCH]. Adjustments:" then include explicit factor-by-factor breakdown for: (1) team strength, (2) schedule strength of opponents faced (last 5 and last 10), (3) round/rematch context, (4) confirmed unavailable players, (5) recency-weighted form (the headline form metric), (6) raw last-10 form for context, (7) match-by-match recent game history, (8) any extra context>
 }`;
 }
 
@@ -307,7 +310,7 @@ export class AnalysisAgent {
 
   constructor(private readonly config: ConfigService) {
     this.model =
-      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
+      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-7';
     this.provider = detectProvider(this.model);
 
     if (this.provider === 'openai') {
@@ -547,6 +550,57 @@ export class AnalysisAgent {
       `- Referee: ${fixture.referee ?? 'Unknown'}`,
     );
 
+    // Venue / contextual flags (derby, altitude, late-season stakes).
+    // We only inject a section when at least one flag is non-trivial — most
+    // matches are vanilla and adding "no derby, no altitude, no stakes" to
+    // every prompt is just noise.
+    const venueCtx = data.venueContext;
+    if (
+      venueCtx &&
+      (venueCtx.derbyType ||
+        venueCtx.altitudeBoost > 0 ||
+        venueCtx.lateSeasonStakes ||
+        venueCtx.notes.length > 0)
+    ) {
+      sections.push(`\n## Venue & Match Context`);
+      if (venueCtx.derbyType) {
+        sections.push(
+          `- Derby: ${venueCtx.derbyType.replace('_', ' ')}` +
+            (venueCtx.derbyLabel ? ` (${venueCtx.derbyLabel})` : ''),
+        );
+      }
+      if (venueCtx.altitudeBoost > 0) {
+        sections.push(
+          `- Altitude advantage at ${venueCtx.altitudeVenue ?? 'venue'}: ` +
+            `boost factor ${venueCtx.altitudeBoost.toFixed(2)} ` +
+            `(home stamina edge over a low-altitude away side).`,
+        );
+      }
+      if (venueCtx.lateSeasonStakes) {
+        sections.push(
+          `- Stakes: ${venueCtx.lateSeasonStakes.replace(/_/g, ' ')}`,
+        );
+      }
+      for (const note of venueCtx.notes) {
+        sections.push(`  • ${note}`);
+      }
+    }
+
+    // Lineup-vs-typical-XI delta + rest-days asymmetry. Both are
+    // empirically small effects (0.2-0.5pp accuracy lift each) but
+    // they're often invisible to the LLM otherwise — the team-form
+    // and injury sections don't capture acute fatigue (a midweek
+    // Europa game three days ago) or rotation surprise (a key
+    // attacker dropped to the bench without an injury report).
+    const lrf = (data as any).lineupRestFeatures;
+    if (lrf?.promptSummary) {
+      sections.push(`\n## Rest & lineup context`);
+      sections.push(`- ${lrf.promptSummary}`);
+      sections.push(
+        `- Treat fatigue / rotation deltas as small adjustments (±1-2%), not destiny.`,
+      );
+    }
+
     const seasonRematch = data.seasonRematch;
     if (seasonRematch?.isSeasonRematch && seasonRematch.previousMeeting) {
       const prev = seasonRematch.previousMeeting;
@@ -581,9 +635,10 @@ export class AnalysisAgent {
         );
       }
       if (formWindows) {
+        const w = formWindows.weighted;
         sections.push(
-          `- Overall Form (Last 5): W${formWindows.last5.wins} D${formWindows.last5.draws} L${formWindows.last5.losses}, PPG ${formWindows.last5.pointsPerGame}, GF ${formWindows.last5.goalsFor}, GA ${formWindows.last5.goalsAgainst}`,
-          `- Overall Form (Last 10): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}, GF ${formWindows.last10.goalsFor}, GA ${formWindows.last10.goalsAgainst}`,
+          `- Form (recency-weighted, half-life 8 matches, n=${w.sampleSize}): PPG ${w.weightedPpg}, win rate ${w.weightedWinRate}, GF/GA ${w.weightedGoalsFor}/${w.weightedGoalsAgainst} (diff ${w.weightedGoalDiff})`,
+          `- Form (last 10 raw): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}`,
         );
       }
       const opponentStrength = data.opponentStrength?.home;
@@ -652,9 +707,10 @@ export class AnalysisAgent {
         );
       }
       if (formWindows) {
+        const w = formWindows.weighted;
         sections.push(
-          `- Overall Form (Last 5): W${formWindows.last5.wins} D${formWindows.last5.draws} L${formWindows.last5.losses}, PPG ${formWindows.last5.pointsPerGame}, GF ${formWindows.last5.goalsFor}, GA ${formWindows.last5.goalsAgainst}`,
-          `- Overall Form (Last 10): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}, GF ${formWindows.last10.goalsFor}, GA ${formWindows.last10.goalsAgainst}`,
+          `- Form (recency-weighted, half-life 8 matches, n=${w.sampleSize}): PPG ${w.weightedPpg}, win rate ${w.weightedWinRate}, GF/GA ${w.weightedGoalsFor}/${w.weightedGoalsAgainst} (diff ${w.weightedGoalDiff})`,
+          `- Form (last 10 raw): W${formWindows.last10.wins} D${formWindows.last10.draws} L${formWindows.last10.losses}, PPG ${formWindows.last10.pointsPerGame}`,
         );
       }
       const opponentStrength = data.opponentStrength?.away;
@@ -740,20 +796,64 @@ export class AnalysisAgent {
     pushRecentGameHistory(homeName, data.recentGameHistory?.home);
     pushRecentGameHistory(awayName, data.recentGameHistory?.away);
 
-    // H2H
-    if (data.h2h.length > 0) {
-      sections.push(`\n## Head-to-Head (Last ${data.h2h.length} meetings)`);
-      for (const match of data.h2h.slice(0, 10)) {
-        const h = match.teams?.home;
-        const a = match.teams?.away;
-        const g = match.goals;
-        const date = match.fixture?.date
-          ? new Date(match.fixture.date).toISOString().split('T')[0]
-          : '?';
-        sections.push(
-          `- ${date}: ${h?.name ?? '?'} ${g?.home ?? '?'} - ${g?.away ?? '?'} ${a?.name ?? '?'}`,
-        );
+    // H2H — only injected when n>=10 AND one side has won >=65% of meetings.
+    // Most H2H samples are too small or mixed to carry signal beyond what
+    // current-form already captures, and showing them anyway anchors the
+    // model on noise. The system prompt explicitly says to ignore H2H
+    // unless the pattern is extreme; if we don't trust it, we don't show it.
+    const H2H_MIN_SAMPLE = 10;
+    const H2H_DOMINANCE_THRESHOLD = 0.65;
+    if (data.h2h.length >= H2H_MIN_SAMPLE) {
+      const homeId = fixture.homeTeamId;
+      const awayId = fixture.awayTeamId;
+      let homeWins = 0;
+      let awayWins = 0;
+      let draws = 0;
+      for (const match of data.h2h) {
+        const hg = Number(match.goals?.home);
+        const ag = Number(match.goals?.away);
+        if (Number.isNaN(hg) || Number.isNaN(ag)) continue;
+        if (hg === ag) {
+          draws++;
+          continue;
+        }
+        // Identify the winning team in this past meeting, then map it back
+        // to the current fixture's home/away assignment.
+        const matchHomeId = match.teams?.home?.id;
+        const matchAwayId = match.teams?.away?.id;
+        const winnerId = hg > ag ? matchHomeId : matchAwayId;
+        if (winnerId === homeId) homeWins++;
+        else if (winnerId === awayId) awayWins++;
       }
+      const decisive = homeWins + awayWins;
+      const homeShare = decisive > 0 ? homeWins / decisive : 0;
+      const awayShare = decisive > 0 ? awayWins / decisive : 0;
+      const isExtreme =
+        homeShare >= H2H_DOMINANCE_THRESHOLD ||
+        awayShare >= H2H_DOMINANCE_THRESHOLD;
+
+      if (isExtreme) {
+        sections.push(
+          `\n## Head-to-Head (extreme pattern over ${data.h2h.length} meetings)`,
+          `- ${homeName} won ${homeWins} of ${decisive} decisive meetings (${(homeShare * 100).toFixed(0)}%); ` +
+            `${awayName} won ${awayWins} (${(awayShare * 100).toFixed(0)}%); ${draws} draws.`,
+          `- This crosses the ≥65% dominance threshold over a sample ≥10 — small adjustment warranted.`,
+        );
+        for (const match of data.h2h.slice(0, 10)) {
+          const h = match.teams?.home;
+          const a = match.teams?.away;
+          const g = match.goals;
+          const date = match.fixture?.date
+            ? new Date(match.fixture.date).toISOString().split('T')[0]
+            : '?';
+          sections.push(
+            `- ${date}: ${h?.name ?? '?'} ${g?.home ?? '?'} - ${g?.away ?? '?'} ${a?.name ?? '?'}`,
+          );
+        }
+      }
+      // Otherwise: silent skip. Prompt already tells the model H2H is
+      // ignorable below this threshold; including the data anyway just
+      // creates the contradiction we're fixing.
     }
 
     // Confirmed unavailable players — with quantified player impact scores when available
@@ -869,6 +969,20 @@ export class AnalysisAgent {
     // Research
     if (research.combinedResearch) {
       sections.push(`\n## Web Research (Live)\n${research.combinedResearch}`);
+    }
+
+    // Deep-analysis insights (head-to-head, last-20 form, streaks, player
+    // roster). DISPLAY CONTEXT ONLY — provided so the written narrative can be
+    // rich and specific. Do NOT let this move the probability numbers: H2H and
+    // streak signals were shown to hurt calibration, so they are excluded from
+    // the quantitative reasoning by design.
+    const insightsNarrative = (data as any).matchInsights?.narrative;
+    if (insightsNarrative) {
+      sections.push(
+        `\n## Deep-Analysis Reference (DISPLAY CONTEXT — do NOT adjust probabilities from this)`,
+        `The following head-to-head history, last-20 form with scorelines, streaks and squad notes are for your written analysis only. Use them to make detailedAnalysis specific and comprehensive. They must NOT change your probability estimates — those come from team strength, xG, schedule and availability as instructed above.`,
+        insightsNarrative,
+      );
     }
 
     return sections.join('\n');

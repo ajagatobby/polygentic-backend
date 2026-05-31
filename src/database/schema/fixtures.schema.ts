@@ -374,3 +374,187 @@ export const teamFormRelations = relations(teamForm, ({ one }) => ({
     references: [teams.id],
   }),
 }));
+
+// ─── player_season_stats ───────────────────────────────────────────────
+//
+// Cache of per-player season aggregates from API-Football `/players`
+// (paginated). Refreshed lazily by FootballService.getSquadWithSeasonStats
+// when a (team, season) cache is missing or older than the staleness window.
+// One row per (player, team, season). Used purely for the display-only
+// player-by-player breakdown in the prediction insights — it does NOT feed
+// the probability model.
+export const playerSeasonStats = pgTable(
+  'player_season_stats',
+  {
+    id: serial('id').primaryKey(),
+    playerId: integer('player_id').notNull(),
+    teamId: integer('team_id')
+      .notNull()
+      .references(() => teams.id),
+    season: integer('season').notNull(),
+    leagueId: integer('league_id'),
+    name: varchar('name', { length: 255 }),
+    firstname: varchar('firstname', { length: 255 }),
+    lastname: varchar('lastname', { length: 255 }),
+    age: integer('age'),
+    nationality: varchar('nationality', { length: 100 }),
+    height: varchar('height', { length: 20 }),
+    weight: varchar('weight', { length: 20 }),
+    photo: varchar('photo', { length: 500 }),
+    position: varchar('position', { length: 50 }),
+    appearances: integer('appearances'),
+    lineups: integer('lineups'),
+    minutes: integer('minutes'),
+    rating: numeric('rating', { precision: 4, scale: 2 }),
+    captain: boolean('captain'),
+    goals: integer('goals'),
+    assists: integer('assists'),
+    goalsConceded: integer('goals_conceded'),
+    saves: integer('saves'),
+    shotsTotal: integer('shots_total'),
+    shotsOn: integer('shots_on'),
+    passesTotal: integer('passes_total'),
+    passesKey: integer('passes_key'),
+    passAccuracy: integer('pass_accuracy'),
+    tacklesTotal: integer('tackles_total'),
+    interceptions: integer('interceptions'),
+    duelsTotal: integer('duels_total'),
+    duelsWon: integer('duels_won'),
+    dribblesAttempts: integer('dribbles_attempts'),
+    dribblesSuccess: integer('dribbles_success'),
+    yellowCards: integer('yellow_cards'),
+    redCards: integer('red_cards'),
+    penaltyScored: integer('penalty_scored'),
+    penaltyMissed: integer('penalty_missed'),
+    /** Raw API-Football statistics blob (first/primary competition) for anything not promoted to a column. */
+    rawData: jsonb('raw_data'),
+    fetchedAt: timestamp('fetched_at').defaultNow(),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    index('idx_player_season_stats_team_season').on(table.teamId, table.season),
+    uniqueIndex('uq_player_season_stats_player_team_season').on(
+      table.playerId,
+      table.teamId,
+      table.season,
+    ),
+  ],
+);
+
+export const playerSeasonStatsRelations = relations(
+  playerSeasonStats,
+  ({ one }) => ({
+    team: one(teams, {
+      fields: [playerSeasonStats.teamId],
+      references: [teams.id],
+    }),
+  }),
+);
+
+// ─── team_season_statistics ────────────────────────────────────────────
+//
+// Cache of API-Football `/teams/statistics?team=&league=&season=` — a single
+// call per (team, league, season) that returns a rich season profile:
+// home/away W/D/L splits, goals scored & conceded BY MINUTE INTERVAL, over/under
+// distributions, clean sheets, failed-to-score, biggest streaks, penalties,
+// formations used, and cards by minute. Refreshed lazily by
+// FootballService.getTeamSeasonStatistics. Promoted columns cover the common
+// reads; the full nested blobs (by-minute, formations, cards) live in JSONB.
+export const teamSeasonStatistics = pgTable(
+  'team_season_statistics',
+  {
+    id: serial('id').primaryKey(),
+    teamId: integer('team_id')
+      .notNull()
+      .references(() => teams.id),
+    leagueId: integer('league_id').notNull(),
+    season: integer('season').notNull(),
+    formString: varchar('form_string', { length: 80 }),
+    // Fixtures played / record split
+    playedHome: integer('played_home'),
+    playedAway: integer('played_away'),
+    playedTotal: integer('played_total'),
+    winsHome: integer('wins_home'),
+    winsAway: integer('wins_away'),
+    winsTotal: integer('wins_total'),
+    drawsHome: integer('draws_home'),
+    drawsAway: integer('draws_away'),
+    drawsTotal: integer('draws_total'),
+    lossesHome: integer('losses_home'),
+    lossesAway: integer('losses_away'),
+    lossesTotal: integer('losses_total'),
+    // Goals for / against (totals + averages)
+    goalsForHome: integer('goals_for_home'),
+    goalsForAway: integer('goals_for_away'),
+    goalsForTotal: integer('goals_for_total'),
+    goalsAgainstHome: integer('goals_against_home'),
+    goalsAgainstAway: integer('goals_against_away'),
+    goalsAgainstTotal: integer('goals_against_total'),
+    goalsForAvgHome: numeric('goals_for_avg_home', { precision: 5, scale: 2 }),
+    goalsForAvgAway: numeric('goals_for_avg_away', { precision: 5, scale: 2 }),
+    goalsForAvgTotal: numeric('goals_for_avg_total', { precision: 5, scale: 2 }),
+    goalsAgainstAvgHome: numeric('goals_against_avg_home', {
+      precision: 5,
+      scale: 2,
+    }),
+    goalsAgainstAvgAway: numeric('goals_against_avg_away', {
+      precision: 5,
+      scale: 2,
+    }),
+    goalsAgainstAvgTotal: numeric('goals_against_avg_total', {
+      precision: 5,
+      scale: 2,
+    }),
+    // Clean sheets / failed to score
+    cleanSheetHome: integer('clean_sheet_home'),
+    cleanSheetAway: integer('clean_sheet_away'),
+    cleanSheetTotal: integer('clean_sheet_total'),
+    failedToScoreHome: integer('failed_to_score_home'),
+    failedToScoreAway: integer('failed_to_score_away'),
+    failedToScoreTotal: integer('failed_to_score_total'),
+    // Biggest streaks
+    streakWins: integer('streak_wins'),
+    streakDraws: integer('streak_draws'),
+    streakLoses: integer('streak_loses'),
+    // Penalties
+    penaltyScored: integer('penalty_scored'),
+    penaltyMissed: integer('penalty_missed'),
+    penaltyTotal: integer('penalty_total'),
+    // Nested blobs from the API response
+    goalsForByMinute: jsonb('goals_for_by_minute'),
+    goalsAgainstByMinute: jsonb('goals_against_by_minute'),
+    goalsForUnderOver: jsonb('goals_for_under_over'),
+    goalsAgainstUnderOver: jsonb('goals_against_under_over'),
+    cardsYellowByMinute: jsonb('cards_yellow_by_minute'),
+    cardsRedByMinute: jsonb('cards_red_by_minute'),
+    biggest: jsonb('biggest'),
+    lineupsUsed: jsonb('lineups_used'),
+    rawData: jsonb('raw_data'),
+    fetchedAt: timestamp('fetched_at').defaultNow(),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+  },
+  (table) => [
+    index('idx_team_season_stats_team_league_season').on(
+      table.teamId,
+      table.leagueId,
+      table.season,
+    ),
+    uniqueIndex('uq_team_season_stats_team_league_season').on(
+      table.teamId,
+      table.leagueId,
+      table.season,
+    ),
+  ],
+);
+
+export const teamSeasonStatisticsRelations = relations(
+  teamSeasonStatistics,
+  ({ one }) => ({
+    team: one(teams, {
+      fields: [teamSeasonStatistics.teamId],
+      references: [teams.id],
+    }),
+  }),
+);

@@ -34,6 +34,17 @@ import { SmartMoneySignalService } from '../polymarket/services/smart-money-sign
 import { CopyTraderService } from '../polymarket/services/copy-trader.service';
 import { PredictionMemoryService } from '../agents/prediction-memory.service';
 import { LeaguePriorsService } from '../agents/league-priors.service';
+import { VenueContextService } from '../agents/venue-context.service';
+import { IsotonicCalibrationService } from '../agents/isotonic-calibration.service';
+import { DirichletCalibrationService } from '../agents/dirichlet-calibration.service';
+import { FormBasedNudgeService } from '../agents/form-based-nudge.service';
+import { ClosingLineService } from '../agents/closing-line.service';
+import { PiRatingService } from '../agents/pi-rating.service';
+import { MetaBlenderService } from '../agents/meta-blender.service';
+import { LineupRestFeaturesService } from '../agents/lineup-rest-features.service';
+import { MatchInsightsService } from '../agents/match-insights.service';
+import { MarketAnalysisService } from '../agents/market-analysis.service';
+import { MatchContextService } from '../agents/match-context.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
@@ -113,6 +124,11 @@ export interface Services {
   polymarketDataService: PolymarketDataService;
   smartMoneySignalService: SmartMoneySignalService;
   copyTraderService: CopyTraderService;
+  isotonicCalibrationService: IsotonicCalibrationService;
+  dirichletCalibrationService: DirichletCalibrationService;
+  piRatingService: PiRatingService;
+  metaBlenderService: MetaBlenderService;
+  lineupRestFeaturesService: LineupRestFeaturesService;
 }
 
 /**
@@ -143,6 +159,20 @@ export function initServices(): Services {
 
   const predictionMemory = new PredictionMemoryService(config);
   const leaguePriorsService = new LeaguePriorsService(db as any);
+  const venueContextService = new VenueContextService(db as any);
+  const isotonicCalibrationService = new IsotonicCalibrationService(db as any);
+  const dirichletCalibrationService = new DirichletCalibrationService(db as any);
+  const formBasedNudgeService = new FormBasedNudgeService();
+  const closingLineService = new ClosingLineService(db as any);
+  const piRatingService = new PiRatingService(db as any);
+  const metaBlenderService = new MetaBlenderService(db as any);
+  const lineupRestFeaturesService = new LineupRestFeaturesService(db as any);
+  const matchInsightsService = new MatchInsightsService(
+    db as any,
+    footballService,
+  );
+  const marketAnalysisService = new MarketAnalysisService();
+  const matchContextService = new MatchContextService(db as any);
 
   // Build Polymarket services up front so AgentsService can take
   // PolymarketService as a dependency (used for on-demand fixture linking
@@ -187,8 +217,19 @@ export function initServices(): Services {
     alertsService,
     predictionMemory,
     leaguePriorsService,
+    venueContextService,
+    isotonicCalibrationService,
+    dirichletCalibrationService,
+    formBasedNudgeService,
+    closingLineService,
+    piRatingService,
+    metaBlenderService,
+    lineupRestFeaturesService,
     smartMoneySignalService,
     polymarketService,
+    matchInsightsService,
+    marketAnalysisService,
+    matchContextService,
   );
 
   const syncService = new SyncService(
@@ -218,5 +259,10 @@ export function initServices(): Services {
     polymarketDataService,
     smartMoneySignalService,
     copyTraderService,
+    isotonicCalibrationService,
+    dirichletCalibrationService,
+    piRatingService,
+    metaBlenderService,
+    lineupRestFeaturesService,
   };
 }
