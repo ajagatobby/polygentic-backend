@@ -700,18 +700,38 @@ export class FootballService {
    * One cheap call per team. Per-match stats (xG/possession) are NOT fetched
    * here (that would be one call per game); they continue to come from the DB.
    */
-  async getTeamRecentFixtures(teamId: number, last = 40): Promise<number> {
+  async getTeamRecentFixtures(
+    teamId: number,
+    last = 40,
+    backfillStatsCount = 8,
+  ): Promise<number> {
     try {
       const data = await this.apiRequest<any>('/fixtures', {
         team: String(teamId),
         last: String(Math.min(Math.max(1, last), 99)),
       });
+      const resp: any[] = data.response ?? [];
       let n = 0;
-      for (const item of data.response ?? []) {
+      const finished: Array<{ id: number; date: string }> = [];
+      for (const item of resp) {
         await this.upsertFixture(item);
         n++;
+        const short = item.fixture?.status?.short;
+        if (['FT', 'AET', 'PEN'].includes(short) && item.fixture?.id) {
+          finished.push({ id: item.fixture.id, date: item.fixture.date });
+        }
       }
       this.logger.debug(`Freshened ${n} recent fixtures for team ${teamId}`);
+
+      // Backfill per-match stats + formations for the most recent finished
+      // games (immutable once played → fetched once, then cached forever).
+      if (backfillStatsCount > 0 && finished.length) {
+        const recentIds = finished
+          .sort((a, b) => (a.date < b.date ? 1 : -1))
+          .slice(0, backfillStatsCount)
+          .map((f) => f.id);
+        await this.backfillFixtureStatsAndLineups(recentIds);
+      }
       return n;
     } catch (error: any) {
       this.logger.warn(
@@ -719,6 +739,43 @@ export class FootballService {
       );
       return 0;
     }
+  }
+
+  /**
+   * Backfill per-match statistics (xG, shots, possession) and lineups
+   * (formations) for finished fixtures that don't already have them. Stats are
+   * immutable once a game ends, so we only fetch each fixture once — the
+   * `existing` check makes this cheap in steady state (only newly-played games
+   * incur a fetch).
+   */
+  async backfillFixtureStatsAndLineups(fixtureIds: number[]): Promise<number> {
+    if (!fixtureIds.length) return 0;
+    const existing = await this.db
+      .select({ fixtureId: schema.fixtureStatistics.fixtureId })
+      .from(schema.fixtureStatistics)
+      .where(inArray(schema.fixtureStatistics.fixtureId, fixtureIds));
+    const have = new Set<number>(existing.map((r: any) => r.fixtureId));
+    const missing = fixtureIds.filter((id) => !have.has(id));
+    if (!missing.length) return 0;
+
+    let done = 0;
+    for (const id of missing) {
+      try {
+        await this.fetchFixtureStatistics(id);
+        await this.fetchAndPersistLineups(id);
+        done++;
+      } catch (error: any) {
+        this.logger.debug(
+          `Backfill stats/lineups for fixture ${id} failed: ${error.message}`,
+        );
+      }
+    }
+    if (done > 0) {
+      this.logger.debug(
+        `Backfilled stats + lineups for ${done} finished fixture(s)`,
+      );
+    }
+    return done;
   }
 
   /**
