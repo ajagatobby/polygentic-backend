@@ -1,7 +1,18 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { eq, and, gte, lte, sql, desc, asc, inArray } from 'drizzle-orm';
+import {
+  eq,
+  and,
+  gte,
+  lte,
+  lt,
+  sql,
+  desc,
+  asc,
+  inArray,
+  notInArray,
+} from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { FixtureQueryDto, MATCH_STATE_STATUSES } from './dto/fixture-query.dto';
 
@@ -660,6 +671,87 @@ export class FootballService {
       `Completed fixtures sync done — ${totalUpserted} fixtures upserted`,
     );
     return totalUpserted;
+  }
+
+  /**
+   * Terminal fixture statuses — a fixture in one of these is done and never
+   * needs re-fetching. Everything else past its kickoff is a straggler.
+   * FT/AET/PEN = finished; PST/CANC/ABD/AWD/WO = not-played outcomes.
+   */
+  static readonly TERMINAL_STATUSES = [
+    'FT',
+    'AET',
+    'PEN',
+    'PST',
+    'CANC',
+    'ABD',
+    'AWD',
+    'WO',
+  ];
+
+  /**
+   * Fetch specific fixtures by API-Football fixture ID and upsert them.
+   * API-Football accepts up to 20 ids per `/fixtures?ids=a-b-c` request.
+   */
+  async syncFixturesByIds(fixtureIds: number[]): Promise<number> {
+    if (!fixtureIds.length) return 0;
+    let upserted = 0;
+    const BATCH = 20;
+    for (let i = 0; i < fixtureIds.length; i += BATCH) {
+      const batch = fixtureIds.slice(i, i + BATCH);
+      try {
+        const data = await this.apiRequest<any>('/fixtures', {
+          ids: batch.join('-'),
+        });
+        for (const item of data.response ?? []) {
+          await this.upsertFixture(item);
+          upserted++;
+        }
+      } catch (error: any) {
+        this.logger.warn(
+          `syncFixturesByIds batch [${batch[0]}…] failed: ${error.message}`,
+        );
+      }
+    }
+    return upserted;
+  }
+
+  /**
+   * Reconcile "stale" fixtures: any fixture whose kickoff is in the past but
+   * whose status is still non-terminal (NS, 1H, HT, 2H, etc.). These are games
+   * that were played but never resolved — typically because they were missed
+   * inside syncCompletedFixtures' fixed 2-day window. Re-fetches them by ID so
+   * form windows, standings and prediction resolution stay current regardless
+   * of how long ago the game was.
+   *
+   * @param maxAgeHours only reconcile fixtures older than this (default 3h, so
+   *   we don't fight with the live in-play sync).
+   * @param limit cap per run to bound API usage (default 300 = 15 batches).
+   */
+  async resolveStaleFixtures(maxAgeHours = 3, limit = 300): Promise<number> {
+    const cutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000);
+    const stale = await this.db
+      .select({ id: schema.fixtures.id })
+      .from(schema.fixtures)
+      .where(
+        and(
+          lt(schema.fixtures.date, cutoff),
+          notInArray(
+            schema.fixtures.status,
+            FootballService.TERMINAL_STATUSES,
+          ),
+        ),
+      )
+      .orderBy(desc(schema.fixtures.date))
+      .limit(limit);
+
+    if (!stale.length) return 0;
+    this.logger.log(
+      `Reconciling ${stale.length} stale (past-dated, non-final) fixture(s)`,
+    );
+    const upserted = await this.syncFixturesByIds(stale.map((f: any) => f.id));
+    this.logger.log(`Stale-fixture reconciliation upserted ${upserted}`);
+    return upserted;
   }
 
   /**

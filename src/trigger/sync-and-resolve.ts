@@ -24,9 +24,10 @@ export const syncCompletedFixturesAndResolveTask = task({
     factor: 2,
   },
   run: async () => {
-    const { syncService, agentsService, polymarketService } = initServices();
+    const { syncService, agentsService, polymarketService, footballService } =
+      initServices();
 
-    // Step 1: Sync completed fixtures
+    // Step 1: Sync completed fixtures (last 2 days)
     logger.info('Step 1: Syncing completed fixtures...');
     let fixturesSynced = 0;
     try {
@@ -34,6 +35,20 @@ export const syncCompletedFixturesAndResolveTask = task({
       logger.info('Completed fixtures sync finished');
     } catch (error) {
       logger.error('Completed fixtures sync failed, proceeding to resolve', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Step 1b: Reconcile stragglers — any past-dated fixture still in a
+    // non-final status (missed by the 2-day window above). Without this, a
+    // single missed sync leaves a game stuck on NS forever, which silently
+    // staleifies form windows, standings, and prediction resolution.
+    logger.info('Step 1b: Reconciling stale (unresolved) fixtures...');
+    try {
+      const reconciled = await footballService.resolveStaleFixtures();
+      logger.info(`Stale-fixture reconciliation upserted ${reconciled}`);
+    } catch (error) {
+      logger.error('Stale-fixture reconciliation failed', {
         error: error instanceof Error ? error.message : String(error),
       });
     }
