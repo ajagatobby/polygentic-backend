@@ -14,6 +14,8 @@ export interface H2HMatch {
   awayTeamId: number | null;
   homeTeamName: string | null;
   awayTeamName: string | null;
+  homeTeamLogo: string | null;
+  awayTeamLogo: string | null;
   homeGoals: number | null;
   awayGoals: number | null;
   /** Readable scoreline, e.g. "PSG 2 - 0 Chelsea". */
@@ -60,6 +62,7 @@ export interface RecentMatch {
   venue: 'home' | 'away';
   opponentId: number | null;
   opponentName: string | null;
+  opponentLogo: string | null;
   goalsFor: number;
   goalsAgainst: number;
   /** Readable scoreline from this team's perspective, e.g. "PSG 3 - 1 Lyon (W)". */
@@ -83,6 +86,7 @@ export interface TeamStreak {
 export interface TeamRecentForm {
   teamId: number;
   teamName: string | null;
+  teamLogo: string | null;
   played: number;
   wins: number;
   draws: number;
@@ -100,6 +104,8 @@ export interface PlayerInsight {
   name: string | null;
   number: number | null;
   position: string | null;
+  /** Player headshot URL (from API-Football), null when unavailable. */
+  photo: string | null;
   /** "starting" | "bench" | "squad" — squad = not in the named lineup (or lineup unavailable). */
   role: 'starting' | 'bench' | 'squad';
   available: boolean;
@@ -122,6 +128,7 @@ export interface PlayerInsight {
 export interface TeamPlayerBreakdown {
   teamId: number;
   teamName: string | null;
+  teamLogo: string | null;
   formation: string | null;
   coach: string | null;
   lineupConfirmed: boolean;
@@ -161,6 +168,7 @@ export interface GoalTimingProfile {
 export interface TeamStatProfile {
   teamId: number;
   teamName: string | null;
+  teamLogo: string | null;
   formString: string | null;
   overall: VenueRecord;
   home: VenueRecord;
@@ -289,6 +297,8 @@ export class MatchInsightsService {
     const awayTeamId: number = fixture.awayTeamId;
     const homeName = data.homeTeam?.team?.name ?? `Team ${homeTeamId}`;
     const awayName = data.awayTeam?.team?.name ?? `Team ${awayTeamId}`;
+    const homeLogo: string | null = data.homeTeam?.team?.logo ?? null;
+    const awayLogo: string | null = data.awayTeam?.team?.logo ?? null;
 
     const [
       headToHead,
@@ -302,12 +312,12 @@ export class MatchInsightsService {
       Promise.resolve(
         this.buildHeadToHead(data, homeTeamId, awayTeamId, homeName, awayName),
       ),
-      this.buildRecentForm(homeTeamId, fixture.id, homeName),
-      this.buildRecentForm(awayTeamId, fixture.id, awayName),
-      this.buildPlayerBreakdown(data, homeTeamId, homeName),
-      this.buildPlayerBreakdown(data, awayTeamId, awayName),
-      this.buildTeamProfile(data, homeTeamId, homeName, 'home'),
-      this.buildTeamProfile(data, awayTeamId, awayName, 'away'),
+      this.buildRecentForm(homeTeamId, fixture.id, homeName, homeLogo),
+      this.buildRecentForm(awayTeamId, fixture.id, awayName, awayLogo),
+      this.buildPlayerBreakdown(data, homeTeamId, homeName, homeLogo),
+      this.buildPlayerBreakdown(data, awayTeamId, awayName, awayLogo),
+      this.buildTeamProfile(data, homeTeamId, homeName, 'home', homeLogo),
+      this.buildTeamProfile(data, awayTeamId, awayName, 'away', awayLogo),
     ]);
 
     const signals = await this.buildSignals(
@@ -364,6 +374,8 @@ export class MatchInsightsService {
         const mAwayId = m.teams?.away?.id ?? null;
         const mHomeName = m.teams?.home?.name ?? null;
         const mAwayName = m.teams?.away?.name ?? null;
+        const mHomeLogo = m.teams?.home?.logo ?? null;
+        const mAwayLogo = m.teams?.away?.logo ?? null;
 
         let winnerTeamId: number | null = null;
         let winnerName: string | null = null;
@@ -392,6 +404,8 @@ export class MatchInsightsService {
           awayTeamId: mAwayId,
           homeTeamName: mHomeName,
           awayTeamName: mAwayName,
+          homeTeamLogo: mHomeLogo,
+          awayTeamLogo: mAwayLogo,
           homeGoals: hg,
           awayGoals: ag,
           scoreline: `${mHomeName ?? '?'} ${hg ?? '?'} - ${ag ?? '?'} ${mAwayName ?? '?'}`,
@@ -749,6 +763,7 @@ export class MatchInsightsService {
     teamId: number,
     teamName: string,
     side: 'home' | 'away',
+    teamLogo: string | null = null,
   ): Promise<TeamStatProfile | null> {
     try {
       const leagueId: number | null = data.fixture?.leagueId ?? null;
@@ -855,6 +870,7 @@ export class MatchInsightsService {
       return {
         teamId,
         teamName,
+        teamLogo,
         formString: s.formString ?? null,
         overall,
         home,
@@ -1001,6 +1017,7 @@ export class MatchInsightsService {
     teamId: number,
     currentFixtureId: number,
     teamName: string,
+    teamLogo: string | null = null,
   ): Promise<TeamRecentForm | null> {
     try {
       const fixtures = await this.db
@@ -1020,6 +1037,7 @@ export class MatchInsightsService {
         return {
           teamId,
           teamName,
+          teamLogo,
           played: 0,
           wins: 0,
           draws: 0,
@@ -1045,11 +1063,19 @@ export class MatchInsightsService {
         opponentIds.add(f.homeTeamId === teamId ? f.awayTeamId : f.homeTeamId);
       }
       const teamRows = await this.db
-        .select({ id: schema.teams.id, name: schema.teams.name })
+        .select({
+          id: schema.teams.id,
+          name: schema.teams.name,
+          logo: schema.teams.logo,
+        })
         .from(schema.teams)
         .where(inArray(schema.teams.id, [...opponentIds]));
       const nameById = new Map<number, string>();
-      for (const t of teamRows) nameById.set(t.id, t.name);
+      const logoById = new Map<number, string | null>();
+      for (const t of teamRows) {
+        nameById.set(t.id, t.name);
+        logoById.set(t.id, t.logo ?? null);
+      }
 
       let wins = 0;
       let draws = 0;
@@ -1084,6 +1110,7 @@ export class MatchInsightsService {
           venue: isHome ? 'home' : 'away',
           opponentId,
           opponentName,
+          opponentLogo: logoById.get(opponentId) ?? null,
           goalsFor: gf,
           goalsAgainst: ga,
           scoreline,
@@ -1097,6 +1124,7 @@ export class MatchInsightsService {
       return {
         teamId,
         teamName,
+        teamLogo,
         played,
         wins,
         draws,
@@ -1184,6 +1212,7 @@ export class MatchInsightsService {
     data: CollectedMatchData,
     teamId: number,
     teamName: string,
+    teamLogo: string | null = null,
   ): Promise<TeamPlayerBreakdown | null> {
     try {
       const season: number = data.fixture?.season ?? new Date().getFullYear();
@@ -1216,6 +1245,7 @@ export class MatchInsightsService {
       const breakdown: TeamPlayerBreakdown = {
         teamId,
         teamName,
+        teamLogo,
         formation: lineup?.formation ?? null,
         coach: lineup?.coach?.name ?? null,
         lineupConfirmed,
@@ -1243,6 +1273,7 @@ export class MatchInsightsService {
           name: p.name ?? stat?.name ?? null,
           number: p.number ?? null,
           position,
+          photo: stat?.photo ?? null,
           role,
           available: !reason,
           unavailableReason: reason || null,
@@ -1317,6 +1348,7 @@ export class MatchInsightsService {
           name: stat?.name ?? null,
           number: null,
           position: stat?.position ?? null,
+          photo: stat?.photo ?? null,
           role: 'squad',
           available: false,
           unavailableReason: reason,
