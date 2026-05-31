@@ -2683,6 +2683,14 @@ export class FootballService {
     // triggered with fresher data, so it supersedes older runs.
     const bestPrediction = predictions[0] ?? null;
 
+    // Backfill visual assets (club logos + player photos) into the stored
+    // matchInsights at read time. Logos/photos are static reference data, so
+    // enriching here means every prediction — including ones generated before
+    // assets were added — returns them without needing regeneration.
+    if (bestPrediction?.matchInsights) {
+      await this.enrichInsightsAssets(bestPrediction.matchInsights);
+    }
+
     return {
       fixture: {
         id: fixture.id,
@@ -2807,6 +2815,114 @@ export class FootballService {
         awayName: awayTeam?.name ?? null,
       }),
     };
+  }
+
+  /**
+   * Backfill club logos and player photos into a stored matchInsights blob.
+   * Mutates the blob in place. Logos/photos are static reference data, so this
+   * lets predictions generated before assets were added still return them.
+   * Two batched lookups: teams (for all referenced team ids) and
+   * player_season_stats (for all referenced player ids).
+   */
+  private async enrichInsightsAssets(insights: any): Promise<void> {
+    try {
+      const teamIds = new Set<number>();
+      const playerIds = new Set<number>();
+
+      const addTeam = (id: any) => {
+        if (typeof id === 'number') teamIds.add(id);
+      };
+
+      // Recent form: team + opponents
+      for (const side of ['home', 'away']) {
+        const rf = insights?.recentForm?.[side];
+        if (rf) {
+          addTeam(rf.teamId);
+          for (const m of rf.matches ?? []) addTeam(m.opponentId);
+        }
+        const tp = insights?.teamProfiles?.[side];
+        if (tp) addTeam(tp.teamId);
+        const pb = insights?.players?.[side];
+        if (pb) {
+          addTeam(pb.teamId);
+          for (const group of [
+            'goalkeepers',
+            'defenders',
+            'midfielders',
+            'forwards',
+            'unavailable',
+          ]) {
+            for (const p of pb[group] ?? [])
+              if (typeof p.playerId === 'number') playerIds.add(p.playerId);
+          }
+        }
+      }
+      // H2H meetings
+      for (const m of insights?.headToHead?.matches ?? []) {
+        addTeam(m.homeTeamId);
+        addTeam(m.awayTeamId);
+      }
+
+      const [teamRows, playerRows] = await Promise.all([
+        teamIds.size > 0
+          ? this.db
+              .select({ id: schema.teams.id, logo: schema.teams.logo })
+              .from(schema.teams)
+              .where(inArray(schema.teams.id, [...teamIds]))
+          : Promise.resolve([]),
+        playerIds.size > 0
+          ? this.db
+              .select({
+                playerId: schema.playerSeasonStats.playerId,
+                photo: schema.playerSeasonStats.photo,
+              })
+              .from(schema.playerSeasonStats)
+              .where(inArray(schema.playerSeasonStats.playerId, [...playerIds]))
+          : Promise.resolve([]),
+      ]);
+
+      const logoById = new Map<number, string | null>();
+      for (const t of teamRows) logoById.set(t.id, t.logo ?? null);
+      const photoById = new Map<number, string | null>();
+      for (const p of playerRows)
+        if (p.photo && !photoById.has(p.playerId))
+          photoById.set(p.playerId, p.photo);
+
+      const teamLogo = (id: any) =>
+        typeof id === 'number' ? (logoById.get(id) ?? null) : null;
+
+      for (const side of ['home', 'away']) {
+        const rf = insights?.recentForm?.[side];
+        if (rf) {
+          if (rf.teamLogo == null) rf.teamLogo = teamLogo(rf.teamId);
+          for (const m of rf.matches ?? [])
+            if (m.opponentLogo == null) m.opponentLogo = teamLogo(m.opponentId);
+        }
+        const tp = insights?.teamProfiles?.[side];
+        if (tp && tp.teamLogo == null) tp.teamLogo = teamLogo(tp.teamId);
+        const pb = insights?.players?.[side];
+        if (pb) {
+          if (pb.teamLogo == null) pb.teamLogo = teamLogo(pb.teamId);
+          for (const group of [
+            'goalkeepers',
+            'defenders',
+            'midfielders',
+            'forwards',
+            'unavailable',
+          ]) {
+            for (const p of pb[group] ?? [])
+              if (p.photo == null && typeof p.playerId === 'number')
+                p.photo = photoById.get(p.playerId) ?? null;
+          }
+        }
+      }
+      for (const m of insights?.headToHead?.matches ?? []) {
+        if (m.homeTeamLogo == null) m.homeTeamLogo = teamLogo(m.homeTeamId);
+        if (m.awayTeamLogo == null) m.awayTeamLogo = teamLogo(m.awayTeamId);
+      }
+    } catch (error: any) {
+      this.logger.debug(`Insights asset enrichment failed: ${error.message}`);
+    }
   }
 
   /**
