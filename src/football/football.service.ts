@@ -3187,6 +3187,160 @@ export class FootballService {
     return data.response ?? [];
   }
 
+  // ─── Live match stats (realtime) ────────────────────────────────────────
+
+  private static readonly LIVE_STATUSES = [
+    '1H',
+    'HT',
+    '2H',
+    'ET',
+    'BT',
+    'P',
+    'LIVE',
+    'INT',
+    'SUSP',
+  ];
+  /** Short server-side cache so many concurrent viewers share one upstream poll. */
+  private liveStatsCache = new Map<number, { data: any; expiresAt: number }>();
+  private static readonly LIVE_CACHE_TTL_MS = 12_000;
+
+  /**
+   * Realtime in-play stats for a fixture: current score, elapsed, per-team
+   * statistics (shots on target, total shots, possession, xG, corners, cards…),
+   * formations, and events — fetched fresh from API-Football. Intended to be
+   * polled by the client while a match is in play. Cached ~12s so a burst of
+   * viewers triggers only one upstream call per fixture.
+   */
+  async getLiveMatchStats(fixtureId: number): Promise<any> {
+    const cached = this.liveStatsCache.get(fixtureId);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+
+    // Current fixture state (score, status, elapsed, teams, league).
+    const fxData = await this.apiRequest<any>('/fixtures', {
+      id: String(fixtureId),
+    });
+    const fx = fxData.response?.[0];
+    if (!fx) {
+      const empty = { fixtureId, found: false, isLive: false };
+      this.liveStatsCache.set(fixtureId, {
+        data: empty,
+        expiresAt: Date.now() + FootballService.LIVE_CACHE_TTL_MS,
+      });
+      return empty;
+    }
+
+    const short = fx.fixture?.status?.short ?? null;
+    const isLive = FootballService.LIVE_STATUSES.includes(short);
+    const isFinished = ['FT', 'AET', 'PEN'].includes(short);
+
+    // Stats / lineups / events only exist once a match is under way.
+    let statsResp: any[] = [];
+    let lineupsResp: any[] = [];
+    let eventsResp: any[] = [];
+    if (isLive || isFinished) {
+      const [s, l, e] = await Promise.all([
+        this.apiRequest<any>('/fixtures/statistics', {
+          fixture: String(fixtureId),
+        })
+          .then((d) => d.response ?? [])
+          .catch(() => []),
+        this.apiRequest<any>('/fixtures/lineups', {
+          fixture: String(fixtureId),
+        })
+          .then((d) => d.response ?? [])
+          .catch(() => []),
+        this.apiRequest<any>('/fixtures/events', {
+          fixture: String(fixtureId),
+        })
+          .then((d) => d.response ?? [])
+          .catch(() => []),
+      ]);
+      statsResp = s;
+      lineupsResp = l;
+      eventsResp = e;
+    }
+
+    const statsByTeam = new Map<number, any>();
+    for (const ts of statsResp) {
+      const map: Record<string, any> = {};
+      for (const st of ts.statistics ?? []) map[st.type] = st.value;
+      statsByTeam.set(ts.team?.id, {
+        shotsOnTarget: this.parseStatInt(map['Shots on Goal']),
+        totalShots: this.parseStatInt(map['Total Shots']),
+        shotsInsideBox: this.parseStatInt(map['Shots insidebox']),
+        blockedShots: this.parseStatInt(map['Blocked Shots']),
+        possession: this.parseStatPercentStr(map['Ball Possession']),
+        expectedGoals: this.parseStatFloatStr(map['expected_goals']),
+        cornerKicks: this.parseStatInt(map['Corner Kicks']),
+        offsides: this.parseStatInt(map['Offsides']),
+        fouls: this.parseStatInt(map['Fouls']),
+        yellowCards: this.parseStatInt(map['Yellow Cards']),
+        redCards: this.parseStatInt(map['Red Cards']),
+        goalkeeperSaves: this.parseStatInt(map['Goalkeeper Saves']),
+        totalPasses: this.parseStatInt(map['Total passes']),
+        passesAccurate: this.parseStatInt(map['Passes accurate']),
+        passAccuracy: this.parseStatPercentStr(map['Passes %']),
+      });
+    }
+
+    const formationByTeam = new Map<number, string | null>();
+    for (const l of lineupsResp)
+      formationByTeam.set(l.team?.id, l.formation ?? null);
+
+    const home = fx.teams?.home;
+    const away = fx.teams?.away;
+    const buildSide = (t: any) => ({
+      teamId: t?.id ?? null,
+      name: t?.name ?? null,
+      logo: t?.logo ?? null,
+      formation: t?.id != null ? (formationByTeam.get(t.id) ?? null) : null,
+      stats: (t?.id != null && statsByTeam.get(t.id)) || null,
+    });
+
+    const events = (eventsResp ?? []).map((ev: any) => ({
+      minute: ev.time?.elapsed ?? null,
+      extra: ev.time?.extra ?? null,
+      teamId: ev.team?.id ?? null,
+      teamName: ev.team?.name ?? null,
+      type: ev.type ?? null,
+      detail: ev.detail ?? null,
+      player: ev.player?.name ?? null,
+      assist: ev.assist?.name ?? null,
+    }));
+
+    const result = {
+      fixtureId,
+      found: true,
+      isLive,
+      isFinished,
+      status: {
+        short,
+        long: fx.fixture?.status?.long ?? null,
+        elapsed: fx.fixture?.status?.elapsed ?? null,
+      },
+      league: {
+        id: fx.league?.id ?? null,
+        name: fx.league?.name ?? null,
+        round: fx.league?.round ?? null,
+      },
+      score: {
+        home: fx.goals?.home ?? null,
+        away: fx.goals?.away ?? null,
+        halftime: fx.score?.halftime ?? null,
+      },
+      home: buildSide(home),
+      away: buildSide(away),
+      events,
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.liveStatsCache.set(fixtureId, {
+      data: result,
+      expiresAt: Date.now() + FootballService.LIVE_CACHE_TTL_MS,
+    });
+    return result;
+  }
+
   /**
    * Get team info from the database, including form data.
    */
