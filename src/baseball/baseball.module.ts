@@ -11,6 +11,8 @@ import { BaseballResearchAgent } from './agents/baseball-research.agent';
 import { BaseballAnalysisAgent } from './agents/baseball-analysis.agent';
 import { BaseballCriticAgent } from './agents/baseball-critic.agent';
 import { BaseballPredictionService } from './baseball-prediction.service';
+import { BaseballBlenderService } from './baseball-blender.service';
+import { BaseballCalibrationService } from './baseball-calibration.service';
 import { BaseballController } from './baseball.controller';
 
 /**
@@ -34,6 +36,8 @@ import { BaseballController } from './baseball.controller';
     BaseballAnalysisAgent,
     BaseballCriticAgent,
     BaseballPredictionService,
+    BaseballBlenderService,
+    BaseballCalibrationService,
   ],
   exports: [
     BaseballTeamMapService,
@@ -47,6 +51,8 @@ import { BaseballController } from './baseball.controller';
     BaseballAnalysisAgent,
     BaseballCriticAgent,
     BaseballPredictionService,
+    BaseballBlenderService,
+    BaseballCalibrationService,
   ],
 })
 export class BaseballModule {}

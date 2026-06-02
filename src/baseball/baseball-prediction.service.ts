@@ -18,6 +18,8 @@ import {
 import { BaseballResearchAgent } from './agents/baseball-research.agent';
 import { BaseballAnalysisAgent } from './agents/baseball-analysis.agent';
 import { BaseballCriticAgent } from './agents/baseball-critic.agent';
+import { BaseballBlenderService } from './baseball-blender.service';
+import { BaseballCalibrationService } from './baseball-calibration.service';
 
 export const BASEBALL_MODEL_VERSION = 'mlb-totals-v1';
 
@@ -54,6 +56,8 @@ export class BaseballPredictionService {
     private readonly research: BaseballResearchAgent,
     private readonly analysis: BaseballAnalysisAgent,
     private readonly critic: BaseballCriticAgent,
+    private readonly blender: BaseballBlenderService,
+    private readonly calibration: BaseballCalibrationService,
   ) {}
 
   /** Generate (or refresh) the over/under prediction for one game. */
@@ -121,10 +125,14 @@ export class BaseballPredictionService {
       ? lineProbsFromTotal(marketTotal.totalLine)
       : null;
 
-    // 8. Blend per line (market-anchored fixed weights for v1).
-    const blended = this.blend(model.lineProbs, agentLineProbs, marketLineProbs);
+    // 8. Blend per line (learned log-pool; market-anchored fallback).
+    const blended = await this.blend(
+      model.lineProbs,
+      agentLineProbs,
+      marketLineProbs,
+    );
 
-    // 9. Calibrate (identity until Phase 3 fits calibrators).
+    // 9. Calibrate each line's blended P(over) (identity until fitted).
     const calibrated = await this.calibrate(blended);
 
     // 10. Primary line = market line if present, else nearest to expected.
@@ -338,33 +346,26 @@ export class BaseballPredictionService {
     return { ...game, ...patch };
   }
 
-  /** Linear-pool blend per line. Market-anchored when a sharp total exists. */
-  private blend(
+  /** Log-pool blend per line via the learned blender (fixed fallback). */
+  private async blend(
     model: LineProb[],
     agent: LineProb[],
     market: LineProb[] | null,
-  ): BlendedLine[] {
+  ): Promise<BlendedLine[]> {
     const byLine = (arr: LineProb[]) => new Map(arr.map((l) => [l.line, l]));
     const mModel = byLine(model);
     const mAgent = byLine(agent);
     const mMarket = market ? byLine(market) : null;
 
     const lines = [...mModel.keys()].sort((a, b) => a - b);
-    const w = mMarket
-      ? { model: 0.3, agent: 0.2, market: 0.5 }
-      : { model: 0.6, agent: 0.4, market: 0 };
-
-    return lines.map((line) => {
+    const out: BlendedLine[] = [];
+    for (const line of lines) {
       const pm = mModel.get(line)!;
       const pa = mAgent.get(line)?.pOver ?? pm.pOver;
       const pk = mMarket?.get(line)?.pOver ?? null;
-      // When the market line is missing, renormalize over model+agent only.
-      const pOver =
-        pk == null
-          ? clampProb((w.model * pm.pOver + w.agent * pa) / (w.model + w.agent))
-          : clampProb(w.model * pm.pOver + w.agent * pa + w.market * pk);
+      const pOver = await this.blender.blend(pm.pOver, pa, pk);
       const push = pm.push;
-      return {
+      out.push({
         line,
         pOver,
         pUnder: clampProb(1 - pOver - push),
@@ -372,13 +373,23 @@ export class BaseballPredictionService {
         model: pm.pOver,
         agent: pa,
         market: pk,
-      };
-    });
+      });
+    }
+    return out;
   }
 
-  /** Calibration hook — identity until Phase 3 fits binary calibrators. */
+  /** Binary isotonic calibration per line (identity until fitted). */
   private async calibrate(blended: BlendedLine[]): Promise<BlendedLine[]> {
-    return blended;
+    const out: BlendedLine[] = [];
+    for (const l of blended) {
+      const cal = await this.calibration.apply(l.pOver, l.line);
+      out.push({
+        ...l,
+        pOver: cal,
+        pUnder: clampProb(1 - cal - l.push),
+      });
+    }
+    return out;
   }
 
   private pickPrimary(

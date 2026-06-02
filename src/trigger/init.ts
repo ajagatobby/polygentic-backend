@@ -57,6 +57,8 @@ import { BaseballResearchAgent } from '../baseball/agents/baseball-research.agen
 import { BaseballAnalysisAgent } from '../baseball/agents/baseball-analysis.agent';
 import { BaseballCriticAgent } from '../baseball/agents/baseball-critic.agent';
 import { BaseballPredictionService } from '../baseball/baseball-prediction.service';
+import { BaseballBlenderService } from '../baseball/baseball-blender.service';
+import { BaseballCalibrationService } from '../baseball/baseball-calibration.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
 const postgres =
@@ -148,6 +150,8 @@ export interface Services {
   baseballMarketService: BaseballMarketService;
   baseballRunModel: BaseballRunModelService;
   baseballPredictionService: BaseballPredictionService;
+  baseballBlenderService: BaseballBlenderService;
+  baseballCalibrationService: BaseballCalibrationService;
 }
 
 /**
@@ -286,6 +290,8 @@ export function initServices(): Services {
   const baseballResearchAgent = new BaseballResearchAgent(config);
   const baseballAnalysisAgent = new BaseballAnalysisAgent(config);
   const baseballCriticAgent = new BaseballCriticAgent(config);
+  const baseballBlenderService = new BaseballBlenderService(db as any);
+  const baseballCalibrationService = new BaseballCalibrationService(db as any);
   const baseballPredictionService = new BaseballPredictionService(
     db as any,
     baseballService,
@@ -297,6 +303,8 @@ export function initServices(): Services {
     baseballResearchAgent,
     baseballAnalysisAgent,
     baseballCriticAgent,
+    baseballBlenderService,
+    baseballCalibrationService,
   );
 
   return {
@@ -331,5 +339,7 @@ export function initServices(): Services {
     baseballMarketService,
     baseballRunModel,
     baseballPredictionService,
+    baseballBlenderService,
+    baseballCalibrationService,
   };
 }

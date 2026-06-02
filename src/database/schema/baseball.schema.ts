@@ -252,6 +252,26 @@ export const baseballPredictions = pgTable(
   ],
 );
 
+// ─── baseball_model_params ─────────────────────────────────────────────
+// Learned parameters for binary calibration (PAV isotonic) and the
+// over/under meta-blender. `kind` distinguishes them; `key` is the
+// line-bucket (calibration) or 'global' (blender).
+
+export const baseballModelParams = pgTable(
+  'baseball_model_params',
+  {
+    id: serial('id').primaryKey(),
+    kind: varchar('kind', { length: 20 }).notNull(), // 'calibration' | 'blender'
+    key: varchar('key', { length: 40 }).notNull(), // line bucket or 'global'
+    params: jsonb('params').notNull(), // breakpoints[] or {weights,bias,order}
+    sampleSize: integer('sample_size').notNull().default(0),
+    fittedAt: timestamp('fitted_at').defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('uq_baseball_model_params_kind_key').on(table.kind, table.key),
+  ],
+);
+
 // ─── RELATIONS ─────────────────────────────────────────────────────────
 
 export const baseballTeamsRelations = relations(baseballTeams, ({ many }) => ({

@@ -48,6 +48,19 @@ export const baseballPreGameRefreshTask = task({
   },
 });
 
+/** Weekly: refit binary calibration + over/under meta-blender. */
+export const baseballRefitModelsTask = task({
+  id: 'baseball-refit-models',
+  retry: { maxAttempts: 1 },
+  run: async () => {
+    const s = initServices();
+    const calibration = await s.baseballCalibrationService.refit();
+    const blender = await s.baseballBlenderService.refit();
+    logger.info('baseball-refit-models complete', { calibration, blender });
+    return { calibration, blender };
+  },
+});
+
 /** Resolve completed/void MLB predictions and score Brier. */
 export const baseballResolvePredictionsTask = task({
   id: 'baseball-resolve-predictions',

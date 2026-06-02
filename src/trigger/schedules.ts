@@ -33,6 +33,7 @@ import {
   baseballGeneratePredictionsTask,
   baseballPreGameRefreshTask,
   baseballResolvePredictionsTask,
+  baseballRefitModelsTask,
 } from './baseball-predictions';
 
 /**
@@ -452,5 +453,15 @@ export const baseballResolveSchedule = schedules.task({
       undefined as void,
     );
     logger.info('Triggered baseball resolve', { runId: handle.id });
+  },
+});
+
+/** Weekly Tuesdays 05:00 UTC: refit MLB calibration + over/under blender. */
+export const baseballRefitModelsSchedule = schedules.task({
+  id: 'scheduled-baseball-refit-models',
+  cron: '0 5 * * 2',
+  run: async () => {
+    const handle = await baseballRefitModelsTask.trigger(undefined as void);
+    logger.info('Triggered baseball model refit', { runId: handle.id });
   },
 });
