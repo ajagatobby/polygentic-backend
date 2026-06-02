@@ -53,7 +53,7 @@ export class StatcastService {
       baseURL:
         this.config.get<string>('BASEBALL_SAVANT_BASE_URL') ||
         'https://baseballsavant.mlb.com',
-      timeout: 30_000,
+      timeout: 60_000, // Savant leaderboard CSVs are large
       headers: { 'User-Agent': 'polygentic/1.0' },
     });
   }
