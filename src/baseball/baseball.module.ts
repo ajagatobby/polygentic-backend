@@ -5,6 +5,8 @@ import { BaseballTeamMapService } from './baseball-team-map.service';
 import { MlbStatsService } from './mlb-stats.service';
 import { StatcastService } from './statcast.service';
 import { BaseballMarketService } from './baseball-market.service';
+import { BaseballLeaguePriorsService } from './baseball-league-priors.service';
+import { BaseballRunModelService } from './baseball-run-model.service';
 import { BaseballController } from './baseball.controller';
 
 /**
@@ -22,6 +24,8 @@ import { BaseballController } from './baseball.controller';
     MlbStatsService,
     StatcastService,
     BaseballMarketService,
+    BaseballLeaguePriorsService,
+    BaseballRunModelService,
   ],
   exports: [
     BaseballTeamMapService,
@@ -29,6 +33,8 @@ import { BaseballController } from './baseball.controller';
     MlbStatsService,
     StatcastService,
     BaseballMarketService,
+    BaseballLeaguePriorsService,
+    BaseballRunModelService,
   ],
 })
 export class BaseballModule {}
