@@ -66,11 +66,64 @@ export class BaseballController {
   }
 
   @Get('predictions/:gameId')
-  @ApiOperation({ summary: 'Get the over/under prediction for a game' })
+  @ApiOperation({
+    summary:
+      'Over/under prediction for a game, with both teams’ last 10 games + H2H',
+  })
   async prediction_(@Param('gameId', ParseIntPipe) gameId: number) {
-    const g = await this.baseball.getGameById(gameId);
-    if (!g) throw new NotFoundException(`Game ${gameId} not found`);
-    return { game: g };
+    const game = await this.baseball.getGameById(gameId);
+    if (!game) throw new NotFoundException(`Game ${gameId} not found`);
+
+    const [prediction, homeRecent, awayRecent, h2h] = await Promise.all([
+      this.baseball.getPredictionByGame(gameId),
+      this.baseball.getRecentCompletedForTeam(game.homeTeamId, 10),
+      this.baseball.getRecentCompletedForTeam(game.awayTeamId, 10),
+      this.baseball.getH2H(game.homeTeamId, game.awayTeamId, 10),
+    ]);
+
+    const summarize = (rows: any[], perspectiveTeamId?: number) =>
+      rows.map((r) => this.summarizeGame(r, perspectiveTeamId));
+
+    return {
+      game,
+      prediction,
+      homeTeam: {
+        teamId: game.homeTeamId,
+        last10: summarize(homeRecent, game.homeTeamId),
+      },
+      awayTeam: {
+        teamId: game.awayTeamId,
+        last10: summarize(awayRecent, game.awayTeamId),
+      },
+      h2h: summarize(h2h),
+    };
+  }
+
+  /** Compact game summary; if perspectiveTeamId given, adds result/runs for/against. */
+  private summarizeGame(r: any, perspectiveTeamId?: number) {
+    const total =
+      r.runsHome != null && r.runsAway != null ? r.runsHome + r.runsAway : null;
+    const base = {
+      gameId: r.id,
+      date: r.date,
+      homeTeamId: r.homeTeamId,
+      awayTeamId: r.awayTeamId,
+      runsHome: r.runsHome,
+      runsAway: r.runsAway,
+      total,
+      status: r.status,
+    };
+    if (!perspectiveTeamId || total == null) return base;
+    const isHome = r.homeTeamId === perspectiveTeamId;
+    const runsFor = isHome ? r.runsHome : r.runsAway;
+    const runsAgainst = isHome ? r.runsAway : r.runsHome;
+    return {
+      ...base,
+      isHome,
+      runsFor,
+      runsAgainst,
+      result: runsFor > runsAgainst ? 'W' : runsFor < runsAgainst ? 'L' : 'T',
+    };
   }
 
   @Get('edges')

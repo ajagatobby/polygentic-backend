@@ -261,6 +261,15 @@ export class BaseballService {
       .orderBy(asc(schema.baseballGames.date));
   }
 
+  async getPredictionByGame(gameId: number): Promise<any | null> {
+    const rows = await this.db
+      .select()
+      .from(schema.baseballPredictions)
+      .where(eq(schema.baseballPredictions.gameId, gameId))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
   async getGameById(gameId: number): Promise<any | null> {
     const rows = await this.db
       .select()
@@ -281,6 +290,30 @@ export class BaseballService {
           or(
             eq(schema.baseballGames.homeTeamId, teamId),
             eq(schema.baseballGames.awayTeamId, teamId),
+          ),
+        ),
+      )
+      .orderBy(desc(schema.baseballGames.date))
+      .limit(limit);
+  }
+
+  /** Head-to-head completed games between two teams (most recent first). */
+  async getH2H(teamA: number, teamB: number, limit = 10): Promise<any[]> {
+    return this.db
+      .select()
+      .from(schema.baseballGames)
+      .where(
+        and(
+          inArray(schema.baseballGames.status, BASEBALL_COMPLETED_STATUSES),
+          or(
+            and(
+              eq(schema.baseballGames.homeTeamId, teamA),
+              eq(schema.baseballGames.awayTeamId, teamB),
+            ),
+            and(
+              eq(schema.baseballGames.homeTeamId, teamB),
+              eq(schema.baseballGames.awayTeamId, teamA),
+            ),
           ),
         ),
       )
