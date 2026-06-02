@@ -357,6 +357,16 @@ export function lineProbsFromTotal(mu: number, phi = 2.2): LineProb[] {
     });
 }
 
+/** P(total over `line`) under NB(mean, phi) at an arbitrary line. */
+export function nbPOverAtLine(mu: number, line: number, phi = 2.2): number {
+  const r = nbSizeFromMeanPhi(mu, phi);
+  const pmf = nbPmfArray(mu, r, 60);
+  let cum = 0;
+  const k = Number.isInteger(line) ? line + 1 : Math.ceil(line);
+  for (let i = 0; i < k && i < pmf.length; i++) cum += pmf[i];
+  return clampProb(1 - cum);
+}
+
 // ─── Negative-Binomial helpers ─────────────────────────────────────────
 
 /** NB size r so that var = phi*mean (phi>1 ⇒ overdispersed). */

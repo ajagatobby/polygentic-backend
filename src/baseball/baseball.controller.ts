@@ -17,6 +17,8 @@ import { BaseballService } from './baseball.service';
 import { BaseballTeamMapService } from './baseball-team-map.service';
 import { StatcastService } from './statcast.service';
 import { BaseballMarketService } from './baseball-market.service';
+import { BaseballPredictionService } from './baseball-prediction.service';
+import { BaseballPolymarketService } from './baseball-polymarket.service';
 
 @ApiTags('Baseball')
 @ApiBearerAuth('firebase-auth')
@@ -29,6 +31,8 @@ export class BaseballController {
     private readonly teamMap: BaseballTeamMapService,
     private readonly statcast: StatcastService,
     private readonly market: BaseballMarketService,
+    private readonly prediction: BaseballPredictionService,
+    private readonly polymarket: BaseballPolymarketService,
   ) {}
 
   // ─── READ ────────────────────────────────────────────────────────────
@@ -59,6 +63,35 @@ export class BaseballController {
   @ApiOperation({ summary: 'API-Sports baseball daily request budget' })
   budget() {
     return this.baseball.getRemainingRequests();
+  }
+
+  @Get('predictions/:gameId')
+  @ApiOperation({ summary: 'Get the over/under prediction for a game' })
+  async prediction_(@Param('gameId', ParseIntPipe) gameId: number) {
+    const g = await this.baseball.getGameById(gameId);
+    if (!g) throw new NotFoundException(`Game ${gameId} not found`);
+    return { game: g };
+  }
+
+  @Get('edges')
+  @ApiOperation({
+    summary: 'Compute model-vs-Polymarket edges across MLB totals markets',
+  })
+  async edges(
+    @Query('minEdge') minEdge?: string,
+  ) {
+    const min = minEdge ? Number(minEdge) : 0.03;
+    return this.polymarket.computeEdges(Number.isFinite(min) ? min : 0.03);
+  }
+
+  @Post('predict/:gameId')
+  @Roles('admin')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Generate an on-demand over/under prediction' })
+  async predict(@Param('gameId', ParseIntPipe) gameId: number) {
+    const row = await this.prediction.generatePrediction(gameId, 'on_demand');
+    if (!row) throw new NotFoundException(`Could not predict game ${gameId}`);
+    return row;
   }
 
   // ─── ADMIN: manual triggers ─────────────────────────────────────────

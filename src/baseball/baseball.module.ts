@@ -13,6 +13,7 @@ import { BaseballCriticAgent } from './agents/baseball-critic.agent';
 import { BaseballPredictionService } from './baseball-prediction.service';
 import { BaseballBlenderService } from './baseball-blender.service';
 import { BaseballCalibrationService } from './baseball-calibration.service';
+import { BaseballPolymarketService } from './baseball-polymarket.service';
 import { BaseballController } from './baseball.controller';
 
 /**
@@ -38,6 +39,7 @@ import { BaseballController } from './baseball.controller';
     BaseballPredictionService,
     BaseballBlenderService,
     BaseballCalibrationService,
+    BaseballPolymarketService,
   ],
   exports: [
     BaseballTeamMapService,
@@ -53,6 +55,7 @@ import { BaseballController } from './baseball.controller';
     BaseballPredictionService,
     BaseballBlenderService,
     BaseballCalibrationService,
+    BaseballPolymarketService,
   ],
 })
 export class BaseballModule {}
