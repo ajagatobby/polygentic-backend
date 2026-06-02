@@ -7,6 +7,10 @@ import { StatcastService } from './statcast.service';
 import { BaseballMarketService } from './baseball-market.service';
 import { BaseballLeaguePriorsService } from './baseball-league-priors.service';
 import { BaseballRunModelService } from './baseball-run-model.service';
+import { BaseballResearchAgent } from './agents/baseball-research.agent';
+import { BaseballAnalysisAgent } from './agents/baseball-analysis.agent';
+import { BaseballCriticAgent } from './agents/baseball-critic.agent';
+import { BaseballPredictionService } from './baseball-prediction.service';
 import { BaseballController } from './baseball.controller';
 
 /**
@@ -26,6 +30,10 @@ import { BaseballController } from './baseball.controller';
     BaseballMarketService,
     BaseballLeaguePriorsService,
     BaseballRunModelService,
+    BaseballResearchAgent,
+    BaseballAnalysisAgent,
+    BaseballCriticAgent,
+    BaseballPredictionService,
   ],
   exports: [
     BaseballTeamMapService,
@@ -35,6 +43,10 @@ import { BaseballController } from './baseball.controller';
     BaseballMarketService,
     BaseballLeaguePriorsService,
     BaseballRunModelService,
+    BaseballResearchAgent,
+    BaseballAnalysisAgent,
+    BaseballCriticAgent,
+    BaseballPredictionService,
   ],
 })
 export class BaseballModule {}

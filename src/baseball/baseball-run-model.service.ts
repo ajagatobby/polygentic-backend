@@ -127,9 +127,7 @@ export class BaseballRunModelService {
     // Negative-binomial on the game total.
     const phi = overrides.phi ?? BaseballRunModelService.DEFAULT_PHI;
     const r = nbSizeFromMeanPhi(expectedTotal, phi);
-    const pmf = nbPmfArray(expectedTotal, r, 45);
-
-    const lineProbs = this.buildLineProbs(expectedTotal, pmf);
+    const lineProbs = lineProbsFromTotal(expectedTotal, phi);
 
     const confidence = this.scoreConfidence(
       homeOffense,
@@ -295,50 +293,6 @@ export class BaseballRunModelService {
 
   // ─── line probabilities ────────────────────────────────────────────
 
-  private buildLineProbs(mu: number, pmf: number[]): LineProb[] {
-    const cdf: number[] = [];
-    let acc = 0;
-    for (let k = 0; k < pmf.length; k++) {
-      acc += pmf[k];
-      cdf[k] = acc;
-    }
-    const survAtLeast = (k: number) => 1 - (k - 1 >= 0 ? cdf[k - 1] ?? 0 : 0);
-
-    const center = Math.round(mu);
-    const lines: number[] = [];
-    for (let base = center - 3; base <= center + 3; base++) {
-      if (base >= 5) {
-        lines.push(base); // integer line (push possible)
-        lines.push(base + 0.5); // half line (no push)
-      }
-    }
-
-    return lines
-      .filter((l, i, a) => a.indexOf(l) === i)
-      .sort((a, b) => a - b)
-      .map((line) => {
-        if (Number.isInteger(line)) {
-          const push = pmf[line] ?? 0;
-          const pOver = survAtLeast(line + 1); // total > line
-          const pUnder = 1 - pOver - push;
-          return {
-            line,
-            pOver: clampProb(pOver),
-            pUnder: clampProb(pUnder),
-            push: clampProb(push),
-          };
-        }
-        const k = Math.ceil(line); // e.g. 7.5 → over means >=8
-        const pOver = survAtLeast(k);
-        return {
-          line,
-          pOver: clampProb(pOver),
-          pUnder: clampProb(1 - pOver),
-          push: 0,
-        };
-      });
-  }
-
   private scoreConfidence(
     ho: any,
     ao: any,
@@ -355,6 +309,52 @@ export class BaseballRunModelService {
     if (priors.isReliable) score += 1;
     return Math.max(1, Math.min(10, Math.round(score)));
   }
+}
+
+/**
+ * Build per-line over/under/push probabilities from an expected total under
+ * NB(mean, phi). Pure + exported so the analysis agent's expected total can
+ * be converted identically to the model's.
+ */
+export function lineProbsFromTotal(mu: number, phi = 2.2): LineProb[] {
+  const r = nbSizeFromMeanPhi(mu, phi);
+  const pmf = nbPmfArray(mu, r, 45);
+  const cdf: number[] = [];
+  let acc = 0;
+  for (let k = 0; k < pmf.length; k++) {
+    acc += pmf[k];
+    cdf[k] = acc;
+  }
+  const survAtLeast = (k: number) => 1 - (k - 1 >= 0 ? cdf[k - 1] ?? 0 : 0);
+
+  const center = Math.round(mu);
+  const lines: number[] = [];
+  for (let base = center - 3; base <= center + 3; base++) {
+    if (base >= 5) {
+      lines.push(base);
+      lines.push(base + 0.5);
+    }
+  }
+
+  return lines
+    .filter((l, i, a) => a.indexOf(l) === i)
+    .sort((a, b) => a - b)
+    .map((line) => {
+      if (Number.isInteger(line)) {
+        const push = pmf[line] ?? 0;
+        const pOver = survAtLeast(line + 1);
+        const pUnder = 1 - pOver - push;
+        return {
+          line,
+          pOver: clampProb(pOver),
+          pUnder: clampProb(pUnder),
+          push: clampProb(push),
+        };
+      }
+      const k = Math.ceil(line);
+      const pOver = survAtLeast(k);
+      return { line, pOver: clampProb(pOver), pUnder: clampProb(1 - pOver), push: 0 };
+    });
 }
 
 // ─── Negative-Binomial helpers ─────────────────────────────────────────

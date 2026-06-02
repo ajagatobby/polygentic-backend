@@ -29,6 +29,14 @@ export class BaseballTeamMapService implements OnModuleInit {
   }
 
   async onModuleInit(): Promise<void> {
+    await this.init();
+  }
+
+  /**
+   * Seed + load caches. Safe to call from Trigger.dev tasks (which run
+   * outside Nest's lifecycle) as well as onModuleInit. Idempotent.
+   */
+  async init(): Promise<void> {
     try {
       await this.seed();
       await this.loadApiSportsCache();

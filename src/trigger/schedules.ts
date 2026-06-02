@@ -4,6 +4,8 @@ import {
   generatePreMatchPredictionsTask,
 } from './generate-daily-predictions';
 import { lineupPredictionTask } from './lineup-prediction';
+import { lateResearchRefreshTask } from './late-research-refresh';
+import { refitIsotonicCalibrationTask } from './refit-isotonic-calibration';
 import { syncCompletedFixturesAndResolveTask } from './sync-and-resolve';
 import {
   syncFixturesTask,
@@ -22,6 +24,16 @@ import {
   syncBasketballCompletedFixturesTask,
   syncBasketballStandingsTask,
 } from './basketball-sync-data';
+import {
+  baseballSyncGamesTask,
+  baseballSyncResultsTask,
+  baseballRefreshStatcastTask,
+} from './baseball-sync-games';
+import {
+  baseballGeneratePredictionsTask,
+  baseballPreGameRefreshTask,
+  baseballResolvePredictionsTask,
+} from './baseball-predictions';
 
 /**
  * ┌──────────────────────────────────────────────────────────────────┐
@@ -90,6 +102,44 @@ export const lineupPredictionSchedule = schedules.task({
     logger.info('Scheduled: lineup-aware prediction check');
     const handle = await lineupPredictionTask.trigger(undefined as void);
     logger.info('Triggered lineup prediction task', { runId: handle.id });
+  },
+});
+
+/**
+ * Every 15 minutes: T-2h late-news refresh. Re-runs the prediction
+ * pipeline for fixtures starting in ~105–145 minutes that already have a
+ * pre_match prediction, so we capture late team-news / weather / lineup
+ * leaks that move the line. Each fixture is refreshed at most once via
+ * the matchContext.lateRefreshed flag.
+ */
+export const lateResearchRefreshSchedule = schedules.task({
+  id: 'scheduled-late-research-refresh',
+  cron: '*/15 * * * *',
+  run: async () => {
+    logger.info('Scheduled: late-news refresh (T-2h window)');
+    const handle = await lateResearchRefreshTask.trigger(undefined as void);
+    logger.info('Triggered late-news refresh task', { runId: handle.id });
+  },
+});
+
+/**
+ * Weekly Mondays at 4 AM UTC: refit the isotonic calibration mappings
+ * from the latest resolved predictions. Mappings shift slowly so a
+ * weekly cadence is fine; the operation is also a no-op when fewer
+ * than 200 resolved predictions exist, so early-stage clusters don't
+ * waste cycles on a meaningless fit.
+ */
+export const refitIsotonicCalibrationSchedule = schedules.task({
+  id: 'scheduled-refit-isotonic-calibration',
+  cron: '0 4 * * 1',
+  run: async () => {
+    logger.info('Scheduled: refit isotonic calibration');
+    const handle = await refitIsotonicCalibrationTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered isotonic calibration refit task', {
+      runId: handle.id,
+    });
   },
 });
 
@@ -346,5 +396,61 @@ export const copyTraderSyncSchedule = schedules.task({
     logger.info('Scheduled: copy-trader sync');
     const handle = await copyTraderSyncTask.trigger(undefined as void);
     logger.info('Triggered copy-trader sync task', { runId: handle.id });
+  },
+});
+
+// ─── Baseball (MLB run-totals) schedules ─────────────────────────────
+
+/** Every 4 hours: sync MLB games + snapshot sharp market totals. */
+export const baseballSyncGamesSchedule = schedules.task({
+  id: 'scheduled-baseball-sync-games',
+  cron: '0 */4 * * *',
+  run: async () => {
+    const handle = await baseballSyncGamesTask.trigger(undefined as void);
+    logger.info('Triggered baseball sync-games', { runId: handle.id });
+  },
+});
+
+/** Daily refresh of Statcast pitcher + team-batting caches (08:30 UTC). */
+export const baseballStatcastSchedule = schedules.task({
+  id: 'scheduled-baseball-statcast',
+  cron: '30 8 * * *',
+  run: async () => {
+    const handle = await baseballRefreshStatcastTask.trigger(undefined as void);
+    logger.info('Triggered baseball statcast refresh', { runId: handle.id });
+  },
+});
+
+/** Daily at 9 AM UTC: generate MLB run-total predictions for the slate. */
+export const baseballDailyPredictionsSchedule = schedules.task({
+  id: 'scheduled-baseball-daily-predictions',
+  cron: '0 9 * * *',
+  run: async () => {
+    const handle = await baseballGeneratePredictionsTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered baseball daily predictions', { runId: handle.id });
+  },
+});
+
+/** Every 30 min: pre-game refresh for games starting soon (late probables). */
+export const baseballPreGameRefreshSchedule = schedules.task({
+  id: 'scheduled-baseball-pre-game-refresh',
+  cron: '*/30 * * * *',
+  run: async () => {
+    const handle = await baseballPreGameRefreshTask.trigger(undefined as void);
+    logger.info('Triggered baseball pre-game refresh', { runId: handle.id });
+  },
+});
+
+/** Every hour: sync results + resolve MLB predictions (Brier). */
+export const baseballResolveSchedule = schedules.task({
+  id: 'scheduled-baseball-resolve',
+  cron: '20 * * * *',
+  run: async () => {
+    const handle = await baseballResolvePredictionsTask.trigger(
+      undefined as void,
+    );
+    logger.info('Triggered baseball resolve', { runId: handle.id });
   },
 });
