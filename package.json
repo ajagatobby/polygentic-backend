@@ -30,7 +30,8 @@
     "sync:fixtures": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts",
     "sync:fixtures:all": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts --all",
     "predictions:update-today": "npx ts-node -r tsconfig-paths/register scripts/update-today-predictions.ts",
-    "backtest": "npx ts-node -r tsconfig-paths/register autoresearch/backtest.ts"
+    "backtest": "npx ts-node -r tsconfig-paths/register autoresearch/backtest.ts",
+    "backtest:mlb": "npx ts-node -r tsconfig-paths/register autoresearch/mlb-totals-backtest.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
