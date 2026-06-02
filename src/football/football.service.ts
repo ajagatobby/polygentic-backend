@@ -227,6 +227,8 @@ export class FootballService {
     262, // Liga MX
     71, // Brasileirao
     128, // Argentina Liga
+    10, // FIFA Friendlies (season = calendar year of the international break)
+    1, // World Cup (season = calendar year of the tournament)
   ]);
 
   /**
