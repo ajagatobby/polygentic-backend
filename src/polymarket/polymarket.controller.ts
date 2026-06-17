@@ -693,6 +693,75 @@ export class PolymarketController {
     return this.polymarketService.updateSmartMoneyConfig(body);
   }
 
+  @Get('wallet/analyze')
+  @ApiOperation({
+    summary: 'Deep-dive analysis of any Polymarket wallet',
+    description:
+      'Accepts either a proxy wallet address (0x...) or a Polymarket ' +
+      'handle (@name). Returns lifetime PnL, ROI, streak, last-10 / 20 ' +
+      'win rates, every smart-money qualification gate pass/fail flag, ' +
+      'recent resolved bets, current open positions, and biggest wins/ losses.',
+  })
+  @ApiQuery({
+    name: 'q',
+    required: true,
+    type: String,
+    description: 'Wallet address (0x…) or Polymarket handle (@name).',
+  })
+  async analyzeWallet(@Query('q') q?: string) {
+    if (!q || typeof q !== 'string' || !q.trim()) {
+      throw new BadRequestException('q (address or @handle) is required');
+    }
+    const result = await this.polymarketService.analyzeWallet(q.trim());
+    if (!result) {
+      throw new BadRequestException(
+        'Could not resolve wallet. Try the 0x… address directly.',
+      );
+    }
+    return result;
+  }
+
+  @Get('markets/:conditionId/history')
+  @ApiOperation({
+    summary: 'Price / volume time series for a Polymarket market',
+    description:
+      'Returns the append-only snapshot trail written every 5 minutes by ' +
+      'the polymarket-market-snapshot trigger task. Powers the match ' +
+      'detail probability chart.',
+  })
+  @ApiQuery({
+    name: 'hours',
+    required: false,
+    type: Number,
+    description: 'Window in hours (1-720, default 24).',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Max points returned (1-2000, default 288).',
+  })
+  async getMarketHistory(
+    @Param('conditionId') conditionId: string,
+    @Query('hours') hours?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const h = hours ? Number(hours) : undefined
+    const l = limit ? Number(limit) : undefined
+    const points = await this.polymarketService.getMarketPriceHistory(
+      conditionId,
+      {
+        hours: Number.isFinite(h) ? h : undefined,
+        limit: Number.isFinite(l) ? l : undefined,
+      },
+    )
+    return {
+      conditionId,
+      count: points.length,
+      points,
+    }
+  }
+
   @Get('holders/:conditionId')
   @ApiOperation({
     summary: 'Get every top holder for a Polymarket market (by conditionId)',

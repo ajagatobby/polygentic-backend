@@ -29,7 +29,9 @@
     "trigger:status": "npx trigger.dev status",
     "sync:fixtures": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts",
     "sync:fixtures:all": "npx ts-node -r tsconfig-paths/register scripts/sync-fixtures.ts --all",
-    "backtest": "npx ts-node -r tsconfig-paths/register autoresearch/backtest.ts"
+    "predictions:update-today": "npx ts-node -r tsconfig-paths/register scripts/update-today-predictions.ts",
+    "backtest": "npx ts-node -r tsconfig-paths/register autoresearch/backtest.ts",
+    "backtest:mlb": "npx ts-node -r tsconfig-paths/register autoresearch/mlb-totals-backtest.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
@@ -43,7 +45,7 @@
     "@nestjs/throttler": "^6.5.0",
     "@nestjs/websockets": "^11.1.14",
     "@polymarket/clob-client": "^5.7.0",
-    "@trigger.dev/sdk": "4.4.4",
+    "@trigger.dev/sdk": "4.4.6",
     "axios": "^1.13.6",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
@@ -66,7 +68,7 @@
     "@nestjs/microservices": "^11.1.14",
     "@nestjs/schematics": "^11.0.9",
     "@nestjs/testing": "^11.1.14",
-    "@trigger.dev/build": "4.4.4",
+    "@trigger.dev/build": "4.4.6",
     "@types/express": "^4.17.17",
     "@types/jest": "^29.5.2",
     "@types/node": "^20.3.1",

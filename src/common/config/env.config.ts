@@ -143,6 +143,49 @@ export class EnvConfig {
   @IsOptional()
   API_FOOTBALL_RATE_LIMIT: number = 300;
 
+  // ─── API-BASEBALL (MLB run-totals) ───────────────────────────────────
+  // API-Sports baseball shares the same key as API-Football. Leave
+  // API_BASEBALL_KEY unset to reuse API_FOOTBALL_KEY (see baseballApiKey).
+
+  @IsString()
+  @IsOptional()
+  API_BASEBALL_KEY?: string;
+
+  @IsString()
+  @IsOptional()
+  API_BASEBALL_BASE_URL: string = 'https://v1.baseball.api-sports.io';
+
+  @Type(() => Number)
+  @IsInt()
+  @IsOptional()
+  API_BASEBALL_DAILY_LIMIT: number = 7500;
+
+  /** API-Sports MLB league id (1 = MLB). */
+  @Type(() => Number)
+  @IsInt()
+  @IsOptional()
+  API_BASEBALL_MLB_LEAGUE_ID: number = 1;
+
+  // ─── MLB STATS API (free, no key) ────────────────────────────────────
+
+  @IsString()
+  @IsOptional()
+  MLB_STATS_BASE_URL: string = 'https://statsapi.mlb.com';
+
+  @IsString()
+  @IsOptional()
+  MLB_STATS_LIVE_BASE_URL: string = 'https://statsapi.mlb.com';
+
+  // ─── STATCAST / FANGRAPHS (free, unofficial) ─────────────────────────
+
+  @IsString()
+  @IsOptional()
+  BASEBALL_SAVANT_BASE_URL: string = 'https://baseballsavant.mlb.com';
+
+  @IsString()
+  @IsOptional()
+  FANGRAPHS_BASE_URL: string = 'https://www.fangraphs.com';
+
   // ─── ODDS API ────────────────────────────────────────────────────────
 
   @IsString()
@@ -183,7 +226,7 @@ export class EnvConfig {
 
   @IsString()
   @IsOptional()
-  PREDICTION_MODEL: string = 'claude-opus-4-6';
+  PREDICTION_MODEL: string = 'claude-opus-4-7';
 
   // ─── SYNC INTERVALS ─────────────────────────────────────────────────
 
@@ -368,6 +411,11 @@ export class EnvConfig {
 
   get authRequired(): boolean {
     return this.AUTH_REQUIRED !== 'false';
+  }
+
+  /** API-Sports baseball key, falling back to the shared API-Football key. */
+  get baseballApiKey(): string {
+    return this.API_BASEBALL_KEY || this.API_FOOTBALL_KEY;
   }
 }
 

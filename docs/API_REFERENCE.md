@@ -272,11 +272,29 @@ Get a fixture with its AI prediction and team details. Returns the prediction ge
     "riskFactors": [...],
     "valueBets": [...],
     "detailedAnalysis": "Arsenal are in excellent form...",
+    "matchInsights": { "...": "see below" },
     "homeTeamName": "Manchester United",
     "awayTeamName": "Arsenal"
   }
 }
 ```
+
+#### `matchInsights` — deep analysis layer
+
+A display-only block of rich match analysis surfaced on the prediction. It does **not** feed the probability model. Club logos and player photos are backfilled at read time, so they appear even on older predictions. Sections:
+
+| Section          | Contents                                                                                                                                |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `headToHead`     | Last 10 meetings with readable scorelines + logos, a W/D/L summary (from the home team's perspective), and the current H2H streak       |
+| `recentForm`     | Last 20 games per team with scorelines, club + opponent logos, rolled-up record (W-D-L, GF-GA, PPG), form string, and current streak    |
+| `players`        | Full roster grouped GK → DEF → MID → FWD, each with photo, season stats (apps, minutes, rating, goals, assists, cards) and availability; injured/suspended players in `unavailable` |
+| `teamProfiles`   | Per-team season profile (`/teams/statistics`): home/away splits, goals-by-minute timing tags, clean-sheet / failed-to-score %, formations, biggest streaks |
+| `signals`        | Tier-1 signals: xG deserved-vs-actual (luck/regression), star-player dependency, and a possession/direct style matchup                  |
+| `markets`        | Multi-market slate derived from the model's expected goals: top scorelines, O/U lines, BTTS, double chance, Asian handicap, team totals, clean sheet, plus value bets vs the market |
+| `context`        | Referee tendencies, matchday weather (Open-Meteo), discipline/booking watch, and what's at stake                                        |
+| `narrative`      | A compact human-readable digest of the above                                                                                            |
+
+> For **live, in-play** stats (shots, possession, formations updating during the match) use [`GET /api/fixtures/:id/live`](#get-apifixturesidlive) instead — `matchInsights` is a pre-match snapshot.
 
 **Response `404`**
 
@@ -739,6 +757,71 @@ Get currently live matches. Returns data from the local live monitor if active, 
 | Field    | Type                      | Description                                                                            |
 | -------- | ------------------------- | -------------------------------------------------------------------------------------- |
 | `source` | `"live-monitor" \| "api"` | `live-monitor` if local polling is active, `api` if fetched directly from API-Football |
+
+---
+
+### `GET /api/fixtures/:id/live`
+
+Realtime in-play stats for a **single** fixture: live score, elapsed minute, per-team statistics (shots on target, total shots, possession, xG, corners, cards…), formations, and events — fetched fresh from API-Football. Designed to be **polled by the client** while a match is in play.
+
+The response is cached server-side for ~12s, so a burst of viewers of the same match triggers only one upstream API-Football poll. For not-started fixtures the heavy stats/lineup/event calls are skipped (`isLive: false`, empty stats).
+
+**Path Parameters**
+
+| Parameter | Type    | Description             |
+| --------- | ------- | ----------------------- |
+| `id`      | integer | API-Football fixture ID |
+
+**Response `200`**
+
+```json
+{
+  "fixtureId": 1035012,
+  "found": true,
+  "isLive": true,
+  "isFinished": false,
+  "status": { "short": "2H", "long": "Second Half", "elapsed": 67 },
+  "league": { "id": 39, "name": "Premier League", "round": "Regular Season - 29" },
+  "score": { "home": 1, "away": 0, "halftime": { "home": 1, "away": 0 } },
+  "home": {
+    "teamId": 33,
+    "name": "Manchester United",
+    "logo": "https://...",
+    "formation": "4-2-3-1",
+    "stats": {
+      "shotsOnTarget": 4,
+      "totalShots": 11,
+      "shotsInsideBox": 7,
+      "blockedShots": 2,
+      "possession": 58,
+      "expectedGoals": 1.32,
+      "cornerKicks": 5,
+      "offsides": 1,
+      "fouls": 9,
+      "yellowCards": 2,
+      "redCards": 0,
+      "goalkeeperSaves": 3,
+      "totalPasses": 412,
+      "passesAccurate": 346,
+      "passAccuracy": 84
+    }
+  },
+  "away": { "teamId": 42, "name": "Arsenal", "logo": "https://...", "formation": "4-3-3", "stats": { "...": "..." } },
+  "events": [
+    { "minute": 23, "extra": null, "teamId": 33, "teamName": "Manchester United", "type": "Goal", "detail": "Normal Goal", "player": "Rashford", "assist": "Bruno Fernandes" }
+  ],
+  "updatedAt": "2026-03-15T15:52:11.000Z"
+}
+```
+
+| Field             | Type           | Description                                                                                                                                  |
+| ----------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `found`           | boolean        | `false` if the fixture id is unknown to API-Football                                                                                          |
+| `isLive`          | boolean        | `true` while the match is in play (`1H/HT/2H/ET/BT/P/LIVE/INT/SUSP`)                                                                          |
+| `isFinished`      | boolean        | `true` once the match is `FT/AET/PEN`                                                                                                         |
+| `home/away.stats` | object \| null | `null` for not-started games; individual stat fields may be `null` where API-Football doesn't supply them (e.g. live xG in lower divisions) |
+
+**Client usage:** poll every ~15–30s while `isLive` is `true`; stop once `isFinished` is `true`. Score, elapsed, and events are available for all leagues; detailed statistics (and especially live xG) depend on the league + API-Football plan.
 
 ---
 

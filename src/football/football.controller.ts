@@ -353,6 +353,24 @@ export class FootballController {
     }
   }
 
+  @Get('fixtures/:id/live')
+  @ApiOperation({
+    summary:
+      'Realtime in-play stats for a fixture (score, shots, possession, xG, formations, events). Poll while the match is live.',
+  })
+  @ApiParam({ name: 'id', description: 'API-Football fixture ID', type: Number })
+  @ApiResponse({ status: 200, description: 'Live match stats snapshot' })
+  async getLiveMatchStats(@Param('id', ParseIntPipe) id: number) {
+    try {
+      return await this.footballService.getLiveMatchStats(id);
+    } catch (error) {
+      this.logger.error(
+        `Failed to get live stats for fixture ${id}: ${error.message}`,
+      );
+      throw new InternalServerErrorException('Failed to retrieve live stats');
+    }
+  }
+
   @Get('fixtures/:id/lineups')
   @ApiOperation({
     summary:

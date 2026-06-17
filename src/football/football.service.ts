@@ -1,7 +1,18 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { eq, and, gte, lte, sql, desc, asc, inArray } from 'drizzle-orm';
+import {
+  eq,
+  and,
+  gte,
+  lte,
+  lt,
+  sql,
+  desc,
+  asc,
+  inArray,
+  notInArray,
+} from 'drizzle-orm';
 import * as schema from '../database/schema';
 import { FixtureQueryDto, MATCH_STATE_STATUSES } from './dto/fixture-query.dto';
 
@@ -75,11 +86,28 @@ interface ApiFootballResponse<T = any> {
 
 export type FixtureByIdResult = {
   fixture: any;
+  homeTeam: {
+    id: number;
+    name: string | null;
+    shortName: string | null;
+    logo: string | null;
+  } | null;
+  awayTeam: {
+    id: number;
+    name: string | null;
+    shortName: string | null;
+    logo: string | null;
+  } | null;
   statistics: any[];
   events: any[];
   injuries: any[];
   lineups: any[];
   prediction: any;
+  polymarket: {
+    eventUrl: string | null;
+    marketCount: number;
+    markets: any[];
+  } | null;
 };
 
 @Injectable()
@@ -199,6 +227,8 @@ export class FootballService {
     262, // Liga MX
     71, // Brasileirao
     128, // Argentina Liga
+    10, // FIFA Friendlies (season = calendar year of the international break)
+    1, // World Cup (season = calendar year of the tournament)
   ]);
 
   /**
@@ -646,6 +676,244 @@ export class FootballService {
   }
 
   /**
+   * Terminal fixture statuses — a fixture in one of these is done and never
+   * needs re-fetching. Everything else past its kickoff is a straggler.
+   * FT/AET/PEN = finished; PST/CANC/ABD/AWD/WO = not-played outcomes.
+   */
+  static readonly TERMINAL_STATUSES = [
+    'FT',
+    'AET',
+    'PEN',
+    'PST',
+    'CANC',
+    'ABD',
+    'AWD',
+    'WO',
+  ];
+
+  /**
+   * Fetch a team's most-recent fixtures FRESH from API-Football and upsert
+   * them. `/fixtures?team=&last=N` returns the last N games across all
+   * competitions with final status + scores — always current, regardless of
+   * our sync state. Upserting into the DB means every downstream query (form
+   * windows, recent-game history, opponent strength — model AND display) reads
+   * fresh results without any query changes.
+   *
+   * One cheap call per team. Per-match stats (xG/possession) are NOT fetched
+   * here (that would be one call per game); they continue to come from the DB.
+   */
+  async getTeamRecentFixtures(
+    teamId: number,
+    last = 40,
+    backfillStatsCount = 8,
+  ): Promise<number> {
+    try {
+      const data = await this.apiRequest<any>('/fixtures', {
+        team: String(teamId),
+        last: String(Math.min(Math.max(1, last), 99)),
+      });
+      const resp: any[] = data.response ?? [];
+      let n = 0;
+      const finished: Array<{ id: number; date: string }> = [];
+      for (const item of resp) {
+        await this.upsertFixture(item);
+        n++;
+        const short = item.fixture?.status?.short;
+        if (['FT', 'AET', 'PEN'].includes(short) && item.fixture?.id) {
+          finished.push({ id: item.fixture.id, date: item.fixture.date });
+        }
+      }
+      this.logger.debug(`Freshened ${n} recent fixtures for team ${teamId}`);
+
+      // Backfill per-match stats + formations for the most recent finished
+      // games (immutable once played → fetched once, then cached forever).
+      if (backfillStatsCount > 0 && finished.length) {
+        const recentIds = finished
+          .sort((a, b) => (a.date < b.date ? 1 : -1))
+          .slice(0, backfillStatsCount)
+          .map((f) => f.id);
+        await this.backfillFixtureStatsAndLineups(recentIds);
+      }
+      return n;
+    } catch (error: any) {
+      this.logger.warn(
+        `getTeamRecentFixtures(${teamId}) failed: ${error.message}`,
+      );
+      return 0;
+    }
+  }
+
+  /**
+   * Backfill per-match statistics (xG, shots, possession) and lineups
+   * (formations) for finished fixtures that don't already have them. Stats are
+   * immutable once a game ends, so we only fetch each fixture once — the
+   * `existing` check makes this cheap in steady state (only newly-played games
+   * incur a fetch).
+   */
+  async backfillFixtureStatsAndLineups(fixtureIds: number[]): Promise<number> {
+    if (!fixtureIds.length) return 0;
+    const existing = await this.db
+      .select({ fixtureId: schema.fixtureStatistics.fixtureId })
+      .from(schema.fixtureStatistics)
+      .where(inArray(schema.fixtureStatistics.fixtureId, fixtureIds));
+    const have = new Set<number>(existing.map((r: any) => r.fixtureId));
+    const missing = fixtureIds.filter((id) => !have.has(id));
+    if (!missing.length) return 0;
+
+    let done = 0;
+    for (const id of missing) {
+      try {
+        await this.fetchFixtureStatistics(id);
+        await this.fetchAndPersistLineups(id);
+        done++;
+      } catch (error: any) {
+        this.logger.debug(
+          `Backfill stats/lineups for fixture ${id} failed: ${error.message}`,
+        );
+      }
+    }
+    if (done > 0) {
+      this.logger.debug(
+        `Backfilled stats + lineups for ${done} finished fixture(s)`,
+      );
+    }
+    return done;
+  }
+
+  /**
+   * Fetch the injuries for a single fixture FRESH and upsert them.
+   * `/injuries?fixture={id}` returns both teams' confirmed absences for that
+   * exact match — current and cheap (one call), unlike the league-wide
+   * syncInjuries which is cooldown-gated.
+   */
+  async syncInjuriesForFixture(fixtureId: number): Promise<number> {
+    try {
+      const data = await this.apiRequest<any>('/injuries', {
+        fixture: String(fixtureId),
+      });
+      const items: any[] = data.response ?? [];
+      let count = 0;
+      for (const item of items) {
+        if (!item.player?.id || !item.team?.id || !item.league?.id) continue;
+        try {
+          if (item.team?.name) {
+            await this.ensureTeam({
+              id: item.team.id,
+              name: item.team.name,
+              logo: item.team.logo,
+            });
+          }
+          await this.db
+            .insert(schema.injuries)
+            .values({
+              playerId: item.player.id,
+              playerName: item.player.name,
+              type: item.player.type,
+              reason: item.player.reason,
+              teamId: item.team.id,
+              fixtureId,
+              leagueId: item.league.id,
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [
+                schema.injuries.playerId,
+                schema.injuries.teamId,
+                schema.injuries.leagueId,
+                schema.injuries.type,
+              ],
+              set: {
+                playerName: item.player.name,
+                reason: item.player.reason,
+                fixtureId,
+                updatedAt: new Date(),
+              },
+            });
+          count++;
+        } catch (error: any) {
+          this.logger.debug(
+            `Fixture injury upsert failed for player ${item.player?.id}: ${error.message}`,
+          );
+        }
+      }
+      this.logger.debug(
+        `Freshened ${count} injuries for fixture ${fixtureId}`,
+      );
+      return count;
+    } catch (error: any) {
+      this.logger.warn(
+        `syncInjuriesForFixture(${fixtureId}) failed: ${error.message}`,
+      );
+      return 0;
+    }
+  }
+
+  /**
+   * Fetch specific fixtures by API-Football fixture ID and upsert them.
+   * API-Football accepts up to 20 ids per `/fixtures?ids=a-b-c` request.
+   */
+  async syncFixturesByIds(fixtureIds: number[]): Promise<number> {
+    if (!fixtureIds.length) return 0;
+    let upserted = 0;
+    const BATCH = 20;
+    for (let i = 0; i < fixtureIds.length; i += BATCH) {
+      const batch = fixtureIds.slice(i, i + BATCH);
+      try {
+        const data = await this.apiRequest<any>('/fixtures', {
+          ids: batch.join('-'),
+        });
+        for (const item of data.response ?? []) {
+          await this.upsertFixture(item);
+          upserted++;
+        }
+      } catch (error: any) {
+        this.logger.warn(
+          `syncFixturesByIds batch [${batch[0]}…] failed: ${error.message}`,
+        );
+      }
+    }
+    return upserted;
+  }
+
+  /**
+   * Reconcile "stale" fixtures: any fixture whose kickoff is in the past but
+   * whose status is still non-terminal (NS, 1H, HT, 2H, etc.). These are games
+   * that were played but never resolved — typically because they were missed
+   * inside syncCompletedFixtures' fixed 2-day window. Re-fetches them by ID so
+   * form windows, standings and prediction resolution stay current regardless
+   * of how long ago the game was.
+   *
+   * @param maxAgeHours only reconcile fixtures older than this (default 3h, so
+   *   we don't fight with the live in-play sync).
+   * @param limit cap per run to bound API usage (default 300 = 15 batches).
+   */
+  async resolveStaleFixtures(maxAgeHours = 3, limit = 300): Promise<number> {
+    const cutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000);
+    const stale = await this.db
+      .select({ id: schema.fixtures.id })
+      .from(schema.fixtures)
+      .where(
+        and(
+          lt(schema.fixtures.date, cutoff),
+          notInArray(
+            schema.fixtures.status,
+            FootballService.TERMINAL_STATUSES,
+          ),
+        ),
+      )
+      .orderBy(desc(schema.fixtures.date))
+      .limit(limit);
+
+    if (!stale.length) return 0;
+    this.logger.log(
+      `Reconciling ${stale.length} stale (past-dated, non-final) fixture(s)`,
+    );
+    const upserted = await this.syncFixturesByIds(stale.map((f: any) => f.id));
+    this.logger.log(`Stale-fixture reconciliation upserted ${upserted}`);
+    return upserted;
+  }
+
+  /**
    * Fetch fixtures for a specific league within a date range and upsert them.
    * Used for historical backfill — does NOT use the `next` param.
    *
@@ -880,6 +1148,362 @@ export class FootballService {
       .where(eq(schema.fixtureLineups.fixtureId, fixtureId));
 
     return lineups;
+  }
+
+  /**
+   * Number of days a cached player_season_stats row stays fresh before we
+   * re-pull from API-Football. Player season aggregates change slowly, so a
+   * 3-day window keeps the player-by-player breakdown current without
+   * hammering the rate-limited /players endpoint on every prediction.
+   */
+  private static readonly PLAYER_STATS_STALE_MS = 3 * 24 * 60 * 60 * 1000;
+
+  /**
+   * Get a team's full squad with per-player season aggregates, GK -> every
+   * outfield player. Reads the cached player_season_stats table; if the cache
+   * is empty or stale for this (team, season) it refreshes from API-Football
+   * `/players?team=&season=` (paginated) and upserts.
+   *
+   * Display-only: this powers the player-by-player section of the prediction
+   * insights and does NOT feed the probability model.
+   *
+   * @param leagueId optional — when the API returns stats across multiple
+   *   competitions we prefer this league's row; otherwise the aggregate.
+   */
+  async getSquadWithSeasonStats(
+    teamId: number,
+    season: number,
+    leagueId?: number,
+  ): Promise<any[]> {
+    const cached = await this.db
+      .select()
+      .from(schema.playerSeasonStats)
+      .where(
+        and(
+          eq(schema.playerSeasonStats.teamId, teamId),
+          eq(schema.playerSeasonStats.season, season),
+        ),
+      );
+
+    const newestFetch = cached.reduce((max: number, r: any) => {
+      const t = r.fetchedAt ? new Date(r.fetchedAt).getTime() : 0;
+      return t > max ? t : max;
+    }, 0);
+    const isFresh =
+      cached.length > 0 &&
+      Date.now() - newestFetch < FootballService.PLAYER_STATS_STALE_MS;
+
+    if (isFresh) return cached;
+
+    try {
+      const refreshed = await this.fetchAndPersistSquadStats(
+        teamId,
+        season,
+        leagueId,
+      );
+      if (refreshed.length > 0) return refreshed;
+    } catch (error: any) {
+      this.logger.warn(
+        `Squad stats fetch failed for team ${teamId} season ${season}: ${error.message}`,
+      );
+    }
+
+    // Fall back to whatever (possibly stale) cache we have rather than nothing.
+    return cached;
+  }
+
+  /**
+   * Pull every page of `/players?team=&season=` and upsert into
+   * player_season_stats. Returns the freshly upserted rows.
+   */
+  private async fetchAndPersistSquadStats(
+    teamId: number,
+    season: number,
+    leagueId?: number,
+  ): Promise<any[]> {
+    const collected: any[] = [];
+    let page = 1;
+    let totalPages = 1;
+
+    do {
+      const data = await this.apiRequest<any>('/players', {
+        team: String(teamId),
+        season: String(season),
+        page: String(page),
+      });
+
+      const response = data.response ?? [];
+      for (const entry of response) collected.push(entry);
+
+      totalPages = data.paging?.total ?? 1;
+      page += 1;
+    } while (page <= totalPages && page <= 20); // hard cap: squads never need 20 pages
+
+    if (collected.length === 0) return [];
+
+    const rows = collected
+      .map((entry) => this.normalizePlayerSeasonEntry(entry, teamId, season, leagueId))
+      .filter((r): r is NonNullable<typeof r> => r != null);
+
+    const now = new Date();
+    for (const row of rows) {
+      await this.db
+        .insert(schema.playerSeasonStats)
+        .values(row)
+        .onConflictDoUpdate({
+          target: [
+            schema.playerSeasonStats.playerId,
+            schema.playerSeasonStats.teamId,
+            schema.playerSeasonStats.season,
+          ],
+          set: { ...row, fetchedAt: now, updatedAt: now },
+        });
+    }
+
+    this.logger.log(
+      `Refreshed ${rows.length} player season stat row(s) for team ${teamId} season ${season}`,
+    );
+
+    return this.db
+      .select()
+      .from(schema.playerSeasonStats)
+      .where(
+        and(
+          eq(schema.playerSeasonStats.teamId, teamId),
+          eq(schema.playerSeasonStats.season, season),
+        ),
+      );
+  }
+
+  /**
+   * Map one API-Football /players entry to a player_season_stats row.
+   * The API returns one `statistics[]` element per competition; we prefer the
+   * requested league, else the element with the most appearances.
+   */
+  private normalizePlayerSeasonEntry(
+    entry: any,
+    teamId: number,
+    season: number,
+    leagueId?: number,
+  ): Record<string, any> | null {
+    const player = entry?.player;
+    if (!player?.id) return null;
+
+    const statsList: any[] = Array.isArray(entry.statistics)
+      ? entry.statistics
+      : [];
+
+    const appearancesOf = (s: any) => Number(s?.games?.appearences ?? 0) || 0;
+
+    let stat =
+      (leagueId != null &&
+        statsList.find((s) => s?.league?.id === leagueId)) ||
+      null;
+    if (!stat) {
+      stat = statsList.reduce(
+        (best, s) => (best == null || appearancesOf(s) > appearancesOf(best) ? s : best),
+        null as any,
+      );
+    }
+    stat = stat ?? {};
+
+    const num = (v: any): number | null =>
+      v === null || v === undefined ? null : Number(v);
+
+    const rating =
+      stat?.games?.rating != null ? Number(stat.games.rating) : null;
+
+    return {
+      playerId: player.id,
+      teamId,
+      season,
+      leagueId: stat?.league?.id ?? leagueId ?? null,
+      name: player.name ?? null,
+      firstname: player.firstname ?? null,
+      lastname: player.lastname ?? null,
+      age: num(player.age),
+      nationality: player.nationality ?? null,
+      height: player.height ?? null,
+      weight: player.weight ?? null,
+      photo: player.photo ?? null,
+      position: stat?.games?.position ?? null,
+      appearances: num(stat?.games?.appearences),
+      lineups: num(stat?.games?.lineups),
+      minutes: num(stat?.games?.minutes),
+      rating: rating != null && !Number.isNaN(rating) ? String(rating.toFixed(2)) : null,
+      captain: stat?.games?.captain ?? null,
+      goals: num(stat?.goals?.total),
+      assists: num(stat?.goals?.assists),
+      goalsConceded: num(stat?.goals?.conceded),
+      saves: num(stat?.goals?.saves),
+      shotsTotal: num(stat?.shots?.total),
+      shotsOn: num(stat?.shots?.on),
+      passesTotal: num(stat?.passes?.total),
+      passesKey: num(stat?.passes?.key),
+      passAccuracy: num(stat?.passes?.accuracy),
+      tacklesTotal: num(stat?.tackles?.total),
+      interceptions: num(stat?.tackles?.interceptions),
+      duelsTotal: num(stat?.duels?.total),
+      duelsWon: num(stat?.duels?.won),
+      dribblesAttempts: num(stat?.dribbles?.attempts),
+      dribblesSuccess: num(stat?.dribbles?.success),
+      yellowCards: num(stat?.cards?.yellow),
+      redCards: num(stat?.cards?.red),
+      penaltyScored: num(stat?.penalty?.scored),
+      penaltyMissed: num(stat?.penalty?.missed),
+      rawData: stat ?? null,
+      updatedAt: new Date(),
+    };
+  }
+
+  /**
+   * Staleness window for the cached team_season_statistics. Season aggregates
+   * shift slowly, so a 2-day window keeps profiles current without re-pulling
+   * the rate-limited endpoint on every prediction.
+   */
+  private static readonly TEAM_STATS_STALE_MS = 2 * 24 * 60 * 60 * 1000;
+
+  /**
+   * Get a team's full season profile from API-Football `/teams/statistics`
+   * (home/away splits, goals & cards by minute, streaks, clean sheets,
+   * failed-to-score, penalties, formations). Reads the cached
+   * team_season_statistics row; refreshes from the API when missing or stale.
+   *
+   * Returns the persisted row, or null when unavailable.
+   */
+  async getTeamSeasonStatistics(
+    teamId: number,
+    leagueId: number,
+    season: number,
+  ): Promise<any | null> {
+    const cached = await this.db
+      .select()
+      .from(schema.teamSeasonStatistics)
+      .where(
+        and(
+          eq(schema.teamSeasonStatistics.teamId, teamId),
+          eq(schema.teamSeasonStatistics.leagueId, leagueId),
+          eq(schema.teamSeasonStatistics.season, season),
+        ),
+      )
+      .limit(1);
+
+    const row = cached[0] ?? null;
+    const fresh =
+      row?.fetchedAt &&
+      Date.now() - new Date(row.fetchedAt).getTime() <
+        FootballService.TEAM_STATS_STALE_MS;
+    if (row && fresh) return row;
+
+    try {
+      const refreshed = await this.fetchAndPersistTeamSeasonStatistics(
+        teamId,
+        leagueId,
+        season,
+      );
+      if (refreshed) return refreshed;
+    } catch (error: any) {
+      this.logger.warn(
+        `Team statistics fetch failed for team ${teamId} league ${leagueId} season ${season}: ${error.message}`,
+      );
+    }
+    return row; // possibly-stale fallback
+  }
+
+  private async fetchAndPersistTeamSeasonStatistics(
+    teamId: number,
+    leagueId: number,
+    season: number,
+  ): Promise<any | null> {
+    const data = await this.apiRequest<any>('/teams/statistics', {
+      team: String(teamId),
+      league: String(leagueId),
+      season: String(season),
+    });
+
+    // /teams/statistics returns a single object (not an array) under `response`.
+    const r: any = data.response;
+    if (!r || !r.team) return null;
+
+    const n = (v: any): number | null =>
+      v === null || v === undefined ? null : Number(v);
+    const dec = (v: any): string | null =>
+      v === null || v === undefined ? null : String(Number(v).toFixed(2));
+
+    const goalsForMin = r.goals?.for?.minute ?? null;
+    const goalsAgainstMin = r.goals?.against?.minute ?? null;
+
+    const now = new Date();
+    const row = {
+      teamId,
+      leagueId,
+      season,
+      formString: r.form ?? null,
+      playedHome: n(r.fixtures?.played?.home),
+      playedAway: n(r.fixtures?.played?.away),
+      playedTotal: n(r.fixtures?.played?.total),
+      winsHome: n(r.fixtures?.wins?.home),
+      winsAway: n(r.fixtures?.wins?.away),
+      winsTotal: n(r.fixtures?.wins?.total),
+      drawsHome: n(r.fixtures?.draws?.home),
+      drawsAway: n(r.fixtures?.draws?.away),
+      drawsTotal: n(r.fixtures?.draws?.total),
+      lossesHome: n(r.fixtures?.loses?.home),
+      lossesAway: n(r.fixtures?.loses?.away),
+      lossesTotal: n(r.fixtures?.loses?.total),
+      goalsForHome: n(r.goals?.for?.total?.home),
+      goalsForAway: n(r.goals?.for?.total?.away),
+      goalsForTotal: n(r.goals?.for?.total?.total),
+      goalsAgainstHome: n(r.goals?.against?.total?.home),
+      goalsAgainstAway: n(r.goals?.against?.total?.away),
+      goalsAgainstTotal: n(r.goals?.against?.total?.total),
+      goalsForAvgHome: dec(r.goals?.for?.average?.home),
+      goalsForAvgAway: dec(r.goals?.for?.average?.away),
+      goalsForAvgTotal: dec(r.goals?.for?.average?.total),
+      goalsAgainstAvgHome: dec(r.goals?.against?.average?.home),
+      goalsAgainstAvgAway: dec(r.goals?.against?.average?.away),
+      goalsAgainstAvgTotal: dec(r.goals?.against?.average?.total),
+      cleanSheetHome: n(r.clean_sheet?.home),
+      cleanSheetAway: n(r.clean_sheet?.away),
+      cleanSheetTotal: n(r.clean_sheet?.total),
+      failedToScoreHome: n(r.failed_to_score?.home),
+      failedToScoreAway: n(r.failed_to_score?.away),
+      failedToScoreTotal: n(r.failed_to_score?.total),
+      streakWins: n(r.biggest?.streak?.wins),
+      streakDraws: n(r.biggest?.streak?.draws),
+      streakLoses: n(r.biggest?.streak?.loses),
+      penaltyScored: n(r.penalty?.scored?.total),
+      penaltyMissed: n(r.penalty?.missed?.total),
+      penaltyTotal: n(r.penalty?.total),
+      goalsForByMinute: goalsForMin,
+      goalsAgainstByMinute: goalsAgainstMin,
+      goalsForUnderOver: r.goals?.for?.under_over ?? null,
+      goalsAgainstUnderOver: r.goals?.against?.under_over ?? null,
+      cardsYellowByMinute: r.cards?.yellow ?? null,
+      cardsRedByMinute: r.cards?.red ?? null,
+      biggest: r.biggest ?? null,
+      lineupsUsed: r.lineups ?? null,
+      rawData: r,
+      updatedAt: now,
+    };
+
+    const [stored] = await this.db
+      .insert(schema.teamSeasonStatistics)
+      .values(row)
+      .onConflictDoUpdate({
+        target: [
+          schema.teamSeasonStatistics.teamId,
+          schema.teamSeasonStatistics.leagueId,
+          schema.teamSeasonStatistics.season,
+        ],
+        set: { ...row, fetchedAt: now, updatedAt: now },
+      })
+      .returning();
+
+    this.logger.log(
+      `Refreshed team season statistics for team ${teamId} league ${leagueId} season ${season}`,
+    );
+    return stored;
   }
 
   /**
@@ -2108,22 +2732,51 @@ export class FootballService {
     const fixture = fixtureRows?.[0];
     if (!fixture) return null;
 
-    const [statistics, events, injuries, lineups] = await Promise.all([
-      this.db
-        .select()
-        .from(schema.fixtureStatistics)
-        .where(eq(schema.fixtureStatistics.fixtureId, id)),
-      this.db
-        .select()
-        .from(schema.fixtureEvents)
-        .where(eq(schema.fixtureEvents.fixtureId, id))
-        .orderBy(asc(schema.fixtureEvents.elapsed)),
-      this.db
-        .select()
-        .from(schema.injuries)
-        .where(eq(schema.injuries.fixtureId, id)),
-      this.getLineupsForFixture(id),
-    ]);
+    const teamIds = [fixture.homeTeamId, fixture.awayTeamId].filter(
+      (x): x is number => typeof x === 'number',
+    );
+
+    const [statistics, events, injuries, lineups, teamRows, polymarketMap] =
+      await Promise.all([
+        this.db
+          .select()
+          .from(schema.fixtureStatistics)
+          .where(eq(schema.fixtureStatistics.fixtureId, id)),
+        this.db
+          .select()
+          .from(schema.fixtureEvents)
+          .where(eq(schema.fixtureEvents.fixtureId, id))
+          .orderBy(asc(schema.fixtureEvents.elapsed)),
+        this.db
+          .select()
+          .from(schema.injuries)
+          .where(eq(schema.injuries.fixtureId, id)),
+        this.getLineupsForFixture(id),
+        teamIds.length > 0
+          ? this.db
+              .select({
+                id: schema.teams.id,
+                name: schema.teams.name,
+                shortName: schema.teams.shortName,
+                logo: schema.teams.logo,
+              })
+              .from(schema.teams)
+              .where(inArray(schema.teams.id, teamIds))
+          : Promise.resolve(
+              [] as Array<{
+                id: number;
+                name: string;
+                shortName: string | null;
+                logo: string | null;
+              }>,
+            ),
+        this.getPolymarketInfoForFixtures([id]),
+      ]);
+
+    const teamMap = new Map<number, (typeof teamRows)[number]>();
+    for (const t of teamRows) teamMap.set(t.id, t);
+    const home = teamMap.get(fixture.homeTeamId) ?? null;
+    const away = teamMap.get(fixture.awayTeamId) ?? null;
 
     // Fetch live prediction from API if fixture hasn't started yet
     let prediction = null;
@@ -2135,7 +2788,45 @@ export class FootballService {
       }
     }
 
-    return { fixture, statistics, events, injuries, lineups, prediction };
+    return {
+      fixture,
+      homeTeam: home
+        ? {
+            id: home.id,
+            name: home.name ?? null,
+            shortName: home.shortName ?? null,
+            logo: home.logo ?? null,
+          }
+        : fixture.homeTeamId
+          ? {
+              id: fixture.homeTeamId,
+              name: null,
+              shortName: null,
+              logo: null,
+            }
+          : null,
+      awayTeam: away
+        ? {
+            id: away.id,
+            name: away.name ?? null,
+            shortName: away.shortName ?? null,
+            logo: away.logo ?? null,
+          }
+        : fixture.awayTeamId
+          ? {
+              id: fixture.awayTeamId,
+              name: null,
+              shortName: null,
+              logo: null,
+            }
+          : null,
+      statistics,
+      events,
+      injuries,
+      lineups,
+      prediction,
+      polymarket: polymarketMap.get(id) ?? null,
+    };
   }
 
   /**
@@ -2243,6 +2934,14 @@ export class FootballService {
     // triggered with fresher data, so it supersedes older runs.
     const bestPrediction = predictions[0] ?? null;
 
+    // Backfill visual assets (club logos + player photos) into the stored
+    // matchInsights at read time. Logos/photos are static reference data, so
+    // enriching here means every prediction — including ones generated before
+    // assets were added — returns them without needing regeneration.
+    if (bestPrediction?.matchInsights) {
+      await this.enrichInsightsAssets(bestPrediction.matchInsights);
+    }
+
     return {
       fixture: {
         id: fixture.id,
@@ -2319,6 +3018,10 @@ export class FootballService {
             valueBets: bestPrediction.valueBets,
             detailedAnalysis: bestPrediction.detailedAnalysis,
             matchContext: bestPrediction.matchContext,
+            // Deep-analysis sections: head-to-head, last-20 form, streaks, full
+            // player roster, season profiles, Tier-1 signals, market slate, and
+            // referee/weather/discipline/stakes context.
+            matchInsights: bestPrediction.matchInsights,
             opponentStrengthProfile: this.formatOpponentStrengthProfile(
               bestPrediction.matchContext?.opponentStrength,
               {
@@ -2366,6 +3069,114 @@ export class FootballService {
   }
 
   /**
+   * Backfill club logos and player photos into a stored matchInsights blob.
+   * Mutates the blob in place. Logos/photos are static reference data, so this
+   * lets predictions generated before assets were added still return them.
+   * Two batched lookups: teams (for all referenced team ids) and
+   * player_season_stats (for all referenced player ids).
+   */
+  private async enrichInsightsAssets(insights: any): Promise<void> {
+    try {
+      const teamIds = new Set<number>();
+      const playerIds = new Set<number>();
+
+      const addTeam = (id: any) => {
+        if (typeof id === 'number') teamIds.add(id);
+      };
+
+      // Recent form: team + opponents
+      for (const side of ['home', 'away']) {
+        const rf = insights?.recentForm?.[side];
+        if (rf) {
+          addTeam(rf.teamId);
+          for (const m of rf.matches ?? []) addTeam(m.opponentId);
+        }
+        const tp = insights?.teamProfiles?.[side];
+        if (tp) addTeam(tp.teamId);
+        const pb = insights?.players?.[side];
+        if (pb) {
+          addTeam(pb.teamId);
+          for (const group of [
+            'goalkeepers',
+            'defenders',
+            'midfielders',
+            'forwards',
+            'unavailable',
+          ]) {
+            for (const p of pb[group] ?? [])
+              if (typeof p.playerId === 'number') playerIds.add(p.playerId);
+          }
+        }
+      }
+      // H2H meetings
+      for (const m of insights?.headToHead?.matches ?? []) {
+        addTeam(m.homeTeamId);
+        addTeam(m.awayTeamId);
+      }
+
+      const [teamRows, playerRows] = await Promise.all([
+        teamIds.size > 0
+          ? this.db
+              .select({ id: schema.teams.id, logo: schema.teams.logo })
+              .from(schema.teams)
+              .where(inArray(schema.teams.id, [...teamIds]))
+          : Promise.resolve([]),
+        playerIds.size > 0
+          ? this.db
+              .select({
+                playerId: schema.playerSeasonStats.playerId,
+                photo: schema.playerSeasonStats.photo,
+              })
+              .from(schema.playerSeasonStats)
+              .where(inArray(schema.playerSeasonStats.playerId, [...playerIds]))
+          : Promise.resolve([]),
+      ]);
+
+      const logoById = new Map<number, string | null>();
+      for (const t of teamRows) logoById.set(t.id, t.logo ?? null);
+      const photoById = new Map<number, string | null>();
+      for (const p of playerRows)
+        if (p.photo && !photoById.has(p.playerId))
+          photoById.set(p.playerId, p.photo);
+
+      const teamLogo = (id: any) =>
+        typeof id === 'number' ? (logoById.get(id) ?? null) : null;
+
+      for (const side of ['home', 'away']) {
+        const rf = insights?.recentForm?.[side];
+        if (rf) {
+          if (rf.teamLogo == null) rf.teamLogo = teamLogo(rf.teamId);
+          for (const m of rf.matches ?? [])
+            if (m.opponentLogo == null) m.opponentLogo = teamLogo(m.opponentId);
+        }
+        const tp = insights?.teamProfiles?.[side];
+        if (tp && tp.teamLogo == null) tp.teamLogo = teamLogo(tp.teamId);
+        const pb = insights?.players?.[side];
+        if (pb) {
+          if (pb.teamLogo == null) pb.teamLogo = teamLogo(pb.teamId);
+          for (const group of [
+            'goalkeepers',
+            'defenders',
+            'midfielders',
+            'forwards',
+            'unavailable',
+          ]) {
+            for (const p of pb[group] ?? [])
+              if (p.photo == null && typeof p.playerId === 'number')
+                p.photo = photoById.get(p.playerId) ?? null;
+          }
+        }
+      }
+      for (const m of insights?.headToHead?.matches ?? []) {
+        if (m.homeTeamLogo == null) m.homeTeamLogo = teamLogo(m.homeTeamId);
+        if (m.awayTeamLogo == null) m.awayTeamLogo = teamLogo(m.awayTeamId);
+      }
+    } catch (error: any) {
+      this.logger.debug(`Insights asset enrichment failed: ${error.message}`);
+    }
+  }
+
+  /**
    * Fetch all currently live fixtures from the API.
    */
   async fetchLiveFixtures(leagueId?: number): Promise<any[]> {
@@ -2376,6 +3187,160 @@ export class FootballService {
 
     const data = await this.apiRequest<any>('/fixtures', params);
     return data.response ?? [];
+  }
+
+  // ─── Live match stats (realtime) ────────────────────────────────────────
+
+  private static readonly LIVE_STATUSES = [
+    '1H',
+    'HT',
+    '2H',
+    'ET',
+    'BT',
+    'P',
+    'LIVE',
+    'INT',
+    'SUSP',
+  ];
+  /** Short server-side cache so many concurrent viewers share one upstream poll. */
+  private liveStatsCache = new Map<number, { data: any; expiresAt: number }>();
+  private static readonly LIVE_CACHE_TTL_MS = 12_000;
+
+  /**
+   * Realtime in-play stats for a fixture: current score, elapsed, per-team
+   * statistics (shots on target, total shots, possession, xG, corners, cards…),
+   * formations, and events — fetched fresh from API-Football. Intended to be
+   * polled by the client while a match is in play. Cached ~12s so a burst of
+   * viewers triggers only one upstream call per fixture.
+   */
+  async getLiveMatchStats(fixtureId: number): Promise<any> {
+    const cached = this.liveStatsCache.get(fixtureId);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+
+    // Current fixture state (score, status, elapsed, teams, league).
+    const fxData = await this.apiRequest<any>('/fixtures', {
+      id: String(fixtureId),
+    });
+    const fx = fxData.response?.[0];
+    if (!fx) {
+      const empty = { fixtureId, found: false, isLive: false };
+      this.liveStatsCache.set(fixtureId, {
+        data: empty,
+        expiresAt: Date.now() + FootballService.LIVE_CACHE_TTL_MS,
+      });
+      return empty;
+    }
+
+    const short = fx.fixture?.status?.short ?? null;
+    const isLive = FootballService.LIVE_STATUSES.includes(short);
+    const isFinished = ['FT', 'AET', 'PEN'].includes(short);
+
+    // Stats / lineups / events only exist once a match is under way.
+    let statsResp: any[] = [];
+    let lineupsResp: any[] = [];
+    let eventsResp: any[] = [];
+    if (isLive || isFinished) {
+      const [s, l, e] = await Promise.all([
+        this.apiRequest<any>('/fixtures/statistics', {
+          fixture: String(fixtureId),
+        })
+          .then((d) => d.response ?? [])
+          .catch(() => []),
+        this.apiRequest<any>('/fixtures/lineups', {
+          fixture: String(fixtureId),
+        })
+          .then((d) => d.response ?? [])
+          .catch(() => []),
+        this.apiRequest<any>('/fixtures/events', {
+          fixture: String(fixtureId),
+        })
+          .then((d) => d.response ?? [])
+          .catch(() => []),
+      ]);
+      statsResp = s;
+      lineupsResp = l;
+      eventsResp = e;
+    }
+
+    const statsByTeam = new Map<number, any>();
+    for (const ts of statsResp) {
+      const map: Record<string, any> = {};
+      for (const st of ts.statistics ?? []) map[st.type] = st.value;
+      statsByTeam.set(ts.team?.id, {
+        shotsOnTarget: this.parseStatInt(map['Shots on Goal']),
+        totalShots: this.parseStatInt(map['Total Shots']),
+        shotsInsideBox: this.parseStatInt(map['Shots insidebox']),
+        blockedShots: this.parseStatInt(map['Blocked Shots']),
+        possession: this.parseStatPercentStr(map['Ball Possession']),
+        expectedGoals: this.parseStatFloatStr(map['expected_goals']),
+        cornerKicks: this.parseStatInt(map['Corner Kicks']),
+        offsides: this.parseStatInt(map['Offsides']),
+        fouls: this.parseStatInt(map['Fouls']),
+        yellowCards: this.parseStatInt(map['Yellow Cards']),
+        redCards: this.parseStatInt(map['Red Cards']),
+        goalkeeperSaves: this.parseStatInt(map['Goalkeeper Saves']),
+        totalPasses: this.parseStatInt(map['Total passes']),
+        passesAccurate: this.parseStatInt(map['Passes accurate']),
+        passAccuracy: this.parseStatPercentStr(map['Passes %']),
+      });
+    }
+
+    const formationByTeam = new Map<number, string | null>();
+    for (const l of lineupsResp)
+      formationByTeam.set(l.team?.id, l.formation ?? null);
+
+    const home = fx.teams?.home;
+    const away = fx.teams?.away;
+    const buildSide = (t: any) => ({
+      teamId: t?.id ?? null,
+      name: t?.name ?? null,
+      logo: t?.logo ?? null,
+      formation: t?.id != null ? (formationByTeam.get(t.id) ?? null) : null,
+      stats: (t?.id != null && statsByTeam.get(t.id)) || null,
+    });
+
+    const events = (eventsResp ?? []).map((ev: any) => ({
+      minute: ev.time?.elapsed ?? null,
+      extra: ev.time?.extra ?? null,
+      teamId: ev.team?.id ?? null,
+      teamName: ev.team?.name ?? null,
+      type: ev.type ?? null,
+      detail: ev.detail ?? null,
+      player: ev.player?.name ?? null,
+      assist: ev.assist?.name ?? null,
+    }));
+
+    const result = {
+      fixtureId,
+      found: true,
+      isLive,
+      isFinished,
+      status: {
+        short,
+        long: fx.fixture?.status?.long ?? null,
+        elapsed: fx.fixture?.status?.elapsed ?? null,
+      },
+      league: {
+        id: fx.league?.id ?? null,
+        name: fx.league?.name ?? null,
+        round: fx.league?.round ?? null,
+      },
+      score: {
+        home: fx.goals?.home ?? null,
+        away: fx.goals?.away ?? null,
+        halftime: fx.score?.halftime ?? null,
+      },
+      home: buildSide(home),
+      away: buildSide(away),
+      events,
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.liveStatsCache.set(fixtureId, {
+      data: result,
+      expiresAt: Date.now() + FootballService.LIVE_CACHE_TTL_MS,
+    });
+    return result;
   }
 
   /**

@@ -263,6 +263,100 @@ export class PolymarketDataService {
   }
 
   /**
+   * Full per-user trade history via `/activity?type=TRADE`, paginated
+   * via offset. Backs the wallet-analyzer's "peak exposure"
+   * computation — the `totalBought` field on /positions is cumulative
+   * gross USD across all buys (including rebuys after partial sells),
+   * which is NOT the amount the user ever had at risk. Reconstructing
+   * actual peak cost basis requires replaying the fill log.
+   *
+   * We hit `/activity` rather than `/trades` because `/trades` aggregates
+   * one row per CLOB order (so a market buy that consumed 20
+   * counterparties shows as 1 row), while `/activity` gives one row per
+   * fill — which is what you need for a faithful share-by-share replay.
+   * Concretely: on a real Polymarket position we tested, `/trades`
+   * returned 9 rows totaling 38K shares / $25K, while `/activity`
+   * returned 173 rows totaling the full 47K shares / $31K that the
+   * user actually holds.
+   *
+   * `truncated` means we filled `maxPages` without seeing an end-of-
+   * list signal. 50 pages × 500 rows = 25,000 fills — fits every
+   * non-pathological wallet with plenty of room.
+   */
+  async getUserTradesAll(
+    proxyWallet: string,
+    opts: { pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ trades: PolymarketTrade[]; truncated: boolean }> {
+    const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
+    // /activity starts returning HTTP 400 past an undocumented offset
+    // ceiling (~3,500 rows for our test wallets), so we cap maxPages
+    // tighter than the positions fetchers — extra pages past the
+    // ceiling just add round-trip latency for zero data.
+    const maxPages = Math.max(1, opts.maxPages ?? 10);
+    const cacheKey = `user-activity-all:${proxyWallet}:${pageSize}:${maxPages}`;
+    return this.cached(cacheKey, this.TRADES_TTL_MS, async () => {
+      const seen = new Set<string>();
+      const out: PolymarketTrade[] = [];
+
+      for (
+        let batchStart = 0;
+        batchStart < maxPages;
+        batchStart += this.PAGINATION_BATCH
+      ) {
+        const batchEnd = Math.min(
+          batchStart + this.PAGINATION_BATCH,
+          maxPages,
+        );
+        const pagePromises: Array<Promise<PolymarketTrade[] | null>> = [];
+        for (let page = batchStart; page < batchEnd; page++) {
+          pagePromises.push(
+            this.client
+              .get<PolymarketTrade[]>('/activity', {
+                params: {
+                  user: proxyWallet,
+                  type: 'TRADE',
+                  limit: pageSize,
+                  offset: page * pageSize,
+                },
+              })
+              .then((r) => (Array.isArray(r.data) ? r.data : []))
+              .catch((err) => {
+                this.logger.warn(
+                  `getUserTradesAll page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
+                );
+                return null;
+              }),
+          );
+        }
+        const results = await Promise.all(pagePromises);
+
+        let hitEnd = false;
+        for (const rows of results) {
+          if (rows == null) {
+            hitEnd = true;
+            continue;
+          }
+          // Dedup on (txHash, asset, ts, size) — siblings fills share a
+          // txHash but are otherwise distinct; the full tuple catches
+          // the case where the API ignored offset and handed back a
+          // page we already saw.
+          let added = 0;
+          for (const row of rows) {
+            const key = `${row.transactionHash}:${row.asset}:${row.size}:${row.timestamp}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(row);
+            added++;
+          }
+          if (rows.length < pageSize || added === 0) hitEnd = true;
+        }
+        if (hitEnd) return { trades: out, truncated: false };
+      }
+      return { trades: out, truncated: true };
+    });
+  }
+
+  /**
    * All current positions for a wallet (across every market they hold).
    * Returns realized + unrealized PnL data per position — the basis for
    * computing a trader's lifetime ROI.
@@ -308,6 +402,144 @@ export class PolymarketDataService {
         return [];
       }
     });
+  }
+
+  /**
+   * Paginated sweep of every open position for a wallet. Required by the
+   * wallet-analyzer endpoint where a partial view of a whale's book
+   * materially changes the reported PnL, resolved count, and streak
+   * numbers. Walks `/positions?offset=` until the API returns a short
+   * page or we hit `maxPages` as a safety stop.
+   *
+   * Distinct from `getUserPositions` which stays at a hard 200-row cap
+   * for hot paths like the /predict smart-money pool — fanning out
+   * 20× per wallet × N wallets would hammer the upstream API.
+   *
+   * `truncated === true` means we exhausted `maxPages` without seeing
+   * an end-of-list signal, so callers know the result is a lower bound.
+   */
+  async getUserPositionsAll(
+    proxyWallet: string,
+    opts: { pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
+    const pageSize = Math.min(500, Math.max(50, opts.pageSize ?? 500));
+    const maxPages = Math.max(1, opts.maxPages ?? 20);
+    const cacheKey = `positions-all:${proxyWallet}:${pageSize}:${maxPages}`;
+    return this.cached(cacheKey, this.POSITIONS_TTL_MS, async () => {
+      return this.paginatedPositions(
+        '/positions',
+        proxyWallet,
+        pageSize,
+        maxPages,
+        'getUserPositionsAll',
+      );
+    });
+  }
+
+  /**
+   * Paginated sweep of every closed position for a wallet.
+   *
+   * ⚠ `/closed-positions` has a hard server-side cap of 50 rows per
+   * response, regardless of the `limit` you send. Using anything
+   * larger than 50 here makes our short-page termination heuristic
+   * trip on page 0 (we ask for 500, get 50, assume that's the whole
+   * list), which silently dropped every wallet's closed-position
+   * history past the first 50 entries. On a heavy trader this meant
+   * only their most recent 50 resolved bets were considered — and
+   * because /closed-positions is effectively sorted newest-first,
+   * the missing 90% were older bets. See getUserPositionsAll for the
+   * positions counterpart which does honour larger limits.
+   */
+  async getUserClosedPositionsAll(
+    proxyWallet: string,
+    opts: { pageSize?: number; maxPages?: number } = {},
+  ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
+    const pageSize = Math.min(50, Math.max(10, opts.pageSize ?? 50));
+    // With 50 rows per page, 200 pages covers 10,000 closed positions —
+    // a generous ceiling; whales-of-whales might trade more in a lifetime
+    // but that's a truly pathological case.
+    const maxPages = Math.max(1, opts.maxPages ?? 200);
+    const cacheKey = `closed-positions-all:${proxyWallet}:${pageSize}:${maxPages}`;
+    return this.cached(cacheKey, this.POSITIONS_TTL_MS, async () => {
+      return this.paginatedPositions(
+        '/closed-positions',
+        proxyWallet,
+        pageSize,
+        maxPages,
+        'getUserClosedPositionsAll',
+      );
+    });
+  }
+
+  /**
+   * How many pages to fetch in parallel per batch. Sequential paging
+   * multiplied latency for whale wallets (15 pages × ~200ms each = 3s+
+   * just for closed positions). 5 requests in parallel is well under
+   * typical upstream rate limits and cuts the wall-clock time by ~5×.
+   */
+  private readonly PAGINATION_BATCH = 5;
+
+  private async paginatedPositions(
+    endpoint: '/positions' | '/closed-positions',
+    proxyWallet: string,
+    pageSize: number,
+    maxPages: number,
+    label: string,
+  ): Promise<{ positions: UserPosition[]; truncated: boolean }> {
+    const seen = new Set<string>();
+    const out: UserPosition[] = [];
+
+    for (let batchStart = 0; batchStart < maxPages; batchStart += this.PAGINATION_BATCH) {
+      const batchEnd = Math.min(batchStart + this.PAGINATION_BATCH, maxPages);
+      const pagePromises: Array<Promise<UserPosition[] | null>> = [];
+      for (let page = batchStart; page < batchEnd; page++) {
+        pagePromises.push(
+          this.client
+            .get<UserPosition[]>(endpoint, {
+              params: {
+                user: proxyWallet,
+                limit: pageSize,
+                offset: page * pageSize,
+              },
+            })
+            .then((r) => (Array.isArray(r.data) ? r.data : []))
+            .catch((err) => {
+              this.logger.warn(
+                `${label} page ${page} failed for ${proxyWallet}: ${(err as Error).message}`,
+              );
+              return null;
+            }),
+        );
+      }
+      const results = await Promise.all(pagePromises);
+
+      let hitEnd = false;
+      for (const rows of results) {
+        // Any page failing (HTTP 400 from Polymarket often fires once
+        // you push past a hidden server-side offset ceiling) signals
+        // end-of-list. We keep whatever we already collected.
+        if (rows == null) {
+          hitEnd = true;
+          continue;
+        }
+        let added = 0;
+        for (const row of rows) {
+          const key = row.asset;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(row);
+          added++;
+        }
+        // Either a short page (explicit end signal from the API) or a
+        // page with zero new rows (API ignoring offset so handing back
+        // a dupe) both mean "no more data past this point."
+        if (rows.length < pageSize || added === 0) hitEnd = true;
+      }
+      if (hitEnd) return { positions: out, truncated: false };
+    }
+    // Filled maxPages × pageSize worth of unique rows without ever
+    // seeing an end signal — more likely exist upstream.
+    return { positions: out, truncated: true };
   }
 
   /**

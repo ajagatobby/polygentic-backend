@@ -34,7 +34,31 @@ import { SmartMoneySignalService } from '../polymarket/services/smart-money-sign
 import { CopyTraderService } from '../polymarket/services/copy-trader.service';
 import { PredictionMemoryService } from '../agents/prediction-memory.service';
 import { LeaguePriorsService } from '../agents/league-priors.service';
+import { VenueContextService } from '../agents/venue-context.service';
+import { IsotonicCalibrationService } from '../agents/isotonic-calibration.service';
+import { DirichletCalibrationService } from '../agents/dirichlet-calibration.service';
+import { FormBasedNudgeService } from '../agents/form-based-nudge.service';
+import { ClosingLineService } from '../agents/closing-line.service';
+import { PiRatingService } from '../agents/pi-rating.service';
+import { MetaBlenderService } from '../agents/meta-blender.service';
+import { LineupRestFeaturesService } from '../agents/lineup-rest-features.service';
+import { MatchInsightsService } from '../agents/match-insights.service';
+import { MarketAnalysisService } from '../agents/market-analysis.service';
+import { MatchContextService } from '../agents/match-context.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
+import { BaseballService } from '../baseball/baseball.service';
+import { BaseballTeamMapService } from '../baseball/baseball-team-map.service';
+import { MlbStatsService } from '../baseball/mlb-stats.service';
+import { StatcastService } from '../baseball/statcast.service';
+import { BaseballMarketService } from '../baseball/baseball-market.service';
+import { BaseballLeaguePriorsService } from '../baseball/baseball-league-priors.service';
+import { BaseballRunModelService } from '../baseball/baseball-run-model.service';
+import { BaseballResearchAgent } from '../baseball/agents/baseball-research.agent';
+import { BaseballAnalysisAgent } from '../baseball/agents/baseball-analysis.agent';
+import { BaseballCriticAgent } from '../baseball/agents/baseball-critic.agent';
+import { BaseballPredictionService } from '../baseball/baseball-prediction.service';
+import { BaseballBlenderService } from '../baseball/baseball-blender.service';
+import { BaseballCalibrationService } from '../baseball/baseball-calibration.service';
 
 // Handle both ESM default export and CJS module.exports for postgres
 const postgres =
@@ -113,6 +137,21 @@ export interface Services {
   polymarketDataService: PolymarketDataService;
   smartMoneySignalService: SmartMoneySignalService;
   copyTraderService: CopyTraderService;
+  isotonicCalibrationService: IsotonicCalibrationService;
+  dirichletCalibrationService: DirichletCalibrationService;
+  piRatingService: PiRatingService;
+  metaBlenderService: MetaBlenderService;
+  lineupRestFeaturesService: LineupRestFeaturesService;
+  // ── Baseball (MLB run-totals) ──
+  baseballService: BaseballService;
+  baseballTeamMap: BaseballTeamMapService;
+  mlbStatsService: MlbStatsService;
+  statcastService: StatcastService;
+  baseballMarketService: BaseballMarketService;
+  baseballRunModel: BaseballRunModelService;
+  baseballPredictionService: BaseballPredictionService;
+  baseballBlenderService: BaseballBlenderService;
+  baseballCalibrationService: BaseballCalibrationService;
 }
 
 /**
@@ -143,6 +182,20 @@ export function initServices(): Services {
 
   const predictionMemory = new PredictionMemoryService(config);
   const leaguePriorsService = new LeaguePriorsService(db as any);
+  const venueContextService = new VenueContextService(db as any);
+  const isotonicCalibrationService = new IsotonicCalibrationService(db as any);
+  const dirichletCalibrationService = new DirichletCalibrationService(db as any);
+  const formBasedNudgeService = new FormBasedNudgeService();
+  const closingLineService = new ClosingLineService(db as any);
+  const piRatingService = new PiRatingService(db as any);
+  const metaBlenderService = new MetaBlenderService(db as any);
+  const lineupRestFeaturesService = new LineupRestFeaturesService(db as any);
+  const matchInsightsService = new MatchInsightsService(
+    db as any,
+    footballService,
+  );
+  const marketAnalysisService = new MarketAnalysisService();
+  const matchContextService = new MatchContextService(db as any);
 
   // Build Polymarket services up front so AgentsService can take
   // PolymarketService as a dependency (used for on-demand fixture linking
@@ -187,8 +240,19 @@ export function initServices(): Services {
     alertsService,
     predictionMemory,
     leaguePriorsService,
+    venueContextService,
+    isotonicCalibrationService,
+    dirichletCalibrationService,
+    formBasedNudgeService,
+    closingLineService,
+    piRatingService,
+    metaBlenderService,
+    lineupRestFeaturesService,
     smartMoneySignalService,
     polymarketService,
+    matchInsightsService,
+    marketAnalysisService,
+    matchContextService,
   );
 
   const syncService = new SyncService(
@@ -196,6 +260,51 @@ export function initServices(): Services {
     config,
     footballService,
     oddsService,
+  );
+
+  // ── Baseball (MLB run-totals) ──
+  const baseballTeamMap = new BaseballTeamMapService(db as any);
+  const baseballService = new BaseballService(
+    config,
+    db as any,
+    baseballTeamMap,
+  );
+  const mlbStatsService = new MlbStatsService(config);
+  const statcastService = new StatcastService(
+    config,
+    db as any,
+    baseballTeamMap,
+  );
+  const baseballMarketService = new BaseballMarketService(
+    config,
+    db as any,
+    baseballTeamMap,
+  );
+  const baseballLeaguePriors = new BaseballLeaguePriorsService(db as any);
+  const baseballRunModel = new BaseballRunModelService(
+    baseballService,
+    statcastService,
+    baseballTeamMap,
+    baseballLeaguePriors,
+  );
+  const baseballResearchAgent = new BaseballResearchAgent(config);
+  const baseballAnalysisAgent = new BaseballAnalysisAgent(config);
+  const baseballCriticAgent = new BaseballCriticAgent(config);
+  const baseballBlenderService = new BaseballBlenderService(db as any);
+  const baseballCalibrationService = new BaseballCalibrationService(db as any);
+  const baseballPredictionService = new BaseballPredictionService(
+    db as any,
+    baseballService,
+    mlbStatsService,
+    statcastService,
+    baseballTeamMap,
+    baseballMarketService,
+    baseballRunModel,
+    baseballResearchAgent,
+    baseballAnalysisAgent,
+    baseballCriticAgent,
+    baseballBlenderService,
+    baseballCalibrationService,
   );
 
   return {
@@ -218,5 +327,19 @@ export function initServices(): Services {
     polymarketDataService,
     smartMoneySignalService,
     copyTraderService,
+    isotonicCalibrationService,
+    dirichletCalibrationService,
+    piRatingService,
+    metaBlenderService,
+    lineupRestFeaturesService,
+    baseballService,
+    baseballTeamMap,
+    mlbStatsService,
+    statcastService,
+    baseballMarketService,
+    baseballRunModel,
+    baseballPredictionService,
+    baseballBlenderService,
+    baseballCalibrationService,
   };
 }

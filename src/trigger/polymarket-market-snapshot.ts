@@ -82,14 +82,25 @@ export const polymarketMarketSnapshotTask = task({
       return { updated: 0, fetched: 0 };
     }
 
-    // Update each market by condition_id. Batch into a single transaction
-    // so a partial Gamma outage doesn't leave us half-way through.
+    // Update each market by condition_id AND append a snapshot row so
+    // the chart timeline has a real time series. One transaction so a
+    // partial Gamma outage doesn't leave us half-way through.
     let updated = 0;
     const now = new Date();
     await db.transaction(async (tx) => {
+      const snapshotRows: Array<{
+        marketId: string;
+        conditionId: string;
+        snapshotAt: Date;
+        outcomePrices: string[];
+        volume: string | null;
+        volume24hr: string | null;
+        liquidity: string | null;
+      }> = [];
+
       for (const m of fetched) {
         if (!m.conditionId) continue;
-        const res = await tx
+        await tx
           .update(schema.polymarketMarkets)
           .set({
             outcomePrices: m.outcomePrices,
@@ -103,11 +114,21 @@ export const polymarketMarketSnapshotTask = task({
             updatedAt: now,
           })
           .where(eq(schema.polymarketMarkets.conditionId, m.conditionId));
-        // postgres-js exposes the affected count via the returning array
-        // length when we use .returning(); without it there's no portable
-        // row-count. We only need it for the log — count the loop iterations.
-        void res;
         updated += 1;
+
+        snapshotRows.push({
+          marketId: m.marketId,
+          conditionId: m.conditionId,
+          snapshotAt: now,
+          outcomePrices: m.outcomePrices,
+          volume: m.volume != null ? String(m.volume) : null,
+          volume24hr: m.volume24hr != null ? String(m.volume24hr) : null,
+          liquidity: m.liquidity != null ? String(m.liquidity) : null,
+        });
+      }
+
+      if (snapshotRows.length > 0) {
+        await tx.insert(schema.polymarketPriceSnapshots).values(snapshotRows);
       }
     });
 

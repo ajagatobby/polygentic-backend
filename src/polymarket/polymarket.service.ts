@@ -6,6 +6,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import axios from 'axios';
 import {
   eq,
   and,
@@ -43,7 +44,10 @@ import {
   SmartMoneySignalService,
   SmartMoneySignal,
 } from './services/smart-money-signal.service';
-import { PolymarketDataService } from './services/polymarket-data.service';
+import {
+  PolymarketDataService,
+  PolymarketTrade,
+} from './services/polymarket-data.service';
 
 /**
  * PolymarketService — Orchestrator
@@ -1658,6 +1662,554 @@ export class PolymarketService implements OnModuleInit {
    * stats (pnl, roi, last10, last20, streak, resolved) auto-enables
    * enrichment so the values exist to filter against.
    */
+
+  /**
+   * Full wallet analysis — resolves a Polymarket handle or address to
+   * its proxy wallet, pulls lifetime stats + current / recent positions,
+   * and checks every qualification gate used by the smart-money signal.
+   * Powers the /wallet analyzer page.
+   */
+  async analyzeWallet(query: string): Promise<{
+    input: string;
+    wallet: string;
+    handle: string | null;
+    displayName: string | null;
+    pseudonym: string | null;
+    bio: string | null;
+    profileImage: string | null;
+    lifetime: {
+      totalPnl: number;
+      unrealizedPnl: number;
+      totalBought: number;
+      roi: number;
+      resolvedCount: number;
+      typicalBetSize: number;
+      currentWinStreak: number;
+      last10Wins: number | null;
+      last10WinRate: number;
+      last20Wins: number | null;
+      last20WinRate: number;
+    };
+    gates: {
+      minLifetimePnl: { required: number; actual: number; pass: boolean };
+      minLifetimeRoi: { required: number; actual: number; pass: boolean };
+      minResolvedBets: { required: number; actual: number; pass: boolean };
+      minLifetimePnlWithStreak: {
+        required: number;
+        actual: number;
+        pass: boolean;
+      };
+      minCurrentStreak: { required: number; actual: number; pass: boolean };
+      minLast10WinRate: { required: number; actual: number; pass: boolean };
+      baseQualifies: boolean;
+      hotStreakQualifies: boolean;
+      anyQualifies: boolean;
+    };
+    recentResolved: Array<{
+      conditionId: string | null;
+      marketQuestion: string | null;
+      outcomeName: string | null;
+      totalBought: number;
+      staked: number;
+      realizedPnl: number;
+      win: boolean;
+      endDate: string | null;
+    }>;
+    openPositions: Array<{
+      conditionId: string | null;
+      marketQuestion: string | null;
+      outcomeName: string | null;
+      size: number;
+      avgPrice: number;
+      currentValue: number;
+      staked: number;
+      cashPnl: number;
+      percentPnl: number;
+      slug: string | null;
+      eventSlug: string | null;
+    }>;
+    biggestWins: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      staked: number;
+      endDate: string | null;
+    }>;
+    biggestLosses: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      staked: number;
+      endDate: string | null;
+    }>;
+    allWins: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      staked: number;
+      endDate: string | null;
+    }>;
+    allLosses: Array<{
+      marketQuestion: string | null;
+      realizedPnl: number;
+      totalBought: number;
+      staked: number;
+      endDate: string | null;
+    }>;
+    truncated: boolean;
+  } | null> {
+    const trimmed = query.trim();
+    if (!trimmed) return null;
+
+    // Resolve input:
+    //   0x...           → use as-is (wallet address)
+    //   @handle / handle → scrape polymarket.com/@handle for proxyWallet
+    const isAddress = /^0x[a-fA-F0-9]{40}$/.test(trimmed);
+    let wallet = isAddress ? trimmed.toLowerCase() : '';
+    let handle: string | null = null;
+    let displayName: string | null = null;
+    let pseudonym: string | null = null;
+    let bio: string | null = null;
+    let profileImage: string | null = null;
+
+    if (!isAddress) {
+      const rawHandle = trimmed.startsWith('@')
+        ? trimmed.slice(1)
+        : trimmed;
+      const profileUrl = `https://polymarket.com/@${encodeURIComponent(rawHandle)}`;
+      try {
+        const res = await axios.get<string>(profileUrl, {
+          timeout: 15_000,
+          headers: {
+            'user-agent':
+              'Mozilla/5.0 (Polygee/1.0; +https://polygee.app)',
+          },
+          responseType: 'text',
+        });
+        const html = res.data;
+        const addressMatch = html.match(/"proxyWallet":"(0x[a-fA-F0-9]{40})"/);
+        if (!addressMatch) return null;
+        wallet = addressMatch[1].toLowerCase();
+        handle = rawHandle;
+        displayName =
+          html.match(/"displayUsername":"([^"]+)"/)?.[1] ?? null;
+        pseudonym = html.match(/"pseudonym":"([^"]+)"/)?.[1] ?? null;
+        bio = html.match(/"bio":"([^"]*)"/)?.[1] ?? null;
+        profileImage =
+          html.match(/"profileImage":"([^"]+)"/)?.[1] ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    if (!wallet) return null;
+
+    // Pull the full position book via paginated /positions and
+    // /closed-positions, plus the full trade log. The single-page
+    // position fetchers cap at 200 rows each which silently truncates
+    // whales; pagination walks offset until the API returns a short
+    // page (positions max 20×500 = 10,000 per side; trades 50×500 =
+    // 25,000). The trade log is what lets us compute the *real* peak
+    // USD a user had at risk per position — Polymarket's totalBought
+    // is cumulative across all buys INCLUDING rebuys after partial
+    // sells, so a trader who bought $1K, sold $600, rebought $1K
+    // shows totalBought=$2K but never actually staked more than $1.4K.
+    const [openResult, closedResult, tradesResult] = await Promise.all([
+      this.polymarketDataService.getUserPositionsAll(wallet),
+      this.polymarketDataService.getUserClosedPositionsAll(wallet),
+      this.polymarketDataService.getUserTradesAll(wallet),
+    ]);
+    const openPositions = openResult.positions;
+    const closedPositions = closedResult.positions;
+    const truncated =
+      openResult.truncated ||
+      closedResult.truncated ||
+      tradesResult.truncated;
+    const stats = this.smartMoneySignalService.computeLifetimeStats(
+      openPositions,
+      closedPositions,
+    );
+
+    // Replay the trade log chronologically, per asset, tracking the
+    // running cost basis of currently-held shares. `peakExposureUsd` is
+    // the maximum that cost basis ever hit — i.e., the largest USD the
+    // user ever had actually at risk on this market. That's what most
+    // users mean by "staked" and what we'll show in the UI instead of
+    // the misleading totalBought.
+    const exposures = this.computeExposuresByAsset(tradesResult.trades);
+    const stakedFor = (
+      assetId: string | undefined,
+      initialValueUsd: number,
+      totalBoughtUsd: number,
+    ): number => {
+      const peak = assetId
+        ? (exposures.get(assetId)?.peakExposureUsd ?? 0)
+        : 0;
+      // Currently-held cost basis (size × avgPrice = initialValue) is a
+      // hard lower bound for an open position — you can't hold that
+      // much at your avg entry price without having paid for it. If our
+      // /activity sweep missed rows (truncated, or neg-risk splits that
+      // don't show as TRADE events) the peak estimate drifts low, so
+      // we floor it at initialValue.
+      const best = Math.max(peak, initialValueUsd);
+      if (best > 0) return best;
+      // Last resort when we have no exposure data AND no held cost
+      // basis (typical of fully-closed positions that pre-date our
+      // trade window): fall back to the API's totalBought. It's noisy
+      // but always upper-bounds the real stake.
+      return Math.max(0, totalBoughtUsd);
+    };
+
+    // Gate checks — mirrors the defaults in SmartMoneySignalService.
+    const MIN_PNL = 50_000;
+    const MIN_ROI = 0.10;
+    const MIN_RESOLVED = 50;
+    const MIN_PNL_STREAK = 20_000;
+    const MIN_STREAK = 7;
+    const MIN_L10_RATE = 0.8;
+    const roi = stats.totalBought > 0 ? stats.totalPnl / stats.totalBought : 0;
+    const basePnl = stats.totalPnl >= MIN_PNL;
+    const baseRoi = roi >= MIN_ROI;
+    const baseResolved = stats.resolvedCount >= MIN_RESOLVED;
+    const baseQualifies = basePnl && baseRoi && baseResolved;
+    const streakPnl = stats.totalPnl >= MIN_PNL_STREAK;
+    const streakStreak = stats.currentWinStreak >= MIN_STREAK;
+    const streakRate =
+      (stats.last10Wins != null ? stats.last10WinRate : 0) >= MIN_L10_RATE;
+    const hotStreakQualifies =
+      streakPnl &&
+      streakStreak &&
+      streakRate &&
+      baseRoi &&
+      baseResolved;
+
+    // Recent resolved for the win/loss timeline. Draw only from
+    // /closed-positions — pulling from open positions was treating
+    // every still-live bet with realizedPnl=0 as a settled loss,
+    // which tanked every whale's "recent form" even when they were
+    // deeply profitable overall. Sort by `timestamp` (last activity
+    // on the position — sell/redeem) because market endDate can
+    // post-date the user's exit.
+    const resolvedMerged = [...closedPositions]
+      .filter((p) => Number(p.totalBought ?? 0) > 0)
+      .sort((a: any, b: any) => {
+        const at = Number(a.timestamp ?? 0);
+        const bt = Number(b.timestamp ?? 0);
+        if (at && bt) return bt - at;
+        if (at) return -1;
+        if (bt) return 1;
+        return String(b.endDate ?? '').localeCompare(String(a.endDate ?? ''));
+      });
+    const recentResolved = resolvedMerged.slice(0, 20).map((p: any) => ({
+      conditionId: p.conditionId ?? null,
+      marketQuestion: p.title ?? p.slug ?? null,
+      outcomeName: p.outcome ?? null,
+      // Convert Polymarket's share-denominated totalBought into USD
+      // via avgPrice. The API returns SHARES in totalBought, not USD —
+      // a $34K bet on a 0.1¢ market looks like $34M if you forget.
+      totalBought:
+        Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+      staked: stakedFor(
+        p.asset,
+        Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+        Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+      ),
+      realizedPnl: Number(p.realizedPnl ?? 0),
+      win: Number(p.realizedPnl ?? 0) > 0,
+      endDate: p.endDate ?? null,
+    }));
+
+    // Full sorted lists — every winning settlement desc by PnL, every
+    // losing settlement asc by PnL. The UI lets the user scroll through
+    // them all; the "biggest" header just reflects the first rows since
+    // the lists are already sorted.
+    const allWins = [...resolvedMerged]
+      .filter((p: any) => Number(p.realizedPnl ?? 0) > 0)
+      .sort(
+        (a: any, b: any) =>
+          Number(b.realizedPnl ?? 0) - Number(a.realizedPnl ?? 0),
+      )
+      .map((p: any) => ({
+        marketQuestion: p.title ?? p.slug ?? null,
+        realizedPnl: Number(p.realizedPnl ?? 0),
+        // API totalBought is in SHARES — convert to USD via avgPrice.
+        totalBought:
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+        staked: stakedFor(
+          p.asset,
+          Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+        ),
+        endDate: p.endDate ?? null,
+      }));
+    const allLosses = [...resolvedMerged]
+      .filter((p: any) => Number(p.realizedPnl ?? 0) < 0)
+      .sort(
+        (a: any, b: any) =>
+          Number(a.realizedPnl ?? 0) - Number(b.realizedPnl ?? 0),
+      )
+      .map((p: any) => ({
+        marketQuestion: p.title ?? p.slug ?? null,
+        realizedPnl: Number(p.realizedPnl ?? 0),
+        // API totalBought is in SHARES — convert to USD via avgPrice.
+        totalBought:
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+        staked: stakedFor(
+          p.asset,
+          Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+        ),
+        endDate: p.endDate ?? null,
+      }));
+    // Keep the top-5 aliases for any consumer that prefers a compact
+    // highlight view; the frontend wallet page now reads the full lists.
+    const biggestWins = allWins.slice(0, 5);
+    const biggestLosses = allLosses.slice(0, 5);
+
+    // Return the FULL open position book sorted by current value. The
+    // frontend defaults to showing the top few and has a "view all"
+    // expand; capping here (we used to slice at 20) would hide whales'
+    // long tails even when the user explicitly asks to see them.
+    const openList = openPositions
+      .filter((p: any) => Number(p.size ?? 0) > 0)
+      .sort(
+        (a: any, b: any) =>
+          Number(b.currentValue ?? 0) - Number(a.currentValue ?? 0),
+      )
+      .map((p: any) => ({
+        conditionId: p.conditionId ?? null,
+        marketQuestion: p.title ?? p.slug ?? null,
+        outcomeName: p.outcome ?? null,
+        size: Number(p.size ?? 0),
+        avgPrice: Number(p.avgPrice ?? 0),
+        currentValue: Number(p.currentValue ?? 0),
+        // Peak exposure from /activity replay, floored at current cost
+        // basis (size × avgPrice = initialValue) so we never
+        // underreport what the user visibly holds right now. The API's
+        // totalBought is SHARES, so convert with × avgPrice.
+        staked: stakedFor(
+          p.asset,
+          Number(p.size ?? 0) * Number(p.avgPrice ?? 0),
+          Number(p.totalBought ?? 0) * Number(p.avgPrice ?? 0),
+        ),
+        cashPnl: Number(p.cashPnl ?? 0),
+        percentPnl: Number(p.percentPnl ?? 0),
+        slug: p.slug ?? null,
+        eventSlug: p.eventSlug ?? null,
+      }));
+
+    return {
+      input: query,
+      wallet,
+      handle,
+      displayName,
+      pseudonym,
+      bio,
+      profileImage,
+      lifetime: {
+        totalPnl: stats.totalPnl,
+        unrealizedPnl: stats.unrealizedPnl,
+        totalBought: stats.totalBought,
+        roi,
+        resolvedCount: stats.resolvedCount,
+        // The UI labels this "median bet" with a $-prefix, so expose
+        // the USD-denominated median rather than the shares one (the
+        // shares median still lives on stats.typicalBetSize for the
+        // smart-money positionMultiple calc).
+        typicalBetSize: stats.typicalBetSizeUsd,
+        currentWinStreak: stats.currentWinStreak,
+        last10Wins: stats.last10Wins,
+        last10WinRate: stats.last10WinRate,
+        last20Wins: stats.last20Wins,
+        last20WinRate: stats.last20WinRate,
+      },
+      gates: {
+        minLifetimePnl: {
+          required: MIN_PNL,
+          actual: stats.totalPnl,
+          pass: basePnl,
+        },
+        minLifetimeRoi: { required: MIN_ROI, actual: roi, pass: baseRoi },
+        minResolvedBets: {
+          required: MIN_RESOLVED,
+          actual: stats.resolvedCount,
+          pass: baseResolved,
+        },
+        minLifetimePnlWithStreak: {
+          required: MIN_PNL_STREAK,
+          actual: stats.totalPnl,
+          pass: streakPnl,
+        },
+        minCurrentStreak: {
+          required: MIN_STREAK,
+          actual: stats.currentWinStreak,
+          pass: streakStreak,
+        },
+        minLast10WinRate: {
+          required: MIN_L10_RATE,
+          actual: stats.last10Wins != null ? stats.last10WinRate : 0,
+          pass: streakRate,
+        },
+        baseQualifies,
+        hotStreakQualifies,
+        anyQualifies: baseQualifies || hotStreakQualifies,
+      },
+      recentResolved,
+      openPositions: openList,
+      biggestWins,
+      biggestLosses,
+      allWins,
+      allLosses,
+      truncated,
+    };
+  }
+
+  /**
+   * Replay every trade for a wallet chronologically per asset
+   * (outcome token), tracking the running USD cost basis of currently-
+   * held shares. Returns a map from assetId to the peak that cost basis
+   * ever reached — i.e., the real maximum USD the user ever had at risk
+   * on that market.
+   *
+   * Why this exists: Polymarket's /positions endpoint returns
+   * `totalBought`, which is the cumulative gross USD spent on all buys
+   * for the position. If a user buys $500, sells $300 worth at a higher
+   * price, and rebuys $500, totalBought = $1,000. But their peak
+   * cost-basis at risk was only ~$700. Showing totalBought as "staked"
+   * in the UI was actively misleading users about how much they had
+   * risked on a given bet.
+   *
+   * The math uses running average cost. When selling, cost basis drops
+   * proportionally to shares sold × average cost. If a sell would take
+   * shares below zero (i.e. the user "shorted" by selling more than
+   * they held — on Polymarket this means minting the opposite outcome)
+   * we clamp at zero; those cases represent a new buy of the mirrored
+   * asset, tracked under its own assetId.
+   */
+  private computeExposuresByAsset(
+    trades: PolymarketTrade[],
+  ): Map<
+    string,
+    {
+      peakExposureUsd: number;
+      currentCostBasisUsd: number;
+      currentShares: number;
+      realizedPnlFromTrades: number;
+      tradeCount: number;
+    }
+  > {
+    const byAsset = new Map<string, PolymarketTrade[]>();
+    for (const t of trades) {
+      const arr = byAsset.get(t.asset) ?? [];
+      arr.push(t);
+      byAsset.set(t.asset, arr);
+    }
+    const out = new Map<
+      string,
+      {
+        peakExposureUsd: number;
+        currentCostBasisUsd: number;
+        currentShares: number;
+        realizedPnlFromTrades: number;
+        tradeCount: number;
+      }
+    >();
+    for (const [asset, assetTrades] of byAsset) {
+      const sorted = [...assetTrades].sort(
+        (a, b) => a.timestamp - b.timestamp,
+      );
+      let currentShares = 0;
+      let currentCostBasisUsd = 0;
+      let peakExposureUsd = 0;
+      let realizedPnlFromTrades = 0;
+      for (const tr of sorted) {
+        const size = Number(tr.size ?? 0);
+        const price = Number(tr.price ?? 0);
+        if (!(size > 0) || !(price >= 0)) continue;
+        const usdc = size * price;
+        if (tr.side === 'BUY') {
+          currentShares += size;
+          currentCostBasisUsd += usdc;
+        } else {
+          // SELL: reduce cost basis proportionally using running avg.
+          const sellShares = Math.min(size, currentShares);
+          if (currentShares > 0 && sellShares > 0) {
+            const avgCost = currentCostBasisUsd / currentShares;
+            currentCostBasisUsd -= sellShares * avgCost;
+            currentShares -= sellShares;
+            realizedPnlFromTrades += (price - avgCost) * sellShares;
+          }
+          // Any excess (size - sellShares) is a short-sell / mint of
+          // the opposite outcome; ignored here because it doesn't
+          // represent exposure on *this* asset.
+        }
+        // Floor tiny floating-point negatives caused by rounding.
+        if (currentCostBasisUsd < 0) currentCostBasisUsd = 0;
+        if (currentShares < 0) currentShares = 0;
+        if (currentCostBasisUsd > peakExposureUsd) {
+          peakExposureUsd = currentCostBasisUsd;
+        }
+      }
+      out.set(asset, {
+        peakExposureUsd,
+        currentCostBasisUsd,
+        currentShares,
+        realizedPnlFromTrades,
+        tradeCount: sorted.length,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Price-history timeline for a single market, sourced from the
+   * polymarket_price_snapshots table (appended every 5 minutes by the
+   * polymarket-market-snapshot trigger task). Powers the match detail
+   * chart — replaces the single in-place value with a real time series.
+   */
+  async getMarketPriceHistory(
+    conditionId: string,
+    opts: { hours?: number; limit?: number } = {},
+  ): Promise<
+    Array<{
+      snapshotAt: Date;
+      outcomePrices: string[];
+      volume: string | null;
+      volume24hr: string | null;
+      liquidity: string | null;
+    }>
+  > {
+    const hours = Math.max(1, Math.min(720, opts.hours ?? 24));
+    const limit = Math.max(1, Math.min(2000, opts.limit ?? 288));
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+
+    const rows = await this.db
+      .select({
+        snapshotAt: schema.polymarketPriceSnapshots.snapshotAt,
+        outcomePrices: schema.polymarketPriceSnapshots.outcomePrices,
+        volume: schema.polymarketPriceSnapshots.volume,
+        volume24hr: schema.polymarketPriceSnapshots.volume24hr,
+        liquidity: schema.polymarketPriceSnapshots.liquidity,
+      })
+      .from(schema.polymarketPriceSnapshots)
+      .where(
+        and(
+          eq(schema.polymarketPriceSnapshots.conditionId, conditionId),
+          gte(schema.polymarketPriceSnapshots.snapshotAt, since),
+        ),
+      )
+      .orderBy(asc(schema.polymarketPriceSnapshots.snapshotAt))
+      .limit(limit);
+
+    return rows as Array<{
+      snapshotAt: Date;
+      outcomePrices: string[];
+      volume: string | null;
+      volume24hr: string | null;
+      liquidity: string | null;
+    }>;
+  }
+
   async getAllMarketHolders(
     conditionId: string,
     opts: {
@@ -2180,18 +2732,21 @@ export class PolymarketService implements OnModuleInit {
     // bounded only by how many unique wallets Polymarket surfaces across
     // /holders + /trades + leaderboard. More candidates in → more
     // qualifying sharps out → more reliable leanScore.
-    const poolOptions = options.persist
-      ? {
-          expandPool: true,
-          targetHoldersPerOutcome: 10_000,
-          includeLeaderboardInPool: true,
-          // Deeper trade pagination + wider leaderboard cross-check so
-          // the union catches every active wallet on the market, not
-          // just the top tier.
-          tradeSampleSize: 5_000,
-          leaderboardSize: 200,
-        }
-      : {};
+    //
+    // SAME pool for GET and POST. Every consumer — match detail pages,
+    // admin persists, trigger tasks — sees the full widest-net wallet
+    // union. Previously GET was capped at 40 wallets via native /holders;
+    // now it matches the POST's /holders + /trades + leaderboard union.
+    const poolOptions = {
+      expandPool: true,
+      targetHoldersPerOutcome: 10_000,
+      includeLeaderboardInPool: true,
+      // Deeper trade pagination + wider leaderboard cross-check so the
+      // union catches every active wallet on the market, not just the
+      // top tier.
+      tradeSampleSize: 5_000,
+      leaderboardSize: 200,
+    };
 
     // Merge DB-stored threshold overrides. Admin-facing endpoint lets
     // operators tune gates without shipping code — non-null DB fields

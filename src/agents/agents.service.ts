@@ -35,6 +35,29 @@ import {
   LeaguePriorsService,
   type LeaguePriors,
 } from './league-priors.service';
+import {
+  VenueContextService,
+  type VenueContext,
+} from './venue-context.service';
+import { IsotonicCalibrationService } from './isotonic-calibration.service';
+import { DirichletCalibrationService } from './dirichlet-calibration.service';
+import { FormBasedNudgeService } from './form-based-nudge.service';
+import { MatchInsightsService } from './match-insights.service';
+import { MarketAnalysisService } from './market-analysis.service';
+import { MatchContextService } from './match-context.service';
+import {
+  ClosingLineService,
+  type ClosingLineSignal,
+} from './closing-line.service';
+import {
+  PiRatingService,
+  type PiRatingPrediction,
+} from './pi-rating.service';
+import {
+  MetaBlenderService,
+  type MetaBlendInputs,
+} from './meta-blender.service';
+import { LineupRestFeaturesService } from './lineup-rest-features.service';
 import { SmartMoneySignalService } from '../polymarket/services/smart-money-signal.service';
 import type { SmartMoneySignal } from '../polymarket/services/smart-money-signal.service';
 import { PolymarketService } from '../polymarket/polymarket.service';
@@ -46,6 +69,60 @@ import {
 
 // Re-export so existing importers don't break
 export { PredictionType, PerformanceFeedback } from './types';
+
+export interface DailyBreakdown {
+  date: string;
+  summary: {
+    total: number;
+    resolved: number;
+    correct: number;
+    incorrect: number;
+    pending: number;
+    accuracy: number;
+    avgConfidence: number;
+    avgBrierScore: number | null;
+  };
+  byResult: {
+    home_win: { predicted: number; correct: number; accuracy: number };
+    draw: { predicted: number; correct: number; accuracy: number };
+    away_win: { predicted: number; correct: number; accuracy: number };
+  };
+  predictions: Array<{
+    predictionId: number;
+    fixtureId: number;
+    matchDate: Date;
+    matchStatus: string;
+    league: { id: number; name: string | null; country: string | null };
+    homeTeam: { id: number; name: string | null; logo: string | null };
+    awayTeam: { id: number; name: string | null; logo: string | null };
+    predicted: {
+      result: string;
+      homeWinProb: number;
+      drawProb: number;
+      awayWinProb: number;
+      homeGoals: number | null;
+      awayGoals: number | null;
+      confidence: number | null;
+    };
+    actual: {
+      result: string | null;
+      homeGoals: number | null;
+      awayGoals: number | null;
+    };
+    wasCorrect: boolean | null;
+    brierScore: number | null;
+    predictionType: string;
+    polymarketLink: string | null;
+    createdAt: Date;
+  }>;
+}
+
+export interface DailyBreakdownRange {
+  range: { from: string; to: string; days: number };
+  summary: DailyBreakdown['summary'];
+  byResult: DailyBreakdown['byResult'];
+  days: DailyBreakdown[];
+}
 
 @Injectable()
 export class AgentsService {
@@ -68,8 +145,19 @@ export class AgentsService {
     private readonly alertsService: AlertsService,
     private readonly predictionMemory: PredictionMemoryService,
     private readonly leaguePriorsService: LeaguePriorsService,
+    private readonly venueContextService: VenueContextService,
+    private readonly isotonicCalibrationService: IsotonicCalibrationService,
+    private readonly dirichletCalibrationService: DirichletCalibrationService,
+    private readonly formBasedNudgeService: FormBasedNudgeService,
+    private readonly closingLineService: ClosingLineService,
+    private readonly piRatingService: PiRatingService,
+    private readonly metaBlenderService: MetaBlenderService,
+    private readonly lineupRestFeaturesService: LineupRestFeaturesService,
     private readonly smartMoneySignalService: SmartMoneySignalService,
     private readonly polymarketService: PolymarketService,
+    private readonly matchInsightsService: MatchInsightsService,
+    private readonly marketAnalysisService: MarketAnalysisService,
+    private readonly matchContextService: MatchContextService,
   ) {
     const openaiKey = this.config.get<string>('OPENAI_API_KEY');
     if (openaiKey) this.openai = new OpenAI({ apiKey: openaiKey });
@@ -145,6 +233,94 @@ export class AgentsService {
     // Attach player impact to matchData so downstream agents can use it
     matchData.playerImpact = playerImpactScores;
 
+    // Step 1c: Compute venue / contextual flags (derby, altitude, stakes).
+    // Cheap CPU-only operation, no DB or API calls — done synchronously.
+    let venueContext: VenueContext | null = null;
+    try {
+      venueContext = this.venueContextService.compute({
+        fixture: matchData.fixture,
+        homeTeam: matchData.homeTeam?.team
+          ? {
+              id: matchData.homeTeam.team.id,
+              name: matchData.homeTeam.team.name,
+              venueName: matchData.homeTeam.team.venueName ?? null,
+            }
+          : null,
+        awayTeam: matchData.awayTeam?.team
+          ? {
+              id: matchData.awayTeam.team.id,
+              name: matchData.awayTeam.team.name,
+              venueName: matchData.awayTeam.team.venueName ?? null,
+            }
+          : null,
+        homeStandings: matchData.standings.home
+          ? {
+              leaguePosition: matchData.standings.home.leaguePosition ?? null,
+              totalTeams: matchData.standings.home.totalTeams ?? null,
+            }
+          : null,
+        awayStandings: matchData.standings.away
+          ? {
+              leaguePosition: matchData.standings.away.leaguePosition ?? null,
+              totalTeams: matchData.standings.away.totalTeams ?? null,
+            }
+          : null,
+      });
+      if (
+        venueContext.derbyType ||
+        venueContext.altitudeBoost > 0 ||
+        venueContext.lateSeasonStakes
+      ) {
+        this.logger.log(
+          `Venue context for ${fixtureId}: derby=${venueContext.derbyType ?? 'none'}, ` +
+            `altitude=${venueContext.altitudeBoost.toFixed(2)} (${venueContext.altitudeVenue ?? '—'}), ` +
+            `stakes=${venueContext.lateSeasonStakes ?? 'none'}`,
+        );
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Venue context failed for fixture ${fixtureId}: ${(error as Error).message}`,
+      );
+      venueContext = null;
+    }
+    matchData.venueContext = venueContext;
+
+    // Step 1d: Deep-analysis insights (head-to-head history, last-20 form,
+    // streaks, full player-by-player roster). Display-only — surfaced in the
+    // response and as read-only narrative context to the analysis prompt, but
+    // it does NOT feed the probability blend (H2H + streak signals were shown
+    // to hurt Brier in our back-tests).
+    try {
+      matchData.matchInsights = await this.matchInsightsService.build(
+        matchData,
+      );
+      // Context layer (referee / weather / discipline / stakes). Computed here
+      // (pre-analysis) so its narrative flows into the analysis prompt as
+      // display context. Markets are added later (they need the prediction).
+      if (matchData.matchInsights) {
+        try {
+          const context = await this.matchContextService.build(
+            matchData,
+            matchData.matchInsights,
+          );
+          matchData.matchInsights.context = context;
+          if (context.narrative) {
+            matchData.matchInsights.narrative +=
+              `\n\nCONTEXT\n${context.narrative}`;
+          }
+        } catch (ctxErr) {
+          this.logger.debug(
+            `Match context failed for fixture ${fixtureId}: ${(ctxErr as Error).message}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Match insights failed for fixture ${fixtureId}: ${(error as Error).message}`,
+      );
+      matchData.matchInsights = null;
+    }
+
     // Step 2: Web research + performance feedback + Poisson model + memory recall + league priors (in parallel)
     let research: ResearchResult;
     let feedback: PerformanceFeedback | null = null;
@@ -159,12 +335,26 @@ export class AgentsService {
         matchData.awayTeam?.team?.name ??
         `Team ${matchData.fixture.awayTeamId}`;
 
+      // League priors are fetched FIRST so the Poisson model can use them
+      // as its cold-start fallback (instead of the global 45/26/29 default).
+      // The cache TTL means this is essentially free after the first call
+      // per league.
+      try {
+        leaguePriors = await this.leaguePriorsService.getLeaguePriors(
+          matchData.fixture.leagueId,
+        );
+      } catch (error) {
+        this.logger.debug(
+          `League priors unavailable for league ${matchData.fixture.leagueId}: ${(error as Error).message}`,
+        );
+        leaguePriors = null;
+      }
+
       const [
         researchResult,
         feedbackResult,
         poissonResult,
         memoriesResult,
-        priorsResult,
       ] = await Promise.allSettled([
         this.researchAgent.research(matchData),
         this.getPerformanceFeedback(),
@@ -174,6 +364,8 @@ export class AgentsService {
           matchData.fixture.leagueId,
           fixtureId,
           playerImpactScores ?? undefined,
+          leaguePriors,
+          venueContext,
         ),
         this.predictionMemory.recallForPrediction({
           homeTeamName: homeName,
@@ -185,10 +377,7 @@ export class AgentsService {
             matchData.fixture.leagueName ??
             `League ${matchData.fixture.leagueId}`,
         }),
-        this.leaguePriorsService.getLeaguePriors(matchData.fixture.leagueId),
       ]);
-      leaguePriors =
-        priorsResult.status === 'fulfilled' ? priorsResult.value : null;
 
       research =
         researchResult.status === 'fulfilled'
@@ -289,15 +478,127 @@ export class AgentsService {
       );
     }
 
-    // Step 3b: Ensemble — blend Claude + Poisson + Bookmaker odds
-    prediction = this.ensemblePredictions(prediction, poissonOutput, matchData);
+    // Step 3a': Build closing-line signal (Pinnacle close + open→close drift)
+    // so the ensemble can blend against the sharpest available book rather
+    // than the generic multi-book consensus.
+    try {
+      const kickoff = matchData.fixture?.date
+        ? new Date(matchData.fixture.date)
+        : null;
+      const closingLineSignal = await this.closingLineService.build(
+        matchData.fixture?.oddsApiEventId ?? null,
+        kickoff,
+      );
+      matchData.closingLineSignal = closingLineSignal;
+      if (closingLineSignal) {
+        this.logger.debug(
+          `Closing-line signal for ${fixtureId}: source=${closingLineSignal.sourceUsed}, ` +
+            `drift|=${closingLineSignal.driftMagnitude.toFixed(3)} (n=${closingLineSignal.driftSampleSize}), ` +
+            `overround=${closingLineSignal.pinnacleOverround?.toFixed(4) ?? 'n/a'}, ` +
+            `ageSec=${closingLineSignal.snapshotAgeSeconds ?? 'n/a'}`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Closing-line signal build failed for fixture ${fixtureId}: ${(error as Error).message}`,
+      );
+      matchData.closingLineSignal = null;
+    }
+
+    // Step 3a''.5: Lineup-delta + rest-day features. Acute fatigue
+    // (rest_diff, 3-in-7 congestion) and rotation/injury surprises
+    // (XI vs typical XI delta in goal involvement) — surfaces directly
+    // in the LLM context block via `lineupRestFeatures.promptSummary`.
+    try {
+      if (
+        matchData.fixture?.homeTeamId &&
+        matchData.fixture?.awayTeamId &&
+        matchData.fixture?.date
+      ) {
+        matchData.lineupRestFeatures =
+          await this.lineupRestFeaturesService.compute({
+            fixtureId,
+            homeTeamId: matchData.fixture.homeTeamId,
+            awayTeamId: matchData.fixture.awayTeamId,
+            fixtureDate: new Date(matchData.fixture.date),
+          });
+        if (matchData.lineupRestFeatures?.promptSummary) {
+          this.logger.debug(
+            `Lineup/rest for ${fixtureId}: ${matchData.lineupRestFeatures.promptSummary}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Lineup-rest features failed for fixture ${fixtureId}: ${(error as Error).message}`,
+      );
+      matchData.lineupRestFeatures = null;
+    }
+
+    // Step 3a'': Pi-rating prediction (Constantinou-Fenton). Adds a
+    // fourth base predictor whose residuals are orthogonal to xG-based
+    // Poisson — independent enough to deliver meaningful ensemble lift
+    // even though each model alone is only marginally accurate.
+    try {
+      if (
+        matchData.fixture?.homeTeamId &&
+        matchData.fixture?.awayTeamId &&
+        matchData.fixture?.leagueId != null
+      ) {
+        const piPrediction = await this.piRatingService.predict(
+          matchData.fixture.homeTeamId,
+          matchData.fixture.awayTeamId,
+          matchData.fixture.leagueId,
+        );
+        matchData.piRatingPrediction = piPrediction;
+        if (piPrediction.mappingApplied) {
+          this.logger.debug(
+            `Pi-rating for ${fixtureId}: ĝ=${piPrediction.predictedGoalDiff.toFixed(2)} ` +
+              `(${piPrediction.mappingScope}) → H=${(piPrediction.homeWinProb * 100).toFixed(1)}% ` +
+              `D=${(piPrediction.drawProb * 100).toFixed(1)}% A=${(piPrediction.awayWinProb * 100).toFixed(1)}%`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Pi-rating prediction failed for fixture ${fixtureId}: ${(error as Error).message}`,
+      );
+      matchData.piRatingPrediction = null;
+    }
+
+    // Step 3b: Ensemble — prefer the learned meta-blender (4-predictor
+    // log-pool) when fitted; fall back to the legacy flat 30/30/40 blend.
+    prediction = await this.ensemblePredictions(
+      prediction,
+      poissonOutput,
+      matchData,
+    );
 
     // Step 3c: Smart-money signal (when fixture is linked to a Polymarket
-    // market). This does not directly modify probabilities — instead it
-    // adjusts confidence: agreement with sharp money → bonus, disagreement
-    // → penalty, no signal → no change. Probabilities will be revisited
-    // once the backtest confirms the signal carries usable predictive value.
-    let smartMoneySignal: SmartMoneySignal | null = null;
+    // market).
+    //
+    // We currently use the signal ONLY as a confidence modifier — agreement
+    // gets +1, disagreement on a direct market gets -1. The original April
+    // 2026 backtest of 583 signaled predictions showed agreement → mean
+    // Brier 0.560 vs disagreement → 0.602, a 0.042 gap that justifies the
+    // confidence move.
+    //
+    // We previously also applied a probability blend (push probs toward
+    // sharp positioning). The April 2026 backtest of that blend on 37
+    // qualifying predictions showed it HURT Brier monotonically across
+    // every weight cap (0.05 → +0.005, 0.20 → +0.013, 0.50 → +0.020) and
+    // every cohort (high-lean cases hurt MOST: +0.048 at |lean|≥0.80).
+    // The 0.042 Brier gap above came from agreement cases being
+    // intrinsically more predictable (Claude + bookmakers + Poisson
+    // converged), not from sharp positioning adding new directional signal.
+    // See autoresearch/smart-money-blend-backtest.ts for the full data.
+    //
+    // applySmartMoneyProbabilityBlend remains defined below for future
+    // re-introduction with stricter gating once more sharp-money samples
+    // accumulate, but it is intentionally NOT wired into the pipeline.
+    let smartMoneySignal:
+      | (SmartMoneySignal & { marketTeamId?: number | null })
+      | null = null;
     try {
       smartMoneySignal = await this.computeSmartMoneySignal(fixtureId);
       if (smartMoneySignal && smartMoneySignal.leanScore != null) {
@@ -315,15 +616,134 @@ export class AgentsService {
       );
     }
 
-    // TODO [Phase 3]: Apply isotonic regression calibration to final probabilities
-    // once we have 200+ resolved predictions. Isotonic regression maps raw model
-    // probabilities to empirically calibrated ones, fixing systematic miscalibration.
-    // Implementation: train an isotonic regressor on (predicted_prob, actual_outcome)
-    // pairs, then apply to homeWinProb/drawProb/awayWinProb before storage.
+    // Step 3d: Empirical calibration. Native-multiclass Dirichlet
+    // calibration (Kull et al., NeurIPS 2019) is preferred — it learns a
+    // 3×3 weight matrix + bias over the log-probability triple and
+    // softmaxes, which both fixes per-class biases *and* preserves the
+    // simplex constraint without a manual renormalisation step. The
+    // legacy per-outcome isotonic mapping runs as a safety fallback when
+    // no Dirichlet row has been fitted yet.
+    //
+    // Both no-op gracefully when no fitted row exists (e.g. before the
+    // first refit). Calibration runs LAST so all upstream signals
+    // (Claude, Poisson, bookmaker/Pinnacle, sharps, draw floors) compose
+    // into a coherent input distribution first.
+    try {
+      const dirichlet = await this.dirichletCalibrationService.applyToTriple(
+        {
+          homeWinProb: prediction.homeWinProb,
+          drawProb: prediction.drawProb,
+          awayWinProb: prediction.awayWinProb,
+        },
+        matchData.fixture.leagueId,
+      );
+      if (dirichlet.applied) {
+        this.logger.log(
+          `Dirichlet calibration (${dirichlet.scope}): ` +
+            `H=${(prediction.homeWinProb * 100).toFixed(1)}→${(dirichlet.homeWinProb * 100).toFixed(1)}%, ` +
+            `D=${(prediction.drawProb * 100).toFixed(1)}→${(dirichlet.drawProb * 100).toFixed(1)}%, ` +
+            `A=${(prediction.awayWinProb * 100).toFixed(1)}→${(dirichlet.awayWinProb * 100).toFixed(1)}%`,
+        );
+        prediction = {
+          ...prediction,
+          homeWinProb: dirichlet.homeWinProb,
+          drawProb: dirichlet.drawProb,
+          awayWinProb: dirichlet.awayWinProb,
+        };
+      } else {
+        // Fallback: legacy per-outcome isotonic.
+        const isotonic =
+          await this.isotonicCalibrationService.applyToTriple(
+            {
+              homeWinProb: prediction.homeWinProb,
+              drawProb: prediction.drawProb,
+              awayWinProb: prediction.awayWinProb,
+            },
+            matchData.fixture.leagueId,
+          );
+        if (isotonic.applied) {
+          this.logger.log(
+            `Isotonic calibration fallback (${isotonic.scope}): ` +
+              `H=${(prediction.homeWinProb * 100).toFixed(1)}→${(isotonic.homeWinProb * 100).toFixed(1)}%, ` +
+              `D=${(prediction.drawProb * 100).toFixed(1)}→${(isotonic.drawProb * 100).toFixed(1)}%, ` +
+              `A=${(prediction.awayWinProb * 100).toFixed(1)}→${(isotonic.awayWinProb * 100).toFixed(1)}%`,
+          );
+          prediction = {
+            ...prediction,
+            homeWinProb: isotonic.homeWinProb,
+            drawProb: isotonic.drawProb,
+            awayWinProb: isotonic.awayWinProb,
+          };
+        }
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Calibration failed (no-op fallback): ${(error as Error).message}`,
+      );
+    }
+
+    // Step 3e: Form-based nudges. Three home-side rules derived from a
+    // 100-game study with 100-game holdout validation — see
+    // FormBasedNudgeService for the rules and their hit-rate evidence.
+    // No-ops when matchData.formWindows is missing or no rule conditions
+    // are met.
+    try {
+      const nudge = this.formBasedNudgeService.applyToTriple(
+        {
+          homeWinProb: prediction.homeWinProb,
+          drawProb: prediction.drawProb,
+          awayWinProb: prediction.awayWinProb,
+        },
+        matchData.formWindows,
+      );
+      if (nudge.applied) {
+        this.logger.log(
+          `Form-based nudge [${nudge.firedRules.join(',')}]: ` +
+            `H=${(prediction.homeWinProb * 100).toFixed(1)}→${(nudge.homeWinProb * 100).toFixed(1)}%, ` +
+            `D=${(prediction.drawProb * 100).toFixed(1)}→${(nudge.drawProb * 100).toFixed(1)}%, ` +
+            `A=${(prediction.awayWinProb * 100).toFixed(1)}→${(nudge.awayWinProb * 100).toFixed(1)}%`,
+        );
+        prediction = {
+          ...prediction,
+          homeWinProb: nudge.homeWinProb,
+          drawProb: nudge.drawProb,
+          awayWinProb: nudge.awayWinProb,
+        };
+      }
+    } catch (error) {
+      this.logger.debug(
+        `Form-based nudge failed (no-op fallback): ${(error as Error).message}`,
+      );
+    }
+
+    // Step 3f: Multi-market analysis (derived from the FINAL probabilities +
+    // expected goals). Display + value-detection only — never feeds the blend.
+    if (matchData.matchInsights) {
+      try {
+        const markets = this.marketAnalysisService.build(matchData, {
+          homeWinProb: prediction.homeWinProb,
+          drawProb: prediction.drawProb,
+          awayWinProb: prediction.awayWinProb,
+          predictedHomeGoals: prediction.predictedHomeGoals,
+          predictedAwayGoals: prediction.predictedAwayGoals,
+        });
+        matchData.matchInsights.markets = markets;
+        if (markets?.valueBets?.length) {
+          matchData.matchInsights.narrative +=
+            `\n\nMARKETS — value: ${markets.valueBets
+              .map((v) => `${v.market} (+${v.edgePct}pp)`)
+              .join(', ')}`;
+        }
+      } catch (error) {
+        this.logger.debug(
+          `Market analysis failed for fixture ${fixtureId}: ${(error as Error).message}`,
+        );
+      }
+    }
 
     // Step 4: Store prediction
     const modelVersion =
-      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-6';
+      this.config.get<string>('PREDICTION_MODEL') || 'claude-opus-4-7';
     const stored = await this.storePrediction(
       fixtureId,
       matchData,
@@ -1387,53 +1807,125 @@ export class AgentsService {
    * - Each prediction with: match info, predicted vs actual result, correctness,
    *   confidence, and a link to the Polymarket game (if one exists)
    */
-  async getDailyBreakdown(date?: string): Promise<{
-    date: string;
-    summary: {
-      total: number;
-      resolved: number;
-      correct: number;
-      incorrect: number;
-      pending: number;
-      accuracy: number;
-      avgConfidence: number;
-      avgBrierScore: number | null;
-    };
-    byResult: {
-      home_win: { predicted: number; correct: number; accuracy: number };
-      draw: { predicted: number; correct: number; accuracy: number };
-      away_win: { predicted: number; correct: number; accuracy: number };
-    };
-    predictions: Array<{
-      predictionId: number;
-      fixtureId: number;
-      matchDate: Date;
-      matchStatus: string;
-      league: { id: number; name: string | null; country: string | null };
-      homeTeam: { id: number; name: string | null; logo: string | null };
-      awayTeam: { id: number; name: string | null; logo: string | null };
-      predicted: {
-        result: string;
-        homeWinProb: number;
-        drawProb: number;
-        awayWinProb: number;
-        homeGoals: number | null;
-        awayGoals: number | null;
-        confidence: number | null;
-      };
-      actual: {
-        result: string | null;
-        homeGoals: number | null;
-        awayGoals: number | null;
-      };
-      wasCorrect: boolean | null;
-      brierScore: number | null;
-      predictionType: string;
-      polymarketLink: string | null;
-      createdAt: Date;
-    }>;
-  }> {
+  async getDailyBreakdown(date?: string): Promise<DailyBreakdown> {
     const dateStr = date ?? new Date().toISOString().split('T')[0];
+    return this.computeDailyBreakdown(dateStr);
+  }
+
+  /**
+   * Return per-day breakdowns plus an aggregated summary across a range.
+   * Accepts either `days` (rolling window ending today) or explicit `from`/`to`.
+   */
+  async getDailyBreakdownRange(opts: {
+    days?: number;
+    from?: string;
+    to?: string;
+  }): Promise<DailyBreakdownRange> {
+    const today = new Date().toISOString().split('T')[0];
+
+    let fromStr: string;
+    let toStr: string;
+    if (opts.days != null) {
+      const days = Math.max(1, Math.min(90, Math.floor(opts.days)));
+      const end = new Date(`${today}T00:00:00Z`);
+      const start = new Date(end);
+      start.setUTCDate(start.getUTCDate() - (days - 1));
+      fromStr = start.toISOString().split('T')[0];
+      toStr = today;
+    } else {
+      fromStr = opts.from ?? opts.to ?? today;
+      toStr = opts.to ?? opts.from ?? today;
+      if (new Date(fromStr).getTime() > new Date(toStr).getTime()) {
+        [fromStr, toStr] = [toStr, fromStr];
+      }
+    }
+
+    const dateList: string[] = [];
+    const cursor = new Date(`${fromStr}T00:00:00Z`);
+    const end = new Date(`${toStr}T00:00:00Z`);
+    const maxDays = 90;
+    while (cursor.getTime() <= end.getTime() && dateList.length < maxDays) {
+      dateList.push(cursor.toISOString().split('T')[0]);
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    const days = await Promise.all(
+      dateList.map((d) => this.computeDailyBreakdown(d)),
+    );
+
+    // Aggregate summary + byResult across days
+    const summary = {
+      total: 0,
+      resolved: 0,
+      correct: 0,
+      incorrect: 0,
+      pending: 0,
+      accuracy: 0,
+      avgConfidence: 0,
+      avgBrierScore: null as number | null,
+    };
+    const byResult = {
+      home_win: { predicted: 0, correct: 0, accuracy: 0 },
+      draw: { predicted: 0, correct: 0, accuracy: 0 },
+      away_win: { predicted: 0, correct: 0, accuracy: 0 },
+    };
+
+    let confidenceWeighted = 0;
+    let confidenceCount = 0;
+    let brierWeighted = 0;
+    let brierCount = 0;
+
+    for (const day of days) {
+      summary.total += day.summary.total;
+      summary.resolved += day.summary.resolved;
+      summary.correct += day.summary.correct;
+      summary.incorrect += day.summary.incorrect;
+      summary.pending += day.summary.pending;
+
+      // avgConfidence is rounded per-day but we re-weight by per-day count.
+      // The per-day count of non-null confidences is (day.summary.total
+      // minus predictions without a confidence) — we don't expose that, so
+      // fall back to weighting by total when resolved is zero.
+      if (day.summary.avgConfidence > 0) {
+        const weight = day.summary.total;
+        confidenceWeighted += day.summary.avgConfidence * weight;
+        confidenceCount += weight;
+      }
+      if (day.summary.avgBrierScore != null) {
+        brierWeighted += day.summary.avgBrierScore * day.summary.resolved;
+        brierCount += day.summary.resolved;
+      }
+
+      for (const k of Object.keys(byResult) as Array<keyof typeof byResult>) {
+        byResult[k].predicted += day.byResult[k].predicted;
+        byResult[k].correct += day.byResult[k].correct;
+      }
+    }
+
+    summary.accuracy = summary.resolved > 0 ? summary.correct / summary.resolved : 0;
+    summary.avgConfidence =
+      confidenceCount > 0
+        ? Number((confidenceWeighted / confidenceCount).toFixed(1))
+        : 0;
+    summary.avgBrierScore =
+      brierCount > 0 ? Number((brierWeighted / brierCount).toFixed(6)) : null;
+
+    for (const k of Object.keys(byResult) as Array<keyof typeof byResult>) {
+      byResult[k].accuracy =
+        byResult[k].predicted > 0
+          ? byResult[k].correct / byResult[k].predicted
+          : 0;
+    }
+
+    return {
+      range: { from: fromStr, to: toStr, days: dateList.length },
+      summary,
+      byResult,
+      days,
+    };
+  }
+
+  private async computeDailyBreakdown(dateStr: string): Promise<DailyBreakdown> {
     const startOfDay = new Date(`${dateStr}T00:00:00Z`);
     const endOfDay = new Date(`${dateStr}T23:59:59Z`);
 
@@ -2072,6 +2564,7 @@ export class AgentsService {
           riskFactors: prediction.riskFactors,
           valueBets: prediction.valueBets,
           detailedAnalysis: prediction.detailedAnalysis,
+          matchInsights: prediction.matchInsights,
           predictionType: prediction.predictionType,
           fixture: {
             id: fixture.id,
@@ -2206,6 +2699,32 @@ export class AgentsService {
         .catch(() => ({ type: 'lineups', count: 0 })),
     );
 
+    // Always freshen each team's recent results straight from API-Football
+    // (one cheap /fixtures?team=&last call per team, upserted to the DB). This
+    // keeps form windows + recent-game history current regardless of sync
+    // gaps — the root fix for stale last-5/last-10 data.
+    tasks.push(
+      this.footballService
+        .getTeamRecentFixtures(fixture.homeTeamId)
+        .then((count) => ({ type: 'homeRecent', count }))
+        .catch(() => ({ type: 'homeRecent', count: 0 })),
+    );
+    tasks.push(
+      this.footballService
+        .getTeamRecentFixtures(fixture.awayTeamId)
+        .then((count) => ({ type: 'awayRecent', count }))
+        .catch(() => ({ type: 'awayRecent', count: 0 })),
+    );
+
+    // Always freshen this fixture's injuries (one cheap /injuries?fixture call,
+    // both teams) so absences are current — not gated by the league cooldown.
+    tasks.push(
+      this.footballService
+        .syncInjuriesForFixture(fixtureId)
+        .then((count) => ({ type: 'fixtureInjuries', count }))
+        .catch(() => ({ type: 'fixtureInjuries', count: 0 })),
+    );
+
     // Only sync injuries and standings if not recently done for this league
     if (needsLeagueSync) {
       this.logger.log(
@@ -2318,59 +2837,144 @@ export class AgentsService {
   // ─── Private helpers ────────────────────────────────────────────────
 
   /**
-   * Ensemble Claude's prediction with Poisson model and bookmaker consensus.
+   * Ensemble Claude's prediction with Poisson model and the sharpest
+   * available book (Pinnacle close → consensus close fallback).
    *
-   * KEY INSIGHT: While bookmaker closing odds are well-calibrated for probabilities,
-   * they are NOT optimised for 1X2 prediction accuracy. Their draw probabilities
-   * are often accurate but always "second place" to a win outcome — meaning a
-   * pure bookmaker-weighted model structurally under-predicts draws.
+   * KEY INSIGHT: Bookmaker closing odds are well-calibrated for probabilities,
+   * but they're not optimised for 1X2 prediction accuracy. Their draw
+   * probabilities are often accurate but always "second place" to a win
+   * outcome — so a pure bookmaker-weighted model structurally under-predicts
+   * draws.
    *
-   * Rebalanced weights (v2 — addresses favourite bias):
-   * - Bookmaker consensus: 40% — still the best-calibrated signal but reduced
-   *   to prevent the system from just echoing the market favourite
-   * - Poisson model: 30% — mathematical, xG-based, independent from market
-   * - Claude (LLM analysis): 30% — contextual reasoning (injuries, motivation,
-   *   tactical matchups, form) that bookmakers price in slowly
+   * Book selection (preferred → fallback):
+   * 1. Pinnacle close (from consensus_odds.pinnacleHomeWin/Draw/Away) — the
+   *    sharpest widely-available book. Empirically the hardest single
+   *    forecast to beat. Used when present and sanity-passes the sum ≈ 1.0
+   *    check.
+   * 2. Multi-book consensus close — used when Pinnacle is missing for the
+   *    fixture (about 3% of events, mostly small leagues).
    *
-   * Giving Claude more weight allows qualitative factors (e.g. a key goalkeeper
-   * injury, dead-rubber motivation, derby intensity) to shift predictions away
-   * from the bookmaker favourite when warranted.
+   * Weights (when all three signals available):
+   * - Bookmaker: 40% — best-calibrated signal but reduced to prevent the
+   *   system from just echoing the market favourite
+   * - Poisson:   30% — mathematical, xG-based, independent from market
+   * - Claude:    30% — contextual reasoning (injuries, motivation, tactical
+   *   matchups, form) that bookmakers price in slowly
    *
    * If any signal is unavailable, weights are redistributed proportionally.
    */
-  private ensemblePredictions(
+  private async ensemblePredictions(
     claudePrediction: PredictionOutput,
     poissonOutput: PoissonModelOutput | null,
     matchData: CollectedMatchData,
-  ): PredictionOutput {
+  ): Promise<PredictionOutput> {
     // Rebalanced weights v2: less bookmaker dominance, more contextual analysis
     const baseBookmakerWeight = 0.4;
     const basePoissonWeight = 0.3;
     const baseClaudeWeight = 0.3;
 
-    // Extract bookmaker consensus probabilities
+    // Pinnacle close (preferred) → consensus close (fallback) → null.
+    // Computed once in generatePrediction and attached to matchData.
+    const closingLineSignal: ClosingLineSignal | null =
+      matchData.closingLineSignal ?? null;
+    const selected = this.closingLineService.selectBlendProbs(closingLineSignal);
     let bookmakerProbs: {
       home: number;
       draw: number;
       away: number;
-    } | null = null;
+    } | null = selected
+      ? { home: selected.home, draw: selected.draw, away: selected.away }
+      : null;
 
-    const h2hConsensus = matchData.odds?.consensus?.find(
-      (c: any) => c.marketKey === 'h2h',
-    );
-    if (h2hConsensus) {
-      const bHome = Number(h2hConsensus.consensusHomeWin) || 0;
-      const bDraw = Number(h2hConsensus.consensusDraw) || 0;
-      const bAway = Number(h2hConsensus.consensusAwayWin) || 0;
-      const bTotal = bHome + bDraw + bAway;
-      if (bTotal > 0.9 && bTotal < 1.1) {
-        // Looks like valid probabilities (close to 1.0)
-        bookmakerProbs = {
-          home: bHome / bTotal,
-          draw: bDraw / bTotal,
-          away: bAway / bTotal,
-        };
+    // ── Meta-blender path ───────────────────────────────────────────
+    // When learned weights exist, the meta-blender produces the four-
+    // predictor log-pool. We substitute its output for the legacy
+    // claude-weight*claudeProb + poisson-weight*poissonProb + ... blend
+    // and let the existing draw-floor + dampening + confidence post-
+    // processing run on top.
+    const piPred = matchData.piRatingPrediction ?? null;
+    const piProbsForBlend = piPred
+      ? {
+          home: piPred.homeWinProb,
+          draw: piPred.drawProb,
+          away: piPred.awayWinProb,
+        }
+      : null;
+    const blendInputs: MetaBlendInputs = {
+      claudeProbs: {
+        home: claudePrediction.homeWinProb,
+        draw: claudePrediction.drawProb,
+        away: claudePrediction.awayWinProb,
+      },
+      poissonProbs:
+        poissonOutput && poissonOutput.dataPoints >= 6
+          ? {
+              home: poissonOutput.homeWinProb,
+              draw: poissonOutput.drawProb,
+              away: poissonOutput.awayWinProb,
+            }
+          : null,
+      bookmakerProbs,
+      piRatingProbs: piProbsForBlend,
+    };
+    let metaBlenderProbs: { home: number; draw: number; away: number } | null =
+      null;
+    let metaBlenderLog: string | null = null;
+    try {
+      const metaResult = await this.metaBlenderService.blend(
+        blendInputs,
+        matchData.fixture?.leagueId ?? -1,
+      );
+      if (metaResult?.applied && metaResult.params) {
+        metaBlenderProbs = metaResult.blended;
+        const ws = metaResult.params.weights
+          .map(
+            (w, i) =>
+              `${metaResult.params!.predictorOrder[i]}=${w.toFixed(2)}`,
+          )
+          .join(' ');
+        metaBlenderLog =
+          `Meta-blender (${metaResult.scope}) [${ws}]: ` +
+          `H=${(metaResult.blended.home * 100).toFixed(1)}% ` +
+          `D=${(metaResult.blended.draw * 100).toFixed(1)}% ` +
+          `A=${(metaResult.blended.away * 100).toFixed(1)}%`;
       }
+    } catch (error) {
+      this.logger.warn(
+        `Meta-blender failed, falling back to flat blend: ${(error as Error).message}`,
+      );
+    }
+
+    // Legacy fallback path: if the closing-line service returned nothing
+    // (e.g. odds rows present but malformed in a way the new validator
+    // rejects), try the original inline extraction so we don't regress
+    // versus the previous behaviour.
+    if (!bookmakerProbs) {
+      const h2hConsensus = matchData.odds?.consensus?.find(
+        (c: any) => c.marketKey === 'h2h',
+      );
+      if (h2hConsensus) {
+        const bHome = Number(h2hConsensus.consensusHomeWin) || 0;
+        const bDraw = Number(h2hConsensus.consensusDraw) || 0;
+        const bAway = Number(h2hConsensus.consensusAwayWin) || 0;
+        const bTotal = bHome + bDraw + bAway;
+        if (bTotal > 0.9 && bTotal < 1.1) {
+          bookmakerProbs = {
+            home: bHome / bTotal,
+            draw: bDraw / bTotal,
+            away: bAway / bTotal,
+          };
+        }
+      }
+    }
+
+    if (closingLineSignal) {
+      this.logger.log(
+        `Ensemble book source: ${closingLineSignal.sourceUsed}` +
+          (closingLineSignal.driftSampleSize >= 2
+            ? `, Pinnacle open→close drift mag=${closingLineSignal.driftMagnitude.toFixed(3)}`
+            : ''),
+      );
     }
 
     // Determine available signals and redistribute weights
@@ -2423,21 +3027,30 @@ export class AgentsService {
     poissonWeight /= totalWeight;
     bookmakerWeight /= totalWeight;
 
-    // Blend probabilities
-    let homeWinProb =
-      claudeWeight * claudePrediction.homeWinProb +
-      (hasPoissonData ? poissonWeight * poissonOutput!.homeWinProb : 0) +
-      (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.home : 0);
-
-    let drawProb =
-      claudeWeight * claudePrediction.drawProb +
-      (hasPoissonData ? poissonWeight * poissonOutput!.drawProb : 0) +
-      (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.draw : 0);
-
-    let awayWinProb =
-      claudeWeight * claudePrediction.awayWinProb +
-      (hasPoissonData ? poissonWeight * poissonOutput!.awayWinProb : 0) +
-      (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.away : 0);
+    // Blend probabilities — prefer meta-blender output when fitted,
+    // otherwise the legacy flat-weighted average.
+    let homeWinProb: number;
+    let drawProb: number;
+    let awayWinProb: number;
+    if (metaBlenderProbs) {
+      homeWinProb = metaBlenderProbs.home;
+      drawProb = metaBlenderProbs.draw;
+      awayWinProb = metaBlenderProbs.away;
+      if (metaBlenderLog) this.logger.log(metaBlenderLog);
+    } else {
+      homeWinProb =
+        claudeWeight * claudePrediction.homeWinProb +
+        (hasPoissonData ? poissonWeight * poissonOutput!.homeWinProb : 0) +
+        (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.home : 0);
+      drawProb =
+        claudeWeight * claudePrediction.drawProb +
+        (hasPoissonData ? poissonWeight * poissonOutput!.drawProb : 0) +
+        (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.draw : 0);
+      awayWinProb =
+        claudeWeight * claudePrediction.awayWinProb +
+        (hasPoissonData ? poissonWeight * poissonOutput!.awayWinProb : 0) +
+        (hasBookmakerData ? bookmakerWeight * bookmakerProbs!.away : 0);
+    }
 
     // Normalize
     let total = homeWinProb + drawProb + awayWinProb;
@@ -2491,6 +3104,22 @@ export class AgentsService {
         drawFloor = Math.max(drawFloor, 0.27);
       } else if (xgGap < 0.35) {
         drawFloor = Math.max(drawFloor, 0.25);
+      }
+    }
+
+    // Venue-context draw nudges. Effect sizes are small but consistent in
+    // the literature: derbies and dead-rubbers both lift draw rates a few
+    // points. We don't apply altitude here — that's already in the Poisson
+    // home-advantage factor.
+    const venueCtx = matchData.venueContext;
+    if (venueCtx) {
+      if (venueCtx.derbyType === 'same_city') {
+        drawFloor = Math.max(drawFloor, 0.28);
+      } else if (venueCtx.derbyType === 'rivalry') {
+        drawFloor = Math.max(drawFloor, 0.27);
+      }
+      if (venueCtx.lateSeasonStakes === 'mid_table_dead_rubber') {
+        drawFloor = Math.max(drawFloor, 0.28);
       }
     }
 
@@ -2755,6 +3384,7 @@ export class AgentsService {
       riskFactors: prediction.riskFactors,
       valueBets: prediction.valueBets,
       matchContext: this.buildMatchContext(data),
+      matchInsights: (data.matchInsights ?? null) as any,
       researchContext: {
         combinedResearch: research.combinedResearch,
         citations: research.citations,
@@ -2770,10 +3400,11 @@ export class AgentsService {
       .insert(schema.predictions)
       .values(values)
       .onConflictDoUpdate({
-        target: [
-          schema.predictions.fixtureId,
-          schema.predictions.predictionType,
-        ],
+        // One prediction per fixture: the latest run overwrites the existing
+        // row in place (id preserved, so FK references stay valid). The new
+        // predictionType is part of `values`, so the row reflects the most
+        // recent run.
+        target: [schema.predictions.fixtureId],
         set: {
           ...values,
           updatedAt: new Date(),
@@ -3106,6 +3737,147 @@ export class AgentsService {
   }
 
   /**
+   * ⚠ NOT WIRED INTO THE PIPELINE — see Step 3c in generatePrediction.
+   *
+   * Backtest on 37 qualifying historical predictions (April 2026) showed
+   * the probability blend hurts Brier monotonically across every weight
+   * cap and every sub-cohort:
+   *
+   *   weightCap=0.05 → +0.005 Brier
+   *   weightCap=0.20 → +0.013 Brier  (what we initially shipped)
+   *   weightCap=0.50 → +0.020 Brier
+   *
+   * The harm gets worst when sharps are MOST confident (|lean|≥0.80
+   * → +0.048), which is the opposite of what a real predictive signal
+   * would show. The signal correlates with predictability (sharps tend
+   * to crowd in well-modelled matches) but does not add new directional
+   * information beyond what the ensemble already extracts.
+   *
+   * The function stays defined for future re-introduction with stricter
+   * gating (e.g. only sharpCount≥8 cohort showed a tiny -0.001 helps).
+   * Re-wire only after another backtest confirms a meaningful Brier win.
+   * See autoresearch/smart-money-blend-backtest.ts for the data.
+   *
+   * ----- ORIGINAL DESIGN NOTES (kept for context if re-introduced) -----
+   *
+   * Convert a direct smart-money signal into a probability blend over the
+   * ensemble's existing probabilities.
+   *
+   * The signal gives us a lean toward Polymarket outcome 0 (typically YES =
+   * "team X wins") with strength `leanScore` ∈ [-1, +1] and sample-driven
+   * `signalConfidence` ∈ [0, 1]. We map this to a "sharp-implied" 1X2
+   * vector and blend with a small weight:
+   *
+   *   weight = min(0.20, signalConfidence × min(1, sharpCount / 8))
+   *
+   * The cap is intentional. We trust this as a fourth signal, not a
+   * fourth-and-a-half — a single hot streak among 3 sharps shouldn't
+   * dominate a Claude/Poisson/bookmaker consensus that points the other way.
+   *
+   * Mapping leanScore → 1X2 implied probabilities:
+   *   - The market's YES side maps to "marketTeamId wins". Sharp
+   *     positioning gives us p_yes ≈ 0.5 + leanScore × 0.5 (e.g. lean=+1
+   *     → 100% YES, lean=0 → 50/50, lean=-1 → 0% YES).
+   *   - The remaining (1 - p_yes) is distributed between the OTHER 1X2
+   *     outcomes proportionally to the ensemble's current split — i.e.
+   *     if the ensemble has draw and away in a 60/40 ratio, the NO
+   *     mass gets split 60/40 between them. This avoids putting all NO
+   *     mass on one outcome and creating spurious shifts.
+   *
+   * Skipped when:
+   *   - sharpCount < 3 or signalConfidence < 0.2 (too thin)
+   *   - marketTeamId not present or doesn't match either side
+   *   - leanScore magnitude < 0.2 (essentially neutral)
+   */
+  private applySmartMoneyProbabilityBlend(
+    prediction: PredictionOutput,
+    signal: SmartMoneySignal & { marketTeamId?: number | null },
+    matchData: CollectedMatchData,
+  ): PredictionOutput {
+    if (
+      signal.leanScore == null ||
+      signal.signalConfidence < 0.2 ||
+      signal.sharpCount < 3 ||
+      Math.abs(signal.leanScore) < 0.2 ||
+      signal.marketTeamId == null
+    ) {
+      return prediction;
+    }
+
+    // Identify which 1X2 slot the market's YES outcome corresponds to.
+    let yesSlot: 'home' | 'away' | null = null;
+    if (signal.marketTeamId === matchData.fixture.homeTeamId) yesSlot = 'home';
+    else if (signal.marketTeamId === matchData.fixture.awayTeamId)
+      yesSlot = 'away';
+    if (yesSlot == null) return prediction;
+
+    // Sharp-implied YES probability. Bound away from 0/1 so we never
+    // collapse the blend; even +1 lean among 5 sharps is "very high",
+    // not "certainty".
+    const pYesRaw = 0.5 + signal.leanScore * 0.5;
+    const pYes = Math.max(0.05, Math.min(0.95, pYesRaw));
+
+    // Existing ensemble probs by 1X2 slot.
+    const ens = {
+      home: prediction.homeWinProb,
+      draw: prediction.drawProb,
+      away: prediction.awayWinProb,
+    };
+
+    // Build a 1X2 vector from the signal: yesSlot → pYes; remaining mass
+    // is split between the other two slots proportionally to ensemble.
+    const noSlots: Array<'home' | 'draw' | 'away'> =
+      yesSlot === 'home' ? ['draw', 'away'] : ['home', 'draw'];
+    const noMass = 1 - pYes;
+    const noTotal = ens[noSlots[0]] + ens[noSlots[1]];
+    const sharpVec: { home: number; draw: number; away: number } = {
+      home: 0,
+      draw: 0,
+      away: 0,
+    };
+    sharpVec[yesSlot] = pYes;
+    if (noTotal > 0) {
+      sharpVec[noSlots[0]] = (ens[noSlots[0]] / noTotal) * noMass;
+      sharpVec[noSlots[1]] = (ens[noSlots[1]] / noTotal) * noMass;
+    } else {
+      // Degenerate case (shouldn't happen post-ensemble, but be safe).
+      sharpVec[noSlots[0]] = noMass / 2;
+      sharpVec[noSlots[1]] = noMass / 2;
+    }
+
+    // Blend weight. Caps at 0.20.
+    const sampleScale = Math.min(1, signal.sharpCount / 8);
+    const weight = Math.min(0.2, signal.signalConfidence * sampleScale);
+
+    const blended = {
+      home: ens.home * (1 - weight) + sharpVec.home * weight,
+      draw: ens.draw * (1 - weight) + sharpVec.draw * weight,
+      away: ens.away * (1 - weight) + sharpVec.away * weight,
+    };
+    // Renormalise for any floating-point drift.
+    const sum = blended.home + blended.draw + blended.away;
+    blended.home /= sum;
+    blended.draw /= sum;
+    blended.away /= sum;
+
+    this.logger.log(
+      `Smart-money probability blend: leanScore=${signal.leanScore.toFixed(2)}, ` +
+        `sharps=${signal.sharpCount}, weight=${weight.toFixed(2)}, ` +
+        `slot=${yesSlot} → ` +
+        `H=${(ens.home * 100).toFixed(1)}→${(blended.home * 100).toFixed(1)}%, ` +
+        `D=${(ens.draw * 100).toFixed(1)}→${(blended.draw * 100).toFixed(1)}%, ` +
+        `A=${(ens.away * 100).toFixed(1)}→${(blended.away * 100).toFixed(1)}%`,
+    );
+
+    return {
+      ...prediction,
+      homeWinProb: Number(blended.home.toFixed(4)),
+      drawProb: Number(blended.draw.toFixed(4)),
+      awayWinProb: Number(blended.away.toFixed(4)),
+    };
+  }
+
+  /**
    * Smart-money confidence adjustment, calibrated against the Apr-2026
    * backtest of 583 signaled predictions:
    *
@@ -3233,30 +4005,24 @@ export class AgentsService {
   /**
    * Determine the predicted result from probabilities.
    *
-   * Uses a multi-criteria draw-aware strategy because:
-   * - In football, ~25-28% of matches end in draws
-   * - Draw probability rarely exceeds BOTH home and away in a 3-way split
-   * - Models systematically under-predict draws, missing ~25% of correct answers
+   * Draw-aware argmax. The pure-argmax baseline systematically under-predicts
+   * draws because draw probability is distributed across all matches but
+   * rarely becomes the single highest outcome. The old aggressive thresholds
+   * (max ≤ 0.53, spread < 0.08, draw ≥ 0.28) were cannibalising away_wins —
+   * a back-test on n=1181 resolved games showed 111 cases where argmax said
+   * away_win but the old logic overrode to draw, and most of those actual
+   * results were away_wins.
    *
-   * Strategy (layered, from most to least aggressive draw prediction):
-   * Match-type aware prediction logic that accounts for football's true draw rate.
-   *
-   * Pure argmax predicts draws <10% of the time, but draws occur ~26% in reality.
-   * This is because draw probability is distributed across ALL matches but rarely
-   * becomes the single highest outcome. We need match-type classification:
-   *
-   * TIGHT MATCH (max win prob < 0.45):
-   *   → Predict draw if drawProb >= 0.26 (matches are genuinely uncertain)
-   *
-   * COMPETITIVE MATCH (max win prob 0.45-0.55):
-   *   → Predict draw if drawProb >= 0.28 AND win spread < 0.10
-   *   → The slight favourite could easily draw
-   *
-   * CLEAR FAVOURITE (max win prob > 0.55):
-   *   → Only predict draw if drawProb is actually highest (argmax)
-   *   → Strong favourites do usually win, draw is less likely
-   *
-   * This produces ~20-28% draw predictions, matching the true ~26% base rate.
+   * Tightened thresholds (Option B) preserve the intent of catching draws
+   * in genuinely uncertain matches while stopping the spillover into clear
+   * wins. Back-tested impact vs old logic on n=1181:
+   *   home_win recall:  76.4% → 83.3%  (+38 correct)
+   *   draw recall:      26.2% →  6.8%  (−60 correct)
+   *   away_win recall:  16.9% → 31.9%  (+48 correct)
+   *   overall accuracy: 47.2% → 49.4%  (+26 correct)
+   * The draw-recall loss is the intended trade — recovered upstream by
+   * FormBasedNudgeService's home-4D-last10 nudge which boosts drawProb so
+   * more draws become a genuine argmax.
    */
   private getPredictedResultFromProbs(
     homeProb: number,
@@ -3271,25 +4037,22 @@ export class AgentsService {
     const maxWinProb = Math.max(homeProb, awayProb);
     const winSpread = Math.abs(homeProb - awayProb);
 
-    // 2. VERY TIGHT MATCH: no clear favourite (max win prob < 0.43)
-    //    AND draw is within 6pp of the leader AND draw is >= 0.27
-    //    These are genuinely uncertain matches — all three outcomes equally viable
-    if (maxWinProb < 0.43 && drawProb >= 0.27 && maxWinProb - drawProb < 0.06) {
+    // 2. GENUINELY TIGHT MATCH: max win prob ≤ 0.45 AND home/away within
+    //    5pp of each other AND draw is essentially tied with the leader
+    //    (within 3pp). These are the matches where draw is a real outcome
+    //    rather than a tie-break dump.
+    if (maxWinProb <= 0.45 && winSpread < 0.05 && drawProb >= maxWinProb - 0.03) {
       return 'draw';
     }
 
-    // 3. COMPETITIVE MATCH: slight favourite (max win prob up to 0.53)
-    //    Predict draw when teams are close and draw is meaningfully high.
-    if (maxWinProb <= 0.53 && winSpread < 0.08 && drawProb >= 0.28) {
-      return 'draw';
-    }
-
-    // 4. MODERATE FAVOURITE: still allow draw when it is very close to the leader.
+    // 3. MODERATE FAVOURITE: still allow draw when it is very close to the
+    //    leader (within 3pp) and draw is ≥ 0.30. Preserved from the prior
+    //    logic — it doesn't cause the away_win cannibalisation.
     if (maxWinProb <= 0.58 && drawProb >= 0.3 && maxWinProb - drawProb < 0.03) {
       return 'draw';
     }
 
-    // 5. Otherwise, pick the higher of home or away
+    // 4. Otherwise, pick the higher of home or away
     if (homeProb >= awayProb) return 'home_win';
     return 'away_win';
   }

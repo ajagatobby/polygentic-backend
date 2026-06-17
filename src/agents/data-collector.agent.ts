@@ -60,9 +60,32 @@ export interface TeamFormWindowSummary {
   unbeatenRate: number;
 }
 
+/**
+ * Exponentially recency-weighted summary across the last 10 league matches.
+ * Weight at position i (0 = most recent) = 0.5 ^ (i / halfLife), with
+ * halfLife = 8 (matches Poisson). The result is a single PPG / GF / GA /
+ * goal-diff value where recent games count more, so a team that won 4 of
+ * its last 5 but lost 4 of the 5 before that doesn't get inflated by the
+ * older losses.
+ */
+export interface TeamFormWeighted {
+  sampleSize: number;
+  /** Sum of weights — useful for reliability assessment. */
+  totalWeight: number;
+  /** Recency-weighted points per game (max 3.0). */
+  weightedPpg: number;
+  weightedGoalsFor: number;
+  weightedGoalsAgainst: number;
+  weightedGoalDiff: number;
+  /** Recency-weighted win rate. */
+  weightedWinRate: number;
+}
+
 export interface TeamFormWindows {
   last5: TeamFormWindowSummary;
   last10: TeamFormWindowSummary;
+  /** Recency-weighted form across the last 10 matches. */
+  weighted: TeamFormWeighted;
 }
 
 export interface SeasonRematchContext {
@@ -177,6 +200,47 @@ export interface CollectedMatchData {
     home: any;
     away: any;
   } | null;
+  /** Venue / contextual flags (set by agents.service after data collection) */
+  venueContext?: {
+    derbyType: 'same_city' | 'rivalry' | null;
+    derbyLabel: string | null;
+    altitudeBoost: number;
+    altitudeVenue: string | null;
+    lateSeasonStakes:
+      | 'title_race'
+      | 'top_4_chase'
+      | 'relegation_fight'
+      | 'mid_table_dead_rubber'
+      | null;
+    notes: string[];
+  } | null;
+  /**
+   * Closing-line signal — Pinnacle close, consensus close, open→close drift,
+   * sharpness indicators. Computed in agents.service before ensemble blend.
+   * Null when no odds rows exist for the fixture.
+   */
+  closingLineSignal?: import('./closing-line.service').ClosingLineSignal | null;
+  /**
+   * Pi-rating prediction — Constantinou-Fenton ratings + ordered-logit
+   * probability mapping. Computed in agents.service before ensemble.
+   * Null when either team has no pi-rating row yet.
+   */
+  piRatingPrediction?: import('./pi-rating.service').PiRatingPrediction | null;
+  /**
+   * Rest-days asymmetry + lineup-vs-typical-XI delta. Computed at
+   * predict time; surfaces directly in the LLM context block and is
+   * available for any future xG / ensemble adjustments.
+   */
+  lineupRestFeatures?:
+    | import('./lineup-rest-features.service').LineupRestFeatures
+    | null;
+  /**
+   * Display-only deep-analysis sections (head-to-head history, last-20 form,
+   * streaks, full player-by-player roster). Computed in agents.service after
+   * data collection. Surfaced in the response and as read-only narrative
+   * context to the analysis prompt — does NOT move the probability numbers.
+   */
+  matchInsights?: import('./match-insights.service').MatchInsights | null;
 }
 
 @Injectable()
@@ -571,9 +635,49 @@ export class DataCollectorAgent {
         };
       };
 
+      // Recency-weighted form: matches are sorted DESC by date so index 0
+      // is most recent. Half-life of 8 means a match 8 games ago carries
+      // half the weight of the most recent one.
+      const weighted = ((): TeamFormWeighted => {
+        const halfLife = 8;
+        const decay = Math.log(2) / halfLife;
+        let weightSum = 0;
+        let weightedPoints = 0;
+        let weightedGF = 0;
+        let weightedGA = 0;
+        let weightedWins = 0;
+        for (let i = 0; i < recentFixtures.length; i++) {
+          const f = recentFixtures[i];
+          const w = Math.exp(-i * decay);
+          const isHome = f.homeTeamId === teamId;
+          const gf = Number(isHome ? f.goalsHome : f.goalsAway) || 0;
+          const ga = Number(isHome ? f.goalsAway : f.goalsHome) || 0;
+          weightSum += w;
+          weightedGF += gf * w;
+          weightedGA += ga * w;
+          if (gf > ga) {
+            weightedPoints += 3 * w;
+            weightedWins += w;
+          } else if (gf === ga) {
+            weightedPoints += 1 * w;
+          }
+        }
+        const safe = weightSum > 0 ? weightSum : 1;
+        return {
+          sampleSize: recentFixtures.length,
+          totalWeight: Number(weightSum.toFixed(2)),
+          weightedPpg: Number((weightedPoints / safe).toFixed(2)),
+          weightedGoalsFor: Number((weightedGF / safe).toFixed(2)),
+          weightedGoalsAgainst: Number((weightedGA / safe).toFixed(2)),
+          weightedGoalDiff: Number(((weightedGF - weightedGA) / safe).toFixed(2)),
+          weightedWinRate: Number((weightedWins / safe).toFixed(2)),
+        };
+      })();
+
       return {
         last5: summarize(recentFixtures.slice(0, 5)),
         last10: summarize(recentFixtures),
+        weighted,
       };
     } catch (error) {
       this.logger.warn(

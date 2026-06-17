@@ -132,12 +132,43 @@ export interface SmartMoneyOptions {
 }
 
 /** Aggregated lifetime stats for a single wallet, used by the sharp
- *  qualification path and exposed for enrichment in other services. */
+ *  qualification path and exposed for enrichment in other services.
+ *
+ *  Note on units: Polymarket's /positions returns `totalBought` as a
+ *  SHARE count, not USD (USD = shares × avgPrice). We expose both
+ *  denominations so callers pick the right one:
+ *
+ *  - `totalBought` / `typicalBetSizeUsd` — USD, correct for ROI math
+ *    and user-facing display ($N staked, $N median bet).
+ *  - `typicalBetSize` — median SHARES, kept for `positionMultiple`
+ *    which compares a holder's current share balance on a market
+ *    against a wallet's typical share count. Switching that ratio
+ *    to USD would need every call site to carry market prices.
+ *
+ *  Note on PnL: `totalPnl` is REALIZED only — cash actually booked
+ *  from sells and redemptions. Gates and skill signals use this. For
+ *  the UI headline that matches Polymarket's profile graph, add
+ *  `unrealizedPnl` (mark-to-market on open positions).
+ *
+ *  Note on "resolved": resolvedCount, currentWinStreak, and the
+ *  last-10/last-20 numbers come from CLOSED positions only. An open
+ *  position with realizedPnl=0 (no sells, market still live) was
+ *  previously being counted as a settled loss, which made every
+ *  profitable whale with active bets show 0W / 0% last-10.
+ */
 export interface LifetimeStats {
+  /** Lifetime realized PnL in USD (across open + closed positions). */
   totalPnl: number;
+  /** Mark-to-market unrealized PnL on open positions, in USD. */
+  unrealizedPnl: number;
+  /** Lifetime gross USD bought across all positions. */
   totalBought: number;
+  /** Count of CLOSED positions with shares > 0 — actual settled bets. */
   resolvedCount: number;
+  /** Median share count per position — used for positionMultiple. */
   typicalBetSize: number;
+  /** Median USD bought per position — used for UI "median bet" display. */
+  typicalBetSizeUsd: number;
   currentWinStreak: number;
   last10WinRate: number;
   last10Wins: number | null;
@@ -180,7 +211,20 @@ export class SmartMoneySignalService {
       this.data.getUserPositions(wallet, { limit: 200 }),
       this.data.getUserClosedPositions(wallet, { limit: 200 }),
     ]);
-    return this.lifetimeStats([...open, ...closed]);
+    return this.lifetimeStats(open, closed);
+  }
+
+  /**
+   * Public: compute lifetime stats from an already-fetched set of
+   * positions. Used by the wallet-analyzer which paginates positions
+   * itself (via getUserPositionsAll + getUserClosedPositionsAll) and
+   * doesn't want a second set of API calls via getWalletLifetimeStats.
+   */
+  computeLifetimeStats(
+    open: UserPosition[],
+    closed: UserPosition[],
+  ): LifetimeStats {
+    return this.lifetimeStats(open, closed);
   }
 
   /**
@@ -419,11 +463,15 @@ export class SmartMoneySignalService {
           this.data.getUserPositions(w, { limit: 200 }),
           this.data.getUserClosedPositions(w, { limit: 200 }),
         ]);
-        return { wallet: w, positions: [...open, ...closed] };
+        return { wallet: w, open, closed };
       }),
     );
-    const lifetimeMap = new Map<string, UserPosition[]>();
-    for (const l of lifetimes) lifetimeMap.set(l.wallet, l.positions);
+    const lifetimeMap = new Map<
+      string,
+      { open: UserPosition[]; closed: UserPosition[] }
+    >();
+    for (const l of lifetimes)
+      lifetimeMap.set(l.wallet, { open: l.open, closed: l.closed });
 
     const out: Array<{
       proxyWallet: string;
@@ -443,8 +491,8 @@ export class SmartMoneySignalService {
       qualifiedVia?: 'base' | 'hot-streak';
     }> = [];
     for (const [wallet, holders] of byWallet) {
-      const lifetimePositions = lifetimeMap.get(wallet) ?? [];
-      const stats = this.lifetimeStats(lifetimePositions);
+      const lifetime = lifetimeMap.get(wallet) ?? { open: [], closed: [] };
+      const stats = this.lifetimeStats(lifetime.open, lifetime.closed);
       for (const h of holders) {
         out.push(this.recordFor(h, stats, cfg));
       }
@@ -525,13 +573,19 @@ export class SmartMoneySignalService {
    * null (as last10Wins) if < 10 positions resolved total — small samples
    * shouldn't produce a phantom streak signal.
    */
-  private lifetimeStats(positions: UserPosition[]): LifetimeStats {
-    if (positions.length === 0) {
+  private lifetimeStats(
+    openPositions: UserPosition[],
+    closedPositions: UserPosition[],
+  ): LifetimeStats {
+    const allPositions = [...openPositions, ...closedPositions];
+    if (allPositions.length === 0) {
       return {
         totalPnl: 0,
+        unrealizedPnl: 0,
         totalBought: 0,
         resolvedCount: 0,
         typicalBetSize: 0,
+        typicalBetSizeUsd: 0,
         currentWinStreak: 0,
         last10WinRate: 0,
         last10Wins: null,
@@ -540,32 +594,75 @@ export class SmartMoneySignalService {
       };
     }
     let totalPnl = 0;
-    let totalBought = 0;
-    let resolved = 0;
-    const sizes: number[] = [];
-    const resolvedWithDate: Array<{ win: boolean; endDate: string }> = [];
-    for (const p of positions) {
-      // Realized PnL is the cleanest signal of skill — counts only positions
-      // that have been closed. cashPnl includes unrealized.
+    let unrealizedPnl = 0;
+    let totalBoughtUsd = 0;
+    const sharesSizes: number[] = [];
+    const usdSizes: number[] = [];
+    // Aggregates across every position (open + closed) since volume
+    // and realized PnL are lifetime totals regardless of settle state.
+    for (const p of allPositions) {
       totalPnl += Number(p.realizedPnl ?? 0);
-      totalBought += Number(p.totalBought ?? 0);
-      if (p.realizedPnl != null && p.totalBought > 0) {
-        resolved++;
-        resolvedWithDate.push({
-          win: Number(p.realizedPnl) > 0,
-          endDate: String(p.endDate ?? ''),
-        });
-      }
-      if (p.totalBought > 0) sizes.push(p.totalBought);
+      // ⚠ Polymarket's /positions returns `totalBought` in SHARES, not
+      // USD. USD cost = totalBought × avgPrice. Confusing the two was
+      // making volume numbers on penny markets appear 1000× too large
+      // (34M shares at 0.1¢ = $34K in real money).
+      const sharesBought = Number(p.totalBought ?? 0);
+      const avgPrice = Number(p.avgPrice ?? 0);
+      const usdBought = sharesBought * avgPrice;
+      totalBoughtUsd += usdBought;
+      if (sharesBought > 0) sharesSizes.push(sharesBought);
+      if (usdBought > 0) usdSizes.push(usdBought);
     }
-    // Median bet size is more robust to outliers than mean.
-    sizes.sort((a, b) => a - b);
+    // Mark-to-market unrealized PnL lives on OPEN positions only. A
+    // closed position has no unrealized leg — all its PnL is realized
+    // (Polymarket's /closed-positions response omits cashPnl entirely).
+    for (const p of openPositions) {
+      const cash = Number((p as any).cashPnl ?? 0);
+      const realized = Number(p.realizedPnl ?? 0);
+      unrealizedPnl += cash - realized;
+    }
+    // "Resolved" events — i.e., settled bets that tell us about skill —
+    // come strictly from the closed-positions list. Using the combined
+    // list previously swept every open, still-live bet into this stream
+    // as a realizedPnl=0 "loss," which killed the streak/last-10 numbers
+    // for every wallet with active positions.
+    let resolved = 0;
+    const resolvedWithDate: Array<{
+      win: boolean;
+      endDate: string;
+      timestamp: number;
+    }> = [];
+    for (const p of closedPositions) {
+      const sharesBought = Number(p.totalBought ?? 0);
+      if (sharesBought <= 0) continue;
+      resolved++;
+      resolvedWithDate.push({
+        win: Number(p.realizedPnl ?? 0) > 0,
+        endDate: String(p.endDate ?? ''),
+        timestamp: Number((p as any).timestamp ?? 0),
+      });
+    }
+    // Median is more robust to outliers than mean. We compute both the
+    // shares-denominated median (for positionMultiple) and the USD one
+    // (for UI display).
+    sharesSizes.sort((a, b) => a - b);
+    usdSizes.sort((a, b) => a - b);
     const typicalBetSize =
-      sizes.length > 0 ? sizes[Math.floor(sizes.length / 2)] : 0;
+      sharesSizes.length > 0
+        ? sharesSizes[Math.floor(sharesSizes.length / 2)]
+        : 0;
+    const typicalBetSizeUsd =
+      usdSizes.length > 0 ? usdSizes[Math.floor(usdSizes.length / 2)] : 0;
 
-    // Sort resolved positions by endDate desc (most recent first). Empty
-    // endDate sorts last (treated as oldest).
+    // Sort resolved positions by most-recent activity. `timestamp` on
+    // /closed-positions is the last action (sell / redeem) on that
+    // position — better than endDate for ordering because a market
+    // can end long after the user exited. Fall back to endDate if no
+    // timestamp, and oldest-to-end if neither.
     resolvedWithDate.sort((a, b) => {
+      if (a.timestamp && b.timestamp) return b.timestamp - a.timestamp;
+      if (a.timestamp) return -1;
+      if (b.timestamp) return 1;
       if (!a.endDate) return 1;
       if (!b.endDate) return -1;
       return b.endDate.localeCompare(a.endDate);
@@ -599,9 +696,11 @@ export class SmartMoneySignalService {
 
     return {
       totalPnl,
-      totalBought,
+      unrealizedPnl,
+      totalBought: totalBoughtUsd,
       resolvedCount: resolved,
       typicalBetSize,
+      typicalBetSizeUsd,
       currentWinStreak,
       last10WinRate,
       last10Wins,

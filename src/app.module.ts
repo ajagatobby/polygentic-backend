@@ -5,6 +5,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './database/database.module';
 import { FootballModule } from './football/football.module';
 import { BasketballModule } from './basketball/basketball.module';
+import { BaseballModule } from './baseball/baseball.module';
 import { OddsModule } from './odds/odds.module';
 import { AlertsModule } from './alerts/alerts.module';
 import { AgentsModule } from './agents/agents.module';
@@ -46,6 +47,7 @@ import { BillingModule } from './billing/billing.module';
     DatabaseModule,
     FootballModule,
     BasketballModule,
+    BaseballModule,
     OddsModule,
     AlertsModule,
     AgentsModule,
